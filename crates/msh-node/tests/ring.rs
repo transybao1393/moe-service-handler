@@ -12,6 +12,14 @@ const PROMPT: &[u32] = &[11, 22, 33, 44, 55];
 /// Starts every node of `splits` on loopback threads and returns the coordinator plus the
 /// worker threads, which return their engines when the coordinator is dropped.
 fn start(splits: &[[u32; 2]]) -> (Coordinator<MockEngine>, Vec<thread::JoinHandle<MockEngine>>) {
+    start_failing(splits, None)
+}
+
+/// Like `start`, but node `fail.0` fails every step of request `fail.1`.
+fn start_failing(
+    splits: &[[u32; 2]],
+    fail: Option<(usize, u64)>,
+) -> (Coordinator<MockEngine>, Vec<thread::JoinHandle<MockEngine>>) {
     let listeners: Vec<TcpListener> = splits.iter().map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
     let cfg = Config {
         hidden_dim: DIM,
@@ -40,7 +48,10 @@ fn start(splits: &[[u32; 2]]) -> (Coordinator<MockEngine>, Vec<thread::JoinHandl
         let cfg = cfg.clone();
         workers.push(thread::spawn(move || {
             let ring = join_ring(&cfg, i, l, Duration::from_secs(5)).unwrap().unwrap();
-            let engine = MockEngine::new(cfg.nodes[i].layer_range(), DIM);
+            let mut engine = MockEngine::new(cfg.nodes[i].layer_range(), DIM);
+            if let Some((_, req)) = fail.filter(|f| f.0 == i) {
+                engine = engine.failing_on(req);
+            }
             Worker::new(engine, ring, &cfg.nodes[i].name, i == cfg.nodes.len() - 1).run().unwrap()
         }));
     }
@@ -74,4 +85,19 @@ fn two_node_split_matches_too() {
     let (mut single, _) = start(&[[0, 40]]);
     let (mut ring, _) = start(&[[0, 25], [25, 40]]);
     assert_eq!(ring.generate(9, PROMPT, 8).unwrap().tokens, single.generate(9, PROMPT, 8).unwrap().tokens);
+}
+
+#[test]
+fn worker_error_reaches_coordinator_with_its_request_id() {
+    let (mut ring, workers) = start_failing(&[[0, 20], [20, 30], [30, 40]], Some((1, 5)));
+    let err = ring.generate(5, PROMPT, 4).unwrap_err().to_string();
+    assert!(err.contains("n1") && err.contains("request 5"), "{err}");
+
+    // The ring stays up, and the failed request was freed everywhere.
+    let (mut single, _) = start(&[[0, 40]]);
+    assert_eq!(ring.generate(6, PROMPT, 4).unwrap().tokens, single.generate(6, PROMPT, 4).unwrap().tokens);
+    drop(ring);
+    for w in workers {
+        assert_eq!(w.join().unwrap().live_requests(), 0);
+    }
 }

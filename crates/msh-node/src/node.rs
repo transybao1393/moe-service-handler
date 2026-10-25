@@ -82,6 +82,7 @@ fn connect_with_retry(addr: &str, me: &str, timeout: Duration) -> Result<Connect
     }
 }
 
+#[derive(Debug)]
 pub struct Generation {
     pub tokens: Vec<u32>,
     /// Wall time of the step that produced each token.
@@ -191,13 +192,9 @@ impl<E: Engine> Worker<E> {
         let mut buf = Vec::new();
         let mut out = Vec::new();
         loop {
-            let h = match self.ring.prev.recv(&mut buf) {
+            let h = match self.ring.prev.recv_frame(&mut buf) {
                 Ok(h) => h,
                 Err(FrameError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => return Ok(self.engine),
-                Err(FrameError::Remote(msg)) => {
-                    self.ring.next.send(MsgType::Error, 0, 0, msg.as_bytes())?;
-                    continue;
-                }
                 Err(e) => return Err(e.into()),
             };
             match h.msg_type {
@@ -221,6 +218,9 @@ impl<E: Engine> Worker<E> {
                     };
                     sent?;
                 }
+                // An upstream failure: pass it on unchanged so the coordinator learns which
+                // request failed.
+                MsgType::Error => self.ring.next.send(MsgType::Error, h.request_id, h.position, &buf)?,
                 MsgType::Drop => {
                     self.engine.free(h.request_id);
                     self.ring.next.send(MsgType::Drop, h.request_id, 0, &[])?;

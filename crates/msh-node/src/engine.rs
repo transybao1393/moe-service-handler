@@ -27,11 +27,18 @@ pub struct MockEngine {
     vocab: u32,
     /// Per request: next expected position, and one state vector per layer.
     state: HashMap<u64, (u32, Vec<f32>)>,
+    fail_on: Option<u64>,
 }
 
 impl MockEngine {
     pub fn new(layers: Range<u32>, dim: usize) -> Self {
-        MockEngine { layers, dim, vocab: 151_936, state: HashMap::new() }
+        MockEngine { layers, dim, vocab: 151_936, state: HashMap::new(), fail_on: None }
+    }
+
+    /// Makes `forward` fail for request `req`, to test error paths.
+    pub fn failing_on(mut self, req: u64) -> Self {
+        self.fail_on = Some(req);
+        self
     }
 
     pub fn live_requests(&self) -> usize {
@@ -56,6 +63,9 @@ impl Engine for MockEngine {
     }
 
     fn forward(&mut self, req: u64, pos: u32, h: &mut [f32]) -> Result<(), Error> {
+        if self.fail_on == Some(req) {
+            return Err(Error::Engine(format!("mock failure on request {req}")));
+        }
         let n = self.layers.len() * self.dim;
         let (next_pos, st) = self.state.entry(req).or_insert_with(|| (0, vec![0.0; n]));
         if pos != *next_pos {

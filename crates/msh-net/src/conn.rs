@@ -88,10 +88,15 @@ impl Connection {
 
     /// Receives one frame into `payload`. A remote `Error` frame is surfaced as `FrameError::Remote`.
     pub fn recv(&mut self, payload: &mut Vec<u8>) -> Result<Header, FrameError> {
-        let h = read_frame(&mut self.reader, payload)?;
+        let h = self.recv_frame(payload)?;
         if h.msg_type == MsgType::Error {
             return Err(FrameError::Remote(String::from_utf8_lossy(payload).into()));
         }
         Ok(h)
+    }
+
+    /// Receives one frame of any type, `Error` included, so its request id and position are kept.
+    pub fn recv_frame(&mut self, payload: &mut Vec<u8>) -> Result<Header, FrameError> {
+        read_frame(&mut self.reader, payload)
     }
 }
