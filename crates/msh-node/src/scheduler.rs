@@ -9,6 +9,11 @@
 //! node and turns every frame into a message for the scheduler. Clients submit through a
 //! [`Client`] and receive their tokens as [`Event`]s on their own channel; dropping that channel
 //! cancels the request.
+//!
+//! Health (CL-8): every `health_interval_ms` the scheduler sends a `Ping` round the ring. If it
+//! has not come back within `health_timeout_ms`, or a connection breaks, the ring is down:
+//! in-flight requests fail and new ones are rejected until the cluster is restarted. The ping
+//! queues behind hidden states on every node, so the timeout must exceed one full ring pass.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -29,11 +34,15 @@ pub struct SchedulerConfig {
     pub max_in_flight: usize,
     /// Requests waiting for a slot; more are rejected.
     pub max_queue: usize,
+    /// How often a health ping is sent round the ring.
+    pub health_interval_ms: u64,
+    /// How long a ping may take to come back before the ring is declared down.
+    pub health_timeout_ms: u64,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
-        SchedulerConfig { max_in_flight: 3, max_queue: 64 }
+        SchedulerConfig { max_in_flight: 3, max_queue: 64, health_interval_ms: 1000, health_timeout_ms: 5000 }
     }
 }
 
@@ -100,7 +109,7 @@ pub fn collect(rx: Receiver<Event>) -> Result<Generation, Error> {
                 g.latencies.push(latency);
             }
             Event::Done => return Ok(g),
-            Event::Failed(m) => return Err(Error::Engine(m)),
+            Event::Failed(m) => return Err(Error::Failed(m)),
             Event::Rejected(m) => return Err(Error::Rejected(m)),
         }
     }
@@ -134,6 +143,9 @@ pub fn spawn<E: Engine + 'static>(
         ready: VecDeque::new(),
         down: None,
         shutting_down: false,
+        ping: None,
+        ping_seq: 0,
+        next_ping_at: Instant::now(),
     };
     (Client { tx }, thread::spawn(move || s.run()))
 }
@@ -190,6 +202,10 @@ struct Scheduler<E: Engine> {
     /// Set once the ring is lost; every later request is rejected with this reason.
     down: Option<String>,
     shutting_down: bool,
+    /// Outstanding health ping: sequence number and send time.
+    ping: Option<(u64, Instant)>,
+    ping_seq: u64,
+    next_ping_at: Instant,
 }
 
 impl<E: Engine> Scheduler<E> {
@@ -198,6 +214,7 @@ impl<E: Engine> Scheduler<E> {
             while let Ok(m) = self.rx.try_recv() {
                 self.handle(m);
             }
+            self.check_health();
             self.admit();
             if self.shutting_down && self.active.is_empty() {
                 return self.engine;
@@ -206,10 +223,45 @@ impl<E: Engine> Scheduler<E> {
                 self.step(id);
                 continue;
             }
-            match self.rx.recv() {
-                Ok(m) => self.handle(m),
-                Err(_) => return self.engine,
+            let msg = match self.health_deadline() {
+                Some(at) => match self.rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    other => other.ok(),
+                },
+                None => self.rx.recv().ok(),
+            };
+            match msg {
+                Some(m) => self.handle(m),
+                None => return self.engine,
             }
+        }
+    }
+
+    /// When the health check next needs attention, or `None` without a live ring.
+    fn health_deadline(&self) -> Option<Instant> {
+        self.next.as_ref()?;
+        Some(match self.ping {
+            Some((_, sent)) => sent + Duration::from_millis(self.cfg.health_timeout_ms),
+            None => self.next_ping_at,
+        })
+    }
+
+    fn check_health(&mut self) {
+        let Some(next) = &mut self.next else { return };
+        let now = Instant::now();
+        if let Some((seq, sent)) = self.ping {
+            if now.duration_since(sent) > Duration::from_millis(self.cfg.health_timeout_ms) {
+                let reason = format!("health ping {seq} not back after {} ms", self.cfg.health_timeout_ms);
+                self.ring_down(reason);
+            }
+        } else if now >= self.next_ping_at {
+            self.ping_seq += 1;
+            if let Err(e) = next.send(MsgType::Ping, self.ping_seq, 0, &[]) {
+                let reason = format!("send to {}: {e}", next.peer_name());
+                return self.ring_down(reason);
+            }
+            self.ping = Some((self.ping_seq, now));
+            self.next_ping_at = now + Duration::from_millis(self.cfg.health_interval_ms);
         }
     }
 
@@ -308,6 +360,11 @@ impl<E: Engine> Scheduler<E> {
             }
             MsgType::Error if in_flight => {
                 self.finish(id, Event::Failed(String::from_utf8_lossy(&payload).into_owned()))
+            }
+            MsgType::Ping => {
+                if self.ping.is_some_and(|(seq, _)| seq == id) {
+                    self.ping = None;
+                }
             }
             MsgType::Drop => {
                 if let Some(Request { phase: Phase::Freeing(outcome), events, .. }) = self.active.remove(&id) {

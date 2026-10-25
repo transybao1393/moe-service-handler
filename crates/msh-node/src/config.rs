@@ -16,7 +16,8 @@
 //! ```
 //!
 //! A single node with `layers = [0, 40]` is mode A. An optional `[scheduler]` table sets
-//! `max_in_flight` (default 3) and `max_queue` (default 64).
+//! `max_in_flight` (default 3), `max_queue` (64), `health_interval_ms` (1000) and
+//! `health_timeout_ms` (5000).
 
 use std::ops::Range;
 

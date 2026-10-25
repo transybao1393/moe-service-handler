@@ -131,6 +131,8 @@ impl<E: Engine> Worker<E> {
                 // An upstream failure: pass it on unchanged so the coordinator learns which
                 // request failed.
                 MsgType::Error => self.ring.next.send(MsgType::Error, h.request_id, h.position, &buf)?,
+                // Health ping from the coordinator: pass it on (CL-8).
+                MsgType::Ping => self.ring.next.send(MsgType::Ping, h.request_id, h.position, &buf)?,
                 MsgType::Drop => {
                     self.engine.free(h.request_id);
                     self.ring.next.send(MsgType::Drop, h.request_id, 0, &[])?;

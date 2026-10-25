@@ -36,6 +36,9 @@ flowchart LR
 - **Scheduler:** up to `max_in_flight` requests (default 3) step through the ring at once, so
   each node works on a different request; extra requests queue up to `max_queue`, then are
   rejected. Dropping a request's event channel cancels it.
+- **Health:** a `Ping` travels the ring every second. A broken connection, or a ping not back
+  within 5 s (a hung node), marks the ring down: in-flight requests fail and new ones are
+  rejected until the cluster is restarted.
 
 ### Mode A — single node
 
@@ -52,7 +55,7 @@ flowchart LR
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Coordinator / worker, config, ring, scheduler | M1 pipeline and scheduler (CL-5) done on a mock engine |
+| `msh-node` | binary | Coordinator / worker, config, ring, scheduler | M1 pipeline, scheduler (CL-5) and dead-node handling (CL-8) done on a mock engine |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
 The engine sits behind an `Engine` trait. `MockEngine` stands in until moeflux ships

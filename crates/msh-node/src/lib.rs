@@ -18,6 +18,8 @@ pub enum Error {
     Net(FrameError),
     Engine(String),
     Protocol(String),
+    /// A request failed after being admitted (engine error on some node, ring down).
+    Failed(String),
     /// The scheduler did not admit the request (queue full, ring down, ...).
     Rejected(String),
 }
@@ -29,6 +31,7 @@ impl fmt::Display for Error {
             Error::Net(e) => write!(f, "network: {e}"),
             Error::Engine(m) => write!(f, "engine: {m}"),
             Error::Protocol(m) => write!(f, "protocol: {m}"),
+            Error::Failed(m) => write!(f, "request failed: {m}"),
             Error::Rejected(m) => write!(f, "rejected: {m}"),
         }
     }

@@ -1,10 +1,11 @@
 use std::net::TcpListener;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use msh_net::MsgType;
 use msh_node::config::{Config, NodeConfig};
 use msh_node::engine::MockEngine;
-use msh_node::node::{join_ring, Worker};
+use msh_node::node::{join_ring, Ring, Worker};
 use msh_node::scheduler::{self, collect, Client, Event, SchedulerConfig};
 use msh_node::Error;
 
@@ -128,7 +129,7 @@ fn worker_error_fails_only_its_request() {
 
 #[test]
 fn full_queue_rejects_and_admitted_requests_still_finish() {
-    let sched = SchedulerConfig { max_in_flight: 1, max_queue: 1 };
+    let sched = SchedulerConfig { max_in_flight: 1, max_queue: 1, ..Default::default() };
     let c = Cluster::start_with(THREE, sched, None);
     let rxs: Vec<_> = (0..4).map(|i| c.client.submit(prompt(i), 8)).collect();
     let results: Vec<_> = rxs.into_iter().map(collect).collect();
@@ -156,5 +157,70 @@ fn dropping_the_receiver_cancels_and_frees_the_request() {
 fn rejects_empty_prompts() {
     let c = Cluster::start(THREE);
     assert!(matches!(c.client.generate(vec![], 4), Err(Error::Rejected(_))));
+    c.stop_and_check_freed();
+}
+
+/// A two-node ring whose second node runs `fake` instead of a real worker.
+fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Ring) + Send + 'static) -> Client {
+    let (l0, l1) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+    let node = |name: &str, l: &TcpListener, layers| NodeConfig {
+        name: name.into(),
+        addr: l.local_addr().unwrap().to_string(),
+        listen: None,
+        layers,
+    };
+    let cfg = Config {
+        hidden_dim: DIM,
+        num_layers: 40,
+        scheduler: sched,
+        nodes: vec![node("n0", &l0, [0, 20]), node("n1", &l1, [20, 40])],
+    };
+    let worker_cfg = cfg.clone();
+    thread::spawn(move || fake(join_ring(&worker_cfg, 1, l1, Duration::from_secs(5)).unwrap().unwrap()));
+    let ring = join_ring(&cfg, 0, l0, Duration::from_secs(5)).unwrap();
+    scheduler::spawn(MockEngine::new(0..20, DIM), ring, sched).0
+}
+
+/// Reads frames until the first hidden state.
+fn wait_for_hidden(ring: &mut Ring) {
+    let mut buf = Vec::new();
+    while ring.prev.recv_frame(&mut buf).unwrap().msg_type != MsgType::Hidden {}
+}
+
+#[test]
+fn crashed_worker_fails_requests_and_stops_accepting_work() {
+    let client = with_fake_worker(SchedulerConfig::default(), |mut ring| {
+        wait_for_hidden(&mut ring);
+        // Returning drops both connections, as a crashed process would.
+    });
+    let err = client.generate(prompt(0), 8).unwrap_err().to_string();
+    assert!(err.contains("ring down"), "{err}");
+    let err = client.generate(prompt(1), 8).unwrap_err();
+    assert!(matches!(&err, Error::Rejected(m) if m.contains("ring down")), "{err}");
+}
+
+#[test]
+fn hung_worker_is_detected_by_health_ping() {
+    let sched = SchedulerConfig { health_interval_ms: 20, health_timeout_ms: 200, ..Default::default() };
+    let client = with_fake_worker(sched, |mut ring| {
+        wait_for_hidden(&mut ring);
+        // Hang with the connections still open, as a frozen machine would.
+        thread::sleep(Duration::from_secs(3));
+        drop(ring);
+    });
+    let t0 = Instant::now();
+    let err = client.generate(prompt(0), 8).unwrap_err().to_string();
+    assert!(err.contains("health ping"), "{err}");
+    assert!(t0.elapsed() < Duration::from_secs(2), "took {:?}", t0.elapsed());
+}
+
+#[test]
+fn frequent_health_pings_do_not_disturb_generation() {
+    let want = reference(&[prompt(0), prompt(1)], 200);
+    let sched = SchedulerConfig { health_interval_ms: 1, ..Default::default() };
+    let c = Cluster::start_with(THREE, sched, None);
+    let rxs: Vec<_> = [prompt(0), prompt(1)].into_iter().map(|p| c.client.submit(p, 200)).collect();
+    let got: Vec<_> = rxs.into_iter().map(|rx| collect(rx).unwrap().tokens).collect();
+    assert_eq!(got, want);
     c.stop_and_check_freed();
 }
