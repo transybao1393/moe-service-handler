@@ -3,14 +3,15 @@
 //! The first node in the config is the coordinator; it submits K concurrent greedy generations
 //! over the prompt (token ids, until the HTTP endpoint lands) and prints throughput.
 //! Every other node is a worker and serves until the coordinator disconnects.
-//! The engine is `MockEngine` until moeflux's layer-range execution (DEP-1, DEP-2) lands.
+//! `[engine] kind` picks the mock (default) or moeflux, which needs a model feature at build
+//! time, e.g. `cargo build --release --features olmoe`.
 
 use std::net::TcpListener;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use msh_node::config::Config;
-use msh_node::engine::MockEngine;
+use msh_node::config::{Config, EngineKind};
+use msh_node::engine::{Engine, MockEngine};
 use msh_node::node::{join_ring, Worker};
 use msh_node::scheduler::{self, collect};
 
@@ -36,8 +37,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::parse(&std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?)?;
     let idx = cfg.index_of(name)?;
     let node = &cfg.nodes[idx];
-    let engine = MockEngine::new(node.layer_range(), cfg.num_layers, cfg.hidden_dim);
+    // Open the engine before joining the ring, so a range that does not fit fails here (DEP-4).
+    match cfg.engine.kind {
+        EngineKind::Mock => serve(&cfg, idx, MockEngine::new(node.layer_range(), cfg.num_layers, cfg.hidden_dim), &flag),
+        EngineKind::Moeflux => serve(&cfg, idx, open_moeflux(&cfg, idx)?, &flag),
+    }
+}
 
+#[cfg(feature = "moeflux")]
+fn open_moeflux(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box<dyn std::error::Error>> {
+    use msh_node::moeflux_engine::{expand_home, MoefluxEngine, OpenSpec};
+    let node = &cfg.nodes[idx];
+    let model_dir = expand_home(&cfg.engine.model_dir);
+    let t0 = Instant::now();
+    let engine = MoefluxEngine::open(&OpenSpec {
+        model_dir: &model_dir,
+        layers: node.layer_range(),
+        n_ctx: cfg.engine.n_ctx,
+        mem_cap: node.mem_cap(&cfg.engine),
+        max_requests: cfg.scheduler.max_in_flight,
+    })?;
+    eprintln!("{}: moeflux opened layers {:?} in {:.1} s", node.name, node.layer_range(), t0.elapsed().as_secs_f64());
+    Ok(engine)
+}
+
+#[cfg(not(feature = "moeflux"))]
+fn open_moeflux(_: &Config, _: usize) -> Result<MockEngine, Box<dyn std::error::Error>> {
+    Err("engine kind \"moeflux\" needs a build with a model feature, e.g. --features olmoe".into())
+}
+
+fn serve<'a, E: Engine + 'static>(
+    cfg: &Config,
+    idx: usize,
+    engine: E,
+    flag: &dyn Fn(&str) -> Option<&'a str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let node = &cfg.nodes[idx];
+    let name = node.name.as_str();
     let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
     let role = if idx == 0 { "coordinator" } else { "worker" };
     eprintln!("{name}: {role}, layers {:?}, listening on {}", node.layer_range(), node.listen_addr());
@@ -62,10 +98,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let (client, sched) = scheduler::spawn(engine, ring, cfg.scheduler);
     let t0 = Instant::now();
-    // Offset each request's prompt so they differ.
-    let rxs: Vec<_> = (0..requests)
-        .map(|i| client.submit(prompt.iter().map(|t| t + 1000 * i).collect(), max_new))
-        .collect();
+    let rxs: Vec<_> = (0..requests).map(|_| client.submit(prompt.clone(), max_new)).collect();
     let mut total = 0;
     let mut decode = Vec::new();
     for (i, rx) in rxs.into_iter().enumerate() {
@@ -74,7 +107,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // The first latency includes the prompt's last position; the rest are decode steps.
         decode.extend(g.latencies.iter().skip(1).map(|d| d.as_secs_f64() * 1e6));
         if i == 0 {
-            println!("request 1 tokens: {:?}", &g.tokens[..g.tokens.len().min(16)]);
+            println!("request 1 tokens: {:?}", &g.tokens[..g.tokens.len().min(32)]);
         }
     }
     let wall = t0.elapsed().as_secs_f64();

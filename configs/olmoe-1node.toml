@@ -1,0 +1,14 @@
+# Mode A with the real engine: OLMoE-1B-7B (16 layers), one node. Build with --features olmoe.
+hidden_dim = 2048
+num_layers = 16
+
+[engine]
+kind = "moeflux"
+model_dir = "~/models/olmoe-1b-7b"
+n_ctx = 2048
+mem_cap_gib = 3.0
+
+[[nodes]]
+name = "m4"
+addr = "127.0.0.1:7201"
+layers = [0, 16]

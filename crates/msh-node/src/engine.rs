@@ -20,6 +20,10 @@ pub enum StageIn<'a> {
 
 pub trait Engine: Send {
     fn hidden_dim(&self) -> usize;
+    /// End-of-sequence token: generation stops there, and it is not reported as output.
+    fn eos(&self) -> Option<u32> {
+        None
+    }
     /// Runs this node's layer range for one position of request `req`. On the node holding the
     /// head, returns the greedy token; elsewhere writes the next node's input to `hidden_out`
     /// and returns `None`. A request's positions must arrive in order from 0.

@@ -1,0 +1,25 @@
+# Mode B with the real engine on one machine: OLMoE-1B-7B split 8 / 4 / 4 over loopback,
+# the same shape as the planned M4 + 2 × M1 split. Build with --features olmoe.
+hidden_dim = 2048
+num_layers = 16
+
+[engine]
+kind = "moeflux"
+model_dir = "~/models/olmoe-1b-7b"
+n_ctx = 2048
+mem_cap_gib = 3.0
+
+[[nodes]]
+name = "m4"
+addr = "127.0.0.1:7201"
+layers = [0, 8]
+
+[[nodes]]
+name = "m1a"
+addr = "127.0.0.1:7202"
+layers = [8, 12]
+
+[[nodes]]
+name = "m1b"
+addr = "127.0.0.1:7203"
+layers = [12, 16]

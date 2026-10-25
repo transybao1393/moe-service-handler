@@ -378,6 +378,7 @@ impl<E: Engine> Scheduler<E> {
     }
 
     fn on_token(&mut self, id: u64, pos: u32, token: u32) {
+        let eos = self.engine.eos();
         let Some(r) = self.active.get_mut(&id) else { return };
         if pos as usize != r.pos {
             let msg = format!("token for position {pos}, expected {}", r.pos);
@@ -389,6 +390,9 @@ impl<E: Engine> Scheduler<E> {
             r.input = r.prompt[r.pos];
             self.ready.push_back(id);
             return;
+        }
+        if Some(token) == eos {
+            return self.finish(id, Event::Done);
         }
         r.generated += 1;
         let ev = Event::Token { token, latency: r.step_started.elapsed() };

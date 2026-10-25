@@ -55,11 +55,21 @@ flowchart LR
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Coordinator / worker, config, ring, scheduler | M1 pipeline, scheduler (CL-5) and dead-node handling (CL-8) done on a mock engine |
+| `msh-node` | binary | Coordinator / worker, config, ring, scheduler, engines | Ring, scheduler (CL-5), dead-node handling (CL-8); runs real moeflux (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
-The engine sits behind an `Engine` trait. `MockEngine` stands in until moeflux ships
-layer-range execution (moeflux Phase 3).
+The engine sits behind an `Engine` trait shaped like moeflux's `eval_request` (token or
+hidden state in; hidden state or sampled token out). Two implementations:
+
+- `MockEngine`: deterministic, no model needed; the default.
+- `MoefluxEngine`: moeflux on the node's layer range, one moeflux request slot per request in
+  flight. Built with a model feature (`--features olmoe` or `qwen36`) and selected with
+  `[engine] kind = "moeflux"`. moeflux is pinned to a commit of the local checkout until its
+  `main` is pushed (see `crates/msh-node/Cargo.toml`).
+
+For development the real engine runs **OLMoE-1B-7B** (16 layers, 3.9 GB at 4-bit) from
+`~/models/olmoe-1b-7b`: one node and a 3-process 8/4/4 split both reproduce moeflux's MLX
+reference answer token for token.
 
 ## Quick start
 
@@ -71,6 +81,10 @@ B=target/release/msh-node
 $B --config configs/local-3node.toml --node m1b &
 $B --config configs/local-3node.toml --node m1a &
 $B --config configs/local-3node.toml --node m4 --max-tokens 500 --requests 3
+
+# the real engine on OLMoE (configs/olmoe-*.toml), and its model-backed tests
+cargo build --release --features msh-node/olmoe
+cargo test -p msh-node --features olmoe --release --test olmoe -- --ignored --test-threads=1
 
 # network round-trip probe: serve on one machine, run from another
 target/release/msh-probe serve 0.0.0.0:7070

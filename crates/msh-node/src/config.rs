@@ -18,6 +18,16 @@
 //! A single node with `layers = [0, 40]` is mode A. An optional `[scheduler]` table sets
 //! `max_in_flight` (default 3), `max_queue` (64), `health_interval_ms` (1000) and
 //! `health_timeout_ms` (5000).
+//!
+//! An optional `[engine]` table picks the engine (default: the mock):
+//!
+//! ```toml
+//! [engine]
+//! kind = "moeflux"                     # needs a build with a model feature, e.g. --features olmoe
+//! model_dir = "~/models/olmoe-1b-7b"   # artifacts/ and root/ as moeflux's converters write them
+//! n_ctx = 2048
+//! mem_cap_gib = 3.0                    # per node; a node can override it with its own mem_cap_gib
+//! ```
 
 use std::ops::Range;
 
@@ -33,7 +43,33 @@ pub struct Config {
     pub num_layers: u32,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub engine: EngineConfig,
     pub nodes: Vec<NodeConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineKind {
+    #[default]
+    Mock,
+    Moeflux,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EngineConfig {
+    pub kind: EngineKind,
+    pub model_dir: String,
+    pub n_ctx: usize,
+    /// Hard memory cap for moeflux on each node, in GiB. `None` = uncapped.
+    pub mem_cap_gib: Option<f64>,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        EngineConfig { kind: EngineKind::Mock, model_dir: String::new(), n_ctx: 2048, mem_cap_gib: None }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -45,6 +81,8 @@ pub struct NodeConfig {
     /// Address to bind; defaults to `addr`. Use `0.0.0.0:PORT` to listen on every interface.
     pub listen: Option<String>,
     pub layers: [u32; 2],
+    /// Overrides `engine.mem_cap_gib` on this node.
+    pub mem_cap_gib: Option<f64>,
 }
 
 impl NodeConfig {
@@ -54,6 +92,11 @@ impl NodeConfig {
 
     pub fn listen_addr(&self) -> &str {
         self.listen.as_deref().unwrap_or(&self.addr)
+    }
+
+    /// This node's moeflux memory cap in bytes.
+    pub fn mem_cap(&self, engine: &EngineConfig) -> Option<u64> {
+        self.mem_cap_gib.or(engine.mem_cap_gib).map(|g| (g * (1u64 << 30) as f64) as u64)
     }
 }
 
@@ -83,6 +126,9 @@ impl Config {
         }
         if next != self.num_layers {
             return bad(format!("layer ranges end at {next}, model has {}", self.num_layers));
+        }
+        if self.engine.kind == EngineKind::Moeflux && self.engine.model_dir.is_empty() {
+            return bad("engine.model_dir is required for kind = \"moeflux\"".into());
         }
         Ok(())
     }
@@ -132,6 +178,19 @@ mod tests {
         let text = THREE.replace("num_layers = 40", "num_layers = 40\n[scheduler]\nmax_in_flight = 5");
         let c = Config::parse(&text).unwrap();
         assert_eq!((c.scheduler.max_in_flight, c.scheduler.max_queue), (5, 64));
+    }
+
+    #[test]
+    fn engine_section_and_per_node_cap() {
+        let text = THREE
+            .replace("num_layers = 40", "num_layers = 40\n[engine]\nkind = \"moeflux\"\nmodel_dir = \"/m\"\nmem_cap_gib = 2.0")
+            .replace("layers = [20, 30]", "layers = [20, 30]\nmem_cap_gib = 0.5");
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.engine.kind, EngineKind::Moeflux);
+        assert_eq!(c.nodes[0].mem_cap(&c.engine), Some(2 << 30));
+        assert_eq!(c.nodes[1].mem_cap(&c.engine), Some(1 << 29));
+        assert_eq!(Config::parse(THREE).unwrap().engine.kind, EngineKind::Mock);
+        assert!(Config::parse(&text.replace("model_dir = \"/m\"", "")).is_err());
     }
 
     #[test]

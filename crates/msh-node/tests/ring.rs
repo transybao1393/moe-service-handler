@@ -36,6 +36,7 @@ impl Cluster {
             hidden_dim: DIM,
             num_layers: 40,
             scheduler: sched,
+            engine: Default::default(),
             nodes: splits
                 .iter()
                 .zip(&listeners)
@@ -45,6 +46,7 @@ impl Cluster {
                     addr: l.local_addr().unwrap().to_string(),
                     listen: None,
                     layers: *layers,
+                    mem_cap_gib: None,
                 })
                 .collect(),
         };
@@ -168,11 +170,13 @@ fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Ring) + Send + 'st
         addr: l.local_addr().unwrap().to_string(),
         listen: None,
         layers,
+        mem_cap_gib: None,
     };
     let cfg = Config {
         hidden_dim: DIM,
         num_layers: 40,
         scheduler: sched,
+        engine: Default::default(),
         nodes: vec![node("n0", &l0, [0, 20]), node("n1", &l1, [20, 40])],
     };
     let worker_cfg = cfg.clone();
