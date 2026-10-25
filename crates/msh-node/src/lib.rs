@@ -1,11 +1,12 @@
 //! `msh-node`: coordinator and worker roles for moe-service-handler.
 //!
-//! M1 scope: one request at a time through a ring of nodes, each running a contiguous layer
-//! range. Scheduler, planner and HTTP come in M2.
+//! A ring of nodes, each running a contiguous layer range, with the coordinator's scheduler
+//! keeping several requests in flight. Planner and HTTP come later in M2.
 
 pub mod config;
 pub mod engine;
 pub mod node;
+pub mod scheduler;
 
 use std::fmt;
 
@@ -17,6 +18,8 @@ pub enum Error {
     Net(FrameError),
     Engine(String),
     Protocol(String),
+    /// The scheduler did not admit the request (queue full, ring down, ...).
+    Rejected(String),
 }
 
 impl fmt::Display for Error {
@@ -26,6 +29,7 @@ impl fmt::Display for Error {
             Error::Net(e) => write!(f, "network: {e}"),
             Error::Engine(m) => write!(f, "engine: {m}"),
             Error::Protocol(m) => write!(f, "protocol: {m}"),
+            Error::Rejected(m) => write!(f, "rejected: {m}"),
         }
     }
 }

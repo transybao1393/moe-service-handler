@@ -1,17 +1,18 @@
-//! msh-node --config FILE --node NAME [--prompt 1,2,3] [--max-tokens N]
+//! msh-node --config FILE --node NAME [--prompt 1,2,3] [--max-tokens N] [--requests K]
 //!
-//! The first node in the config is the coordinator; it runs one greedy generation over the
-//! prompt (token ids, until the HTTP endpoint lands in M2) and prints per-token timing.
+//! The first node in the config is the coordinator; it submits K concurrent greedy generations
+//! over the prompt (token ids, until the HTTP endpoint lands) and prints throughput.
 //! Every other node is a worker and serves until the coordinator disconnects.
 //! The engine is `MockEngine` until moeflux's layer-range execution (DEP-1, DEP-2) lands.
 
 use std::net::TcpListener;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use msh_node::config::Config;
 use msh_node::engine::MockEngine;
-use msh_node::node::{join_ring, Coordinator, Worker};
+use msh_node::node::{join_ring, Worker};
+use msh_node::scheduler::{self, collect};
 
 const RING_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -28,7 +29,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).map(String::as_str);
-    let usage = "usage: msh-node --config FILE --node NAME [--prompt 1,2,3] [--max-tokens N]";
+    let usage = "usage: msh-node --config FILE --node NAME [--prompt 1,2,3] [--max-tokens N] [--requests K]";
     let path = flag("--config").ok_or(usage)?;
     let name = flag("--node").ok_or(usage)?;
 
@@ -58,20 +59,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("--prompt: {e}"))?;
     let max_new: usize = flag("--max-tokens").unwrap_or("32").parse().map_err(|e| format!("--max-tokens: {e}"))?;
 
-    let mut coord = Coordinator::new(engine, ring);
-    let g = coord.generate(1, &prompt, max_new)?;
-    let us: Vec<f64> = g.step_times.iter().map(|d| d.as_secs_f64() * 1e6).collect();
-    let mut sorted = us.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let decode = &us[1.min(us.len())..]; // first entry includes the prompt's last position
-    let mean = decode.iter().sum::<f64>() / decode.len().max(1) as f64;
-    println!("tokens: {:?}", g.tokens);
+    let requests: u32 = flag("--requests").unwrap_or("1").parse().map_err(|e| format!("--requests: {e}"))?;
+
+    let (client, sched) = scheduler::spawn(engine, ring, cfg.scheduler);
+    let t0 = Instant::now();
+    // Offset each request's prompt so they differ.
+    let rxs: Vec<_> = (0..requests)
+        .map(|i| client.submit(prompt.iter().map(|t| t + 1000 * i).collect(), max_new))
+        .collect();
+    let mut total = 0;
+    let mut decode = Vec::new();
+    for (i, rx) in rxs.into_iter().enumerate() {
+        let g = collect(rx)?;
+        total += g.tokens.len();
+        // The first latency includes the prompt's last position; the rest are decode steps.
+        decode.extend(g.latencies.iter().skip(1).map(|d| d.as_secs_f64() * 1e6));
+        if i == 0 {
+            println!("request 1 tokens: {:?}", &g.tokens[..g.tokens.len().min(16)]);
+        }
+    }
+    let wall = t0.elapsed().as_secs_f64();
+    client.shutdown();
+    sched.join().map_err(|_| "scheduler panicked")?;
+    decode.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = decode.get(decode.len() / 2).copied().unwrap_or(f64::NAN);
     println!(
-        "{} tokens, step p50 {:.0} µs, decode mean {:.0} µs ({:.0} tok/s)",
-        g.tokens.len(),
-        sorted[sorted.len() / 2],
-        mean,
-        1e6 / mean
+        "{requests} requests (max {} in flight), {total} tokens in {wall:.3} s: {:.0} tok/s total, \
+         per-token latency p50 {p50:.0} µs",
+        cfg.scheduler.max_in_flight,
+        total as f64 / wall
     );
     Ok(())
 }

@@ -31,7 +31,11 @@ flowchart LR
 - **f32 on the wire:** the engine works in f32, so a split pipeline stays bit-identical to
   one process.
 - **`Drop`** travels the whole ring; when it returns, every node has freed the request.
-- **Errors** on a worker reach the coordinator as an `Error` frame; the ring stays up.
+- **Errors** on a worker reach the coordinator as an `Error` frame tagged with the request;
+  only that request fails and the ring stays up.
+- **Scheduler:** up to `max_in_flight` requests (default 3) step through the ring at once, so
+  each node works on a different request; extra requests queue up to `max_queue`, then are
+  rejected. Dropping a request's event channel cancels it.
 
 ### Mode A — single node
 
@@ -48,7 +52,7 @@ flowchart LR
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Coordinator / worker, config, ring | M1 pipeline done on a mock engine |
+| `msh-node` | binary | Coordinator / worker, config, ring, scheduler | M1 pipeline and scheduler (CL-5) done on a mock engine |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
 The engine sits behind an `Engine` trait. `MockEngine` stands in until moeflux ships
@@ -63,7 +67,7 @@ cargo test --release
 B=target/release/msh-node
 $B --config configs/local-3node.toml --node m1b &
 $B --config configs/local-3node.toml --node m1a &
-$B --config configs/local-3node.toml --node m4 --max-tokens 64
+$B --config configs/local-3node.toml --node m4 --max-tokens 500 --requests 3
 
 # network round-trip probe: serve on one machine, run from another
 target/release/msh-probe serve 0.0.0.0:7070

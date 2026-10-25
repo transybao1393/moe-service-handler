@@ -15,12 +15,14 @@
 //! layers = [20, 40]
 //! ```
 //!
-//! A single node with `layers = [0, 40]` is mode A.
+//! A single node with `layers = [0, 40]` is mode A. An optional `[scheduler]` table sets
+//! `max_in_flight` (default 3) and `max_queue` (default 64).
 
 use std::ops::Range;
 
 use serde::Deserialize;
 
+use crate::scheduler::SchedulerConfig;
 use crate::Error;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -28,6 +30,8 @@ use crate::Error;
 pub struct Config {
     pub hidden_dim: usize,
     pub num_layers: u32,
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
     pub nodes: Vec<NodeConfig>,
 }
 
@@ -119,6 +123,14 @@ mod tests {
         assert_eq!(c.nodes[0].listen_addr(), "0.0.0.0:7100");
         assert_eq!(c.nodes[2].listen_addr(), "10.0.0.3:7100");
         assert_eq!(c.index_of("m1b").unwrap(), 2);
+        assert_eq!(c.scheduler.max_in_flight, 3);
+    }
+
+    #[test]
+    fn scheduler_section_overrides_defaults() {
+        let text = THREE.replace("num_layers = 40", "num_layers = 40\n[scheduler]\nmax_in_flight = 5");
+        let c = Config::parse(&text).unwrap();
+        assert_eq!((c.scheduler.max_in_flight, c.scheduler.max_queue), (5, 64));
     }
 
     #[test]

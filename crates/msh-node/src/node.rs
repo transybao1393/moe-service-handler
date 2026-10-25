@@ -1,4 +1,4 @@
-//! Ring topology, coordinator and worker loops.
+//! Ring topology and the worker loop. The coordinator side lives in `scheduler`.
 //!
 //! Nodes form a ring in config order: node i sends hidden states to node i+1, and the last
 //! node sends sampled token ids back to node 0, the coordinator. `Drop` travels the whole ring,
@@ -78,96 +78,6 @@ fn connect_with_retry(addr: &str, me: &str, timeout: Duration) -> Result<Connect
                 thread::sleep(Duration::from_millis(100));
             }
             Err(e) => return Err(Error::Protocol(format!("connect to {addr}: {e}"))),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Generation {
-    pub tokens: Vec<u32>,
-    /// Wall time of the step that produced each token.
-    pub step_times: Vec<Duration>,
-}
-
-/// Node 0: embeds tokens, runs its layer range, and drives the ring one position at a time.
-pub struct Coordinator<E: Engine> {
-    engine: E,
-    ring: Option<Ring>,
-    hidden: Vec<f32>,
-    buf: Vec<u8>,
-}
-
-impl<E: Engine> Coordinator<E> {
-    pub fn new(engine: E, ring: Option<Ring>) -> Self {
-        let hidden = vec![0.0; engine.hidden_dim()];
-        Coordinator { engine, ring, hidden, buf: Vec::new() }
-    }
-
-    pub fn engine(&self) -> &E {
-        &self.engine
-    }
-
-    /// Greedy generation of up to `max_new` tokens. The request's state is freed on every
-    /// node afterwards, whether generation succeeded or not.
-    pub fn generate(&mut self, req: u64, prompt: &[u32], max_new: usize) -> Result<Generation, Error> {
-        if prompt.is_empty() {
-            return Err(Error::Protocol("empty prompt".into()));
-        }
-        let result = self.run(req, prompt, max_new);
-        let freed = self.free(req);
-        let generation = result?;
-        freed?;
-        Ok(generation)
-    }
-
-    fn run(&mut self, req: u64, prompt: &[u32], max_new: usize) -> Result<Generation, Error> {
-        let mut g = Generation { tokens: Vec::new(), step_times: Vec::new() };
-        let mut input = prompt[0];
-        let mut pos = 0;
-        while g.tokens.len() < max_new {
-            let t0 = Instant::now();
-            let out = self.step(req, pos as u32, input)?;
-            pos += 1;
-            if pos < prompt.len() {
-                input = prompt[pos];
-            } else {
-                g.tokens.push(out);
-                g.step_times.push(t0.elapsed());
-                input = out;
-            }
-        }
-        Ok(g)
-    }
-
-    fn step(&mut self, req: u64, pos: u32, token: u32) -> Result<u32, Error> {
-        self.engine.embed(token, &mut self.hidden)?;
-        self.engine.forward(req, pos, &mut self.hidden)?;
-        let Some(ring) = &mut self.ring else {
-            return self.engine.head(&self.hidden);
-        };
-        f32s_to_bytes(&self.hidden, &mut self.buf);
-        ring.next.send(MsgType::Hidden, req, pos, &self.buf)?;
-        let h = ring.prev.recv(&mut self.buf)?;
-        if h.msg_type != MsgType::Token || h.request_id != req || h.position != pos || self.buf.len() != 4 {
-            return Err(Error::Protocol(format!(
-                "expected token for request {req} position {pos}, got {:?} for {} at {}",
-                h.msg_type, h.request_id, h.position
-            )));
-        }
-        Ok(u32::from_le_bytes(self.buf[..4].try_into().unwrap()))
-    }
-
-    fn free(&mut self, req: u64) -> Result<(), Error> {
-        self.engine.free(req);
-        let Some(ring) = &mut self.ring else { return Ok(()) };
-        ring.next.send(MsgType::Drop, req, 0, &[])?;
-        // Skip any tokens still in flight from a failed step until our Drop comes back.
-        loop {
-            match ring.prev.recv(&mut self.buf) {
-                Ok(h) if h.msg_type == MsgType::Drop && h.request_id == req => return Ok(()),
-                Ok(_) | Err(FrameError::Remote(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
         }
     }
 }
