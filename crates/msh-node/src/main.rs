@@ -36,7 +36,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::parse(&std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?)?;
     let idx = cfg.index_of(name)?;
     let node = &cfg.nodes[idx];
-    let engine = MockEngine::new(node.layer_range(), cfg.hidden_dim);
+    let engine = MockEngine::new(node.layer_range(), cfg.num_layers, cfg.hidden_dim);
 
     let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
     let role = if idx == 0 { "coordinator" } else { "worker" };
@@ -45,8 +45,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{name}: ring ready ({} nodes)", cfg.nodes.len());
 
     if idx > 0 {
-        let is_last = idx == cfg.nodes.len() - 1;
-        Worker::new(engine, ring.expect("multi-node ring"), name, is_last).run()?;
+        Worker::new(engine, ring.expect("multi-node ring"), name).run()?;
         eprintln!("{name}: coordinator disconnected, exiting");
         return Ok(());
     }

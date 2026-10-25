@@ -51,7 +51,7 @@ impl Cluster {
         cfg.validate().unwrap();
 
         let engine = |i: usize| {
-            let e = MockEngine::new(cfg.nodes[i].layer_range(), DIM);
+            let e = MockEngine::new(cfg.nodes[i].layer_range(), 40, DIM);
             match fail {
                 Some((node, req)) if node == i => e.failing_on(req),
                 _ => e,
@@ -66,7 +66,7 @@ impl Cluster {
                 let (cfg, engine) = (cfg.clone(), engine(i));
                 thread::spawn(move || {
                     let ring = join_ring(&cfg, i, l, Duration::from_secs(5)).unwrap().unwrap();
-                    Worker::new(engine, ring, &cfg.nodes[i].name, i == cfg.nodes.len() - 1).run().unwrap()
+                    Worker::new(engine, ring, &cfg.nodes[i].name).run().unwrap()
                 })
             })
             .collect();
@@ -178,7 +178,7 @@ fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Ring) + Send + 'st
     let worker_cfg = cfg.clone();
     thread::spawn(move || fake(join_ring(&worker_cfg, 1, l1, Duration::from_secs(5)).unwrap().unwrap()));
     let ring = join_ring(&cfg, 0, l0, Duration::from_secs(5)).unwrap();
-    scheduler::spawn(MockEngine::new(0..20, DIM), ring, sched).0
+    scheduler::spawn(MockEngine::new(0..20, 40, DIM), ring, sched).0
 }
 
 /// Reads frames until the first hidden state.

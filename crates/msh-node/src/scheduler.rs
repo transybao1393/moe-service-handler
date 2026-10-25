@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use msh_net::{f32s_to_bytes, Connection, Header, MsgType};
 use serde::Deserialize;
 
-use crate::engine::Engine;
+use crate::engine::{Engine, StageIn};
 use crate::node::Ring;
 use crate::Error;
 
@@ -328,18 +328,18 @@ impl<E: Engine> Scheduler<E> {
         let Some(r) = self.active.get_mut(&id) else { return };
         r.step_started = Instant::now();
         let (pos, input) = (r.pos as u32, r.input);
-        let local = self
-            .engine
-            .embed(input, &mut self.hidden)
-            .and_then(|()| self.engine.forward(id, pos, &mut self.hidden));
-        if let Err(e) = local {
-            return self.finish(id, Event::Failed(e.to_string()));
-        }
-        let Some(next) = &mut self.next else {
-            return match self.engine.head(&self.hidden) {
-                Ok(token) => self.on_token(id, pos, token),
-                Err(e) => self.finish(id, Event::Failed(e.to_string())),
-            };
+        let token = match self.engine.step(id, pos, StageIn::Token(input), &mut self.hidden) {
+            Ok(token) => token,
+            Err(e) => return self.finish(id, Event::Failed(e.to_string())),
+        };
+        let next = match (token, &mut self.next) {
+            // Mode A: this node holds the head.
+            (Some(token), None) => return self.on_token(id, pos, token),
+            (None, Some(next)) => next,
+            (Some(_), Some(_)) | (None, None) => {
+                let msg = "coordinator stage does not match the ring (head on the wrong node)";
+                return self.finish(id, Event::Failed(msg.into()));
+            }
         };
         f32s_to_bytes(&self.hidden, &mut self.buf);
         if let Err(e) = next.send(MsgType::Hidden, id, pos, &self.buf) {

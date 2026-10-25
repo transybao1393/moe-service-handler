@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use msh_net::{bytes_to_f32s, f32s_to_bytes, Connection, FrameError, MsgType};
 
 use crate::config::Config;
-use crate::engine::Engine;
+use crate::engine::{Engine, StageIn};
 use crate::Error;
 
 pub struct Ring {
@@ -82,23 +82,23 @@ fn connect_with_retry(addr: &str, me: &str, timeout: Duration) -> Result<Connect
     }
 }
 
-/// Nodes 1..n: run the layer range on each incoming hidden state and pass it on; the last node
-/// applies the head and sends the token back to the coordinator.
+/// Nodes 1..n: run the layer range on each incoming hidden state and pass it on; the node
+/// holding the head sends the sampled token back to the coordinator instead.
 pub struct Worker<E: Engine> {
     engine: E,
     ring: Ring,
     name: String,
-    head: bool,
 }
 
 impl<E: Engine> Worker<E> {
-    pub fn new(engine: E, ring: Ring, name: &str, head: bool) -> Self {
-        Worker { engine, ring, name: name.to_string(), head }
+    pub fn new(engine: E, ring: Ring, name: &str) -> Self {
+        Worker { engine, ring, name: name.to_string() }
     }
 
     /// Serves until the previous node closes the connection; returns the engine for inspection.
     pub fn run(mut self) -> Result<E, Error> {
         let mut hidden = vec![0.0; self.engine.hidden_dim()];
+        let mut hidden_out = vec![0.0; self.engine.hidden_dim()];
         let mut buf = Vec::new();
         let mut out = Vec::new();
         loop {
@@ -109,16 +109,16 @@ impl<E: Engine> Worker<E> {
             };
             match h.msg_type {
                 MsgType::Hidden => {
-                    let result = bytes_to_f32s(&buf, &mut hidden)
-                        .map_err(Error::from)
-                        .and_then(|()| self.engine.forward(h.request_id, h.position, &mut hidden));
+                    let result = bytes_to_f32s(&buf, &mut hidden).map_err(Error::from).and_then(|()| {
+                        let input = StageIn::Hidden(&hidden);
+                        self.engine.step(h.request_id, h.position, input, &mut hidden_out)
+                    });
                     let sent = match result {
-                        Ok(()) if self.head => {
-                            let token = self.engine.head(&hidden)?;
+                        Ok(Some(token)) => {
                             self.ring.next.send(MsgType::Token, h.request_id, h.position, &token.to_le_bytes())
                         }
-                        Ok(()) => {
-                            f32s_to_bytes(&hidden, &mut out);
+                        Ok(None) => {
+                            f32s_to_bytes(&hidden_out, &mut out);
                             self.ring.next.send(MsgType::Hidden, h.request_id, h.position, &out)
                         }
                         Err(e) => {
