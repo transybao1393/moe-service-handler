@@ -1,0 +1,11 @@
+[package]
+name = "msh-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+msh-net = { version = "0.1.0", path = "../msh-net" }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.0.7"

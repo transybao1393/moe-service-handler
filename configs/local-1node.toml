@@ -1,0 +1,8 @@
+# Mode A: one node runs all 40 layers.
+hidden_dim = 2048
+num_layers = 40
+
+[[nodes]]
+name = "m4"
+addr = "127.0.0.1:7101"
+layers = [0, 40]

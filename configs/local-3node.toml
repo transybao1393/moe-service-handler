@@ -1,0 +1,18 @@
+# Three processes on one machine over loopback; same split as the planned M4 + 2 × M1 cluster.
+hidden_dim = 2048
+num_layers = 40
+
+[[nodes]]
+name = "m4"
+addr = "127.0.0.1:7101"
+layers = [0, 20]
+
+[[nodes]]
+name = "m1a"
+addr = "127.0.0.1:7102"
+layers = [20, 30]
+
+[[nodes]]
+name = "m1b"
+addr = "127.0.0.1:7103"
+layers = [30, 40]

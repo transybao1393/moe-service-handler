@@ -1,0 +1,11 @@
+[package]
+name = "msh-net"
+description = "Node-to-node transport for moe-service-handler (hidden states, tokens, control)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "msh-probe"
+path = "src/bin/msh-probe.rs"

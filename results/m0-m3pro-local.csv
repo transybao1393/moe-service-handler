@@ -1,0 +1,11 @@
+timestamp,git_hash,local,local_hw,peer,link,bytes,n,min_us,p50_us,p99_us,max_us,mean_us,hop_p50_us,mb_per_s
+1792927917,unknown-dirty,Johnathans-MacBook-Pro,Apple M3 Pro / 18 GB / macOS 14.4,Johnathans-MacBook-Pro,loopback,4,1000,9.96,36.42,74.17,138.96,29.60,18.21,0.2
+1792927917,unknown-dirty,Johnathans-MacBook-Pro,Apple M3 Pro / 18 GB / macOS 14.4,Johnathans-MacBook-Pro,loopback,4096,1000,10.83,12.75,17.92,25.08,12.95,6.38,642.5
+1792927917,unknown-dirty,Johnathans-MacBook-Pro,Apple M3 Pro / 18 GB / macOS 14.4,Johnathans-MacBook-Pro,loopback,65536,1000,23.08,27.75,35.79,46.75,29.09,13.88,4723.3
+1792927917,unknown-dirty,Johnathans-MacBook-Pro,Apple M3 Pro / 18 GB / macOS 14.4,Johnathans-MacBook-Pro,loopback,1048576,256,123.08,137.38,150.79,170.88,137.62,68.69,15265.9
+1792927917,unknown-dirty,Johnathans-MacBook-Pro,Apple M3 Pro / 18 GB / macOS 14.4,Johnathans-MacBook-Pro,loopback,16777216,20,3095.38,3255.67,3488.38,3488.38,3273.71,1627.83,10306.5
+1792927918,unknown-dirty,Johnathans-MacBook-Pro,Apple M3 Pro / 18 GB / macOS 14.4,Johnathans-MacBook-Pro,local-en0-addr,4,1000,8.79,13.42,19.67,25.88,13.46,6.71,0.6
+1792927918,unknown-dirty,Johnathans-MacBook-Pro,Apple M3 Pro / 18 GB / macOS 14.4,Johnathans-MacBook-Pro,local-en0-addr,4096,1000,11.38,13.71,16.46,19.38,13.88,6.85,597.6
+1792927918,unknown-dirty,Johnathans-MacBook-Pro,Apple M3 Pro / 18 GB / macOS 14.4,Johnathans-MacBook-Pro,local-en0-addr,65536,1000,25.50,27.96,35.58,39.04,29.32,13.98,4688.2
+1792927918,unknown-dirty,Johnathans-MacBook-Pro,Apple M3 Pro / 18 GB / macOS 14.4,Johnathans-MacBook-Pro,local-en0-addr,1048576,256,125.50,136.71,148.38,149.96,136.78,68.35,15340.4
+1792927918,unknown-dirty,Johnathans-MacBook-Pro,Apple M3 Pro / 18 GB / macOS 14.4,Johnathans-MacBook-Pro,local-en0-addr,16777216,20,3027.17,3221.50,3298.50,3298.50,3207.00,1610.75,10415.8
