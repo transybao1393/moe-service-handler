@@ -83,4 +83,4 @@ the software floor for the M4↔M1 runs:
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).
