@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use msh_node::config::{Config, NodeConfig};
-use msh_node::streammoe_engine::{expand_home, StreamMoeEngine, OpenSpec};
+use msh_node::config::{expand_home, Config, NodeConfig};
+use msh_node::streammoe_engine::{OpenSpec, StreamMoeEngine};
 use msh_node::node::{join_ring, Worker};
 use msh_node::scheduler::{self, collect, Client, SchedulerConfig};
 
@@ -40,8 +40,30 @@ fn open(layers: std::ops::Range<u32>, max_requests: usize, mem_cap: Option<u64>)
         .expect("open OLMoE (is the model converted at ~/models/olmoe-1b-7b?)")
 }
 
-/// Starts `splits` on loopback threads and returns the coordinator's client.
-fn start(splits: &[[u32; 2]]) -> Client {
+/// A cluster on loopback threads. Dropping it shuts it down and waits until every node has
+/// released its context, so the next test starts with the process's memory back.
+struct Cluster {
+    client: Option<Client>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        drop(self.client.take());
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
+
+impl std::ops::Deref for Cluster {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        self.client.as_ref().unwrap()
+    }
+}
+
+fn start(splits: &[[u32; 2]]) -> Cluster {
     let cap = (splits.len() == 1).then_some(3 << 30);
     let sched = SchedulerConfig::default();
     let listeners: Vec<TcpListener> = splits.iter().map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
@@ -50,6 +72,7 @@ fn start(splits: &[[u32; 2]]) -> Client {
         num_layers: 16,
         scheduler: sched,
         engine: Default::default(),
+        http: None,
         nodes: splits
             .iter()
             .zip(&listeners)
@@ -65,17 +88,20 @@ fn start(splits: &[[u32; 2]]) -> Client {
     };
     let mut listeners = listeners.into_iter();
     let coord_listener = listeners.next().unwrap();
+    let mut threads = Vec::new();
     for (k, l) in listeners.enumerate() {
         let (i, cfg) = (k + 1, cfg.clone());
         let engine = open(cfg.nodes[i].layer_range(), sched.max_in_flight, cap);
-        thread::spawn(move || {
+        threads.push(thread::spawn(move || {
             let ring = join_ring(&cfg, i, l, Duration::from_secs(30)).unwrap().unwrap();
             Worker::new(engine, ring, &cfg.nodes[i].name).run().unwrap();
-        });
+        }));
     }
     let engine = open(cfg.nodes[0].layer_range(), sched.max_in_flight, cap);
     let ring = join_ring(&cfg, 0, coord_listener, Duration::from_secs(30)).unwrap();
-    scheduler::spawn(engine, ring, sched).0
+    let (client, coordinator) = scheduler::spawn(engine, ring, sched);
+    threads.push(thread::spawn(move || drop(coordinator.join())));
+    Cluster { client: Some(client), threads }
 }
 
 #[test]
@@ -99,4 +125,36 @@ fn three_node_ring_matches_mlx_reference_with_requests_in_flight() {
     for rx in rxs {
         assert_eq!(collect(rx).unwrap().tokens, REF);
     }
+}
+
+#[test]
+#[ignore = "needs the OLMoE model on disk"]
+fn http_chat_completion_answers_with_the_reference() {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use msh_node::chat::{ChatTemplate, Codec};
+    use msh_node::http::{router, HttpState};
+    use tower::ServiceExt;
+
+    let codec = Codec::load(&model_dir().join("hf/tokenizer.json"), ChatTemplate::Olmoe).unwrap();
+    let cluster = start(&[[0, 8], [8, 12], [12, 16]]);
+    let state = HttpState { client: (*cluster).clone(), codec, model: "olmoe".into(), n_ctx: 512, next_id: AtomicU64::new(1) };
+    let body = serde_json::json!({
+        "messages": [{ "role": "user", "content": "What is the capital of France? Answer in one sentence." }],
+    });
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let resp: serde_json::Value = rt.block_on(async {
+        let resp = router(Arc::new(state)).oneshot(req).await.unwrap();
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    });
+    assert_eq!(resp["choices"][0]["message"]["content"], "The capital of France is Paris.");
+    assert_eq!(resp["usage"]["prompt_tokens"], PROMPT.len());
 }

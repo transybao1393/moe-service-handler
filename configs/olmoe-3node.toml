@@ -9,6 +9,12 @@ model_dir = "~/models/olmoe-1b-7b"
 n_ctx = 2048
 mem_cap_gib = 3.0
 
+[http]
+listen = "127.0.0.1:8080"
+tokenizer = "~/models/olmoe-1b-7b/hf/tokenizer.json"
+chat_template = "olmoe"
+model = "olmoe-1b-7b"
+
 [[nodes]]
 name = "m4"
 addr = "127.0.0.1:7201"

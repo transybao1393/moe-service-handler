@@ -55,6 +55,12 @@ impl MockEngine {
         MockEngine { layers, head, dim, vocab: 151_936, state: HashMap::new(), fail_on: None }
     }
 
+    /// Samples from `vocab` token ids instead of the default 151,936.
+    pub fn with_vocab(mut self, vocab: u32) -> Self {
+        self.vocab = vocab;
+        self
+    }
+
     /// Makes `step` fail for request `req`, to test error paths.
     pub fn failing_on(mut self, req: u64) -> Self {
         self.fail_on = Some(req);

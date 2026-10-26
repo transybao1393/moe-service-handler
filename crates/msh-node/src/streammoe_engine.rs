@@ -6,7 +6,7 @@
 //! node's pool overflows. Sampling is greedy on the node holding the head.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use streammoe::{Ctx, OpenConfig, ReqId, StageInput, StageOutput};
 
@@ -113,12 +113,4 @@ fn argmax(v: &[f32]) -> u32 {
         }
     }
     best as u32
-}
-
-/// Expands a leading `~/` to `$HOME`.
-pub fn expand_home(p: &str) -> PathBuf {
-    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-        _ => PathBuf::from(p),
-    }
 }

@@ -37,6 +37,7 @@ impl Cluster {
             num_layers: 40,
             scheduler: sched,
             engine: Default::default(),
+            http: None,
             nodes: splits
                 .iter()
                 .zip(&listeners)
@@ -177,6 +178,7 @@ fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Ring) + Send + 'st
         num_layers: 40,
         scheduler: sched,
         engine: Default::default(),
+        http: None,
         nodes: vec![node("n0", &l0, [0, 20]), node("n1", &l1, [20, 40])],
     };
     let worker_cfg = cfg.clone();

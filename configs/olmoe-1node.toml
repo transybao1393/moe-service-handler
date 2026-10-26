@@ -9,6 +9,12 @@ n_ctx = 2048
 # 4 request slots (3 in flight + streammoe's default) × 0.5 GiB of KV at n_ctx 2048 need > 3 GiB.
 mem_cap_gib = 4.0
 
+[http]
+listen = "127.0.0.1:8080"
+tokenizer = "~/models/olmoe-1b-7b/hf/tokenizer.json"
+chat_template = "olmoe"
+model = "olmoe-1b-7b"
+
 [[nodes]]
 name = "m4"
 addr = "127.0.0.1:7201"

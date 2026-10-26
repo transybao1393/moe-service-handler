@@ -1,7 +1,8 @@
 //! msh-node --config FILE --node NAME [--prompt 1,2,3] [--max-tokens N] [--requests K]
 //!
-//! The first node in the config is the coordinator; it submits K concurrent greedy generations
-//! over the prompt (token ids, until the HTTP endpoint lands) and prints throughput.
+//! The first node in the config is the coordinator. With an `[http]` table and no `--prompt`,
+//! it serves the OpenAI-compatible API. With `--prompt` (token ids) it submits K concurrent
+//! greedy generations, prints throughput and exits.
 //! Every other node is a worker and serves until the coordinator disconnects.
 //! `[engine] kind` picks the mock (default) or streammoe, which needs a model feature at build
 //! time, e.g. `cargo build --release --features olmoe`.
@@ -10,7 +11,13 @@ use std::net::TcpListener;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use msh_node::config::{Config, EngineKind};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+
+use msh_node::chat::Codec;
+use msh_node::config::{expand_home, Config, EngineKind, HttpConfig};
+use msh_node::http::{self, HttpState};
+use msh_node::node::Ring;
 use msh_node::engine::{Engine, MockEngine};
 use msh_node::node::{join_ring, Worker};
 use msh_node::scheduler::{self, collect};
@@ -46,7 +53,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "streammoe")]
 fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box<dyn std::error::Error>> {
-    use msh_node::streammoe_engine::{expand_home, StreamMoeEngine, OpenSpec};
+    use msh_node::streammoe_engine::{OpenSpec, StreamMoeEngine};
     let node = &cfg.nodes[idx];
     let model_dir = expand_home(&cfg.engine.model_dir);
     let t0 = Instant::now();
@@ -86,6 +93,9 @@ fn serve<'a, E: Engine + 'static>(
         return Ok(());
     }
 
+    if let (None, Some(http)) = (flag("--prompt"), &cfg.http) {
+        return serve_http(cfg, http, engine, ring);
+    }
     let prompt: Vec<u32> = flag("--prompt")
         .unwrap_or("1,2,3,4,5,6,7,8")
         .split(',')
@@ -122,4 +132,29 @@ fn serve<'a, E: Engine + 'static>(
         total as f64 / wall
     );
     Ok(())
+}
+
+/// Runs the scheduler behind the HTTP API until the process is stopped.
+fn serve_http<E: Engine + 'static>(
+    cfg: &Config,
+    http: &HttpConfig,
+    engine: E,
+    ring: Option<Ring>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let codec = Codec::load(&expand_home(&http.tokenizer), http.chat_template)?;
+    let (client, _sched) = scheduler::spawn(engine, ring, cfg.scheduler);
+    let state = Arc::new(HttpState {
+        client,
+        codec,
+        model: http.model.clone(),
+        n_ctx: cfg.engine.n_ctx,
+        next_id: AtomicU64::new(1),
+    });
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind(&http.listen).await.map_err(|e| format!("bind {}: {e}", http.listen))?;
+        eprintln!("{}: serving {} on http://{}/v1", cfg.nodes[0].name, http.model, http.listen);
+        axum::serve(listener, http::router(state)).await?;
+        Ok(())
+    })
 }

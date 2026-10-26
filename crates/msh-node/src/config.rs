@@ -28,11 +28,23 @@
 //! n_ctx = 2048
 //! mem_cap_gib = 3.0                    # per node; a node can override it with its own mem_cap_gib
 //! ```
+//!
+//! An optional `[http]` table makes the coordinator serve the OpenAI-compatible API:
+//!
+//! ```toml
+//! [http]
+//! listen = "0.0.0.0:8080"
+//! tokenizer = "~/models/olmoe-1b-7b/hf/tokenizer.json"
+//! chat_template = "olmoe"              # or "chatml" (Qwen)
+//! model = "olmoe-1b-7b"                # name reported to clients
+//! ```
 
 use std::ops::Range;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::chat::ChatTemplate;
 use crate::scheduler::SchedulerConfig;
 use crate::Error;
 
@@ -45,7 +57,27 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub engine: EngineConfig,
+    #[serde(default)]
+    pub http: Option<HttpConfig>,
     pub nodes: Vec<NodeConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConfig {
+    pub listen: String,
+    /// Path to a Hugging Face `tokenizer.json`.
+    pub tokenizer: String,
+    pub chat_template: ChatTemplate,
+    pub model: String,
+}
+
+/// Expands a leading `~/` to `$HOME`.
+pub fn expand_home(p: &str) -> PathBuf {
+    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(p),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -191,6 +223,17 @@ mod tests {
         assert_eq!(c.nodes[1].mem_cap(&c.engine), Some(1 << 29));
         assert_eq!(Config::parse(THREE).unwrap().engine.kind, EngineKind::Mock);
         assert!(Config::parse(&text.replace("model_dir = \"/m\"", "")).is_err());
+    }
+
+    #[test]
+    fn http_section() {
+        let text = THREE.replace(
+            "num_layers = 40",
+            "num_layers = 40\n[http]\nlisten = \"0.0.0.0:8080\"\ntokenizer = \"/t.json\"\nchat_template = \"chatml\"\nmodel = \"q\"",
+        );
+        let http = Config::parse(&text).unwrap().http.unwrap();
+        assert_eq!((http.chat_template, http.model.as_str()), (ChatTemplate::Chatml, "q"));
+        assert!(Config::parse(THREE).unwrap().http.is_none());
     }
 
     #[test]

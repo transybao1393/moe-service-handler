@@ -3,8 +3,10 @@
 //! A ring of nodes, each running a contiguous layer range, with the coordinator's scheduler
 //! keeping several requests in flight. Planner and HTTP come later in M2.
 
+pub mod chat;
 pub mod config;
 pub mod engine;
+pub mod http;
 #[cfg(feature = "streammoe")]
 pub mod streammoe_engine;
 pub mod node;

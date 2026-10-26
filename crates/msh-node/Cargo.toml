@@ -19,3 +19,13 @@ streammoe = { package = "moeflux", git = "file:///Users/johnathan/Documents/proj
 msh-net = { version = "0.1.0", path = "../msh-net" }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.0.7"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "sync"] }
+axum = "0.8.9"
+tokio-stream = "0.1.19"
+serde_json = "1.0.154"
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time"] }
+tower = { version = "0.5.3", features = ["util"] }

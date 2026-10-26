@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,7 @@ use crate::Error;
 pub struct SchedulerConfig {
     /// Requests stepping through the ring at once.
     pub max_in_flight: usize,
-    /// Requests waiting for a slot; more are rejected.
+    /// Requests waiting for a slot once all are taken; more are rejected.
     pub max_queue: usize,
     /// How often a health ping is sent round the ring.
     pub health_interval_ms: u64,
@@ -72,9 +73,21 @@ enum Msg {
     Shutdown,
 }
 
+/// Handle for submitting requests. Clones share one scheduler; when the last clone is dropped
+/// the scheduler shuts down as if `shutdown` had been called.
 #[derive(Clone)]
 pub struct Client {
+    inner: Arc<ClientInner>,
+}
+
+struct ClientInner {
     tx: Sender<Msg>,
+}
+
+impl Drop for ClientInner {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Msg::Shutdown);
+    }
 }
 
 impl Client {
@@ -82,7 +95,7 @@ impl Client {
     pub fn submit(&self, prompt: Vec<u32>, max_new: usize) -> Receiver<Event> {
         let (events, rx) = mpsc::channel();
         let msg = Msg::Submit { prompt, max_new, events: events.clone() };
-        if self.tx.send(msg).is_err() {
+        if self.inner.tx.send(msg).is_err() {
             let _ = events.send(Event::Rejected("scheduler stopped".into()));
         }
         rx
@@ -95,7 +108,7 @@ impl Client {
 
     /// Stops accepting requests; the scheduler exits once in-flight requests finish.
     pub fn shutdown(&self) {
-        let _ = self.tx.send(Msg::Shutdown);
+        let _ = self.inner.tx.send(Msg::Shutdown);
     }
 }
 
@@ -147,7 +160,7 @@ pub fn spawn<E: Engine + 'static>(
         ping_seq: 0,
         next_ping_at: Instant::now(),
     };
-    (Client { tx }, thread::spawn(move || s.run()))
+    (Client { inner: Arc::new(ClientInner { tx }) }, thread::spawn(move || s.run()))
 }
 
 fn read_ring(mut prev: Connection, tx: Sender<Msg>) {
@@ -286,8 +299,8 @@ impl<E: Engine> Scheduler<E> {
             Some("shutting down".into())
         } else if prompt.is_empty() {
             Some("empty prompt".into())
-        } else if self.waiting.len() >= self.cfg.max_queue {
-            Some(format!("queue full ({} waiting)", self.waiting.len()))
+        } else if self.active.len() + self.waiting.len() >= self.cfg.max_in_flight.max(1) + self.cfg.max_queue {
+            Some(format!("queue full ({} in flight, {} waiting)", self.active.len(), self.waiting.len()))
         } else {
             None
         };
