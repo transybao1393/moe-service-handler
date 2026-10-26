@@ -12,10 +12,8 @@ olmoe = ["streammoe", "streammoe/model-olmoe-1b-7b"]
 qwen36 = ["streammoe", "streammoe/model-qwen3-6-35b-a3b"]
 
 [dependencies]
-# streammoe is published as the `moeflux` crate. Pinned to a commit of the local checkout (its
-# main is not pushed yet); switch the URL to https://github.com/transybao1393/moeflux.git once
-# that commit is on GitHub.
-streammoe = { package = "moeflux", git = "file:///Users/johnathan/Documents/projects/moeflux", rev = "748bb3e8b83c59ce79ca98b1512958e023670fc8", optional = true }
+# streammoe is published as the `moeflux` crate, pinned to a commit of its GitHub repo.
+streammoe = { package = "moeflux", git = "https://github.com/transybao1393/streamoe.git", rev = "748bb3e8b83c59ce79ca98b1512958e023670fc8", optional = true }
 msh-net = { version = "0.1.0", path = "../msh-net" }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.0.7"

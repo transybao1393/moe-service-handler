@@ -603,7 +603,7 @@ dependencies = [
 [[package]]
 name = "moeflux"
 version = "0.1.0-pre.4"
-source = "git+file:///Users/johnathan/Documents/projects/moeflux?rev=748bb3e8b83c59ce79ca98b1512958e023670fc8#748bb3e8b83c59ce79ca98b1512958e023670fc8"
+source = "git+https://github.com/transybao1393/streamoe.git?rev=748bb3e8b83c59ce79ca98b1512958e023670fc8#748bb3e8b83c59ce79ca98b1512958e023670fc8"
 dependencies = [
  "bytemuck",
  "libc",
@@ -622,7 +622,7 @@ dependencies = [
 [[package]]
 name = "moeflux-metal"
 version = "0.1.0-pre.4"
-source = "git+file:///Users/johnathan/Documents/projects/moeflux?rev=748bb3e8b83c59ce79ca98b1512958e023670fc8#748bb3e8b83c59ce79ca98b1512958e023670fc8"
+source = "git+https://github.com/transybao1393/streamoe.git?rev=748bb3e8b83c59ce79ca98b1512958e023670fc8#748bb3e8b83c59ce79ca98b1512958e023670fc8"
 dependencies = [
  "metal",
  "thiserror 1.0.69",

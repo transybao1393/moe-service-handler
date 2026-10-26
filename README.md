@@ -54,8 +54,9 @@ hidden state in; hidden state or sampled token out). Two implementations:
 - `MockEngine`: deterministic, no model needed; the default.
 - `StreamMoeEngine`: streammoe on the node's layer range, one streammoe request slot per request in
   flight. Built with a model feature (`--features olmoe` or `qwen36`) and selected with
-  `[engine] kind = "streammoe"`. streammoe is pinned to a commit of the local checkout until its
-  `main` is pushed (see `crates/msh-node/Cargo.toml`).
+  `[engine] kind = "streammoe"`. streammoe comes from
+  [transybao1393/streamoe](https://github.com/transybao1393/streamoe), pinned to a commit in
+  `crates/msh-node/Cargo.toml`.
 
 For development the real engine runs **OLMoE-1B-7B** (16 layers, 3.9 GB at 4-bit) from
 `~/models/olmoe-1b-7b`: a 3-process 8/4/4 split reproduces streammoe's MLX reference answer
