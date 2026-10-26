@@ -105,8 +105,5 @@ the software floor for the M4↔M1 runs:
 ## License
 
 [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) —
-see [`LICENSE`](LICENSE). Free for noncommercial use (personal, research, education,
+see [`LICENSE.md`](LICENSE.md). Free for noncommercial use (personal, research, education,
 nonprofits); commercial use needs a separate license from the author.
-
-moeflux, which the real engine links against, is MIT-licensed; binaries built with it must
-also carry moeflux's MIT notice.

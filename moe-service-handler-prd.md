@@ -180,7 +180,7 @@ Requirement IDs are referenced by tests and milestones. **Must** = required for 
 | NF-3 | **Platform:** macOS on Apple Silicon (M1 and M4). Rust stable. No Python at runtime. |
 | NF-4 | **Configuration:** one TOML file per node; every threshold, cap and split changes without rebuilding. |
 | NF-5 | **Logging:** structured logs (`tracing`), request id on every line. |
-| NF-6 | **License:** PolyForm Noncommercial 1.0.0. moeflux stays MIT; distributed binaries that link it carry its MIT notice too. |
+| NF-6 | **License:** PolyForm Noncommercial 1.0.0. |
 
 ## 9. Success metrics
 
