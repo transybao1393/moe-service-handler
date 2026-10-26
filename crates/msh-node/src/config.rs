@@ -38,6 +38,14 @@
 //! chat_template = "olmoe"              # or "chatml" (Qwen)
 //! model = "olmoe-1b-7b"                # name reported to clients
 //! ```
+//!
+//! An optional `[metrics]` table makes the coordinator write one CSV row per position
+//! (CL-10, CL-11); `msh-node --metrics FILE` does the same for one run:
+//!
+//! ```toml
+//! [metrics]
+//! csv = "results/olmoe-3node.csv"
+//! ```
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -59,7 +67,16 @@ pub struct Config {
     pub engine: EngineConfig,
     #[serde(default)]
     pub http: Option<HttpConfig>,
+    #[serde(default)]
+    pub metrics: Option<MetricsConfig>,
     pub nodes: Vec<NodeConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// CSV file to append rows to.
+    pub csv: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

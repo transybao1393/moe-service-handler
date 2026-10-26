@@ -7,6 +7,7 @@ pub mod chat;
 pub mod config;
 pub mod engine;
 pub mod http;
+pub mod metrics;
 #[cfg(feature = "streammoe")]
 pub mod streammoe_engine;
 pub mod node;

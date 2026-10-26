@@ -16,7 +16,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"MSHN";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 24;
 /// Upper bound on a payload; guards against a corrupt length field allocating gigabytes.
 /// 64 MiB covers an 8k-token f32 prefill chunk (8192 × 2048 × 4 = 64 MiB).
@@ -25,10 +25,11 @@ pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MsgType {
-    /// f32 hidden state, `seq_len × hidden_dim` values. f32 rather than BF16 because the engine
-    /// works in f32 and a split pipeline must match a single process exactly (NF-1).
+    /// Stage times, then the f32 hidden state, `seq_len × hidden_dim` values (see
+    /// [`encode_hidden`]). f32 rather than BF16 because the engine works in f32 and a split
+    /// pipeline must match a single process exactly (NF-1).
     Hidden = 1,
-    /// Sampled token id (u32).
+    /// Sampled token id (u32), then stage times (see [`encode_token`]).
     Token = 2,
     /// Free all state for a request on the receiving node.
     Drop = 3,
@@ -168,28 +169,73 @@ pub fn read_frame<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Header, F
     Ok(header)
 }
 
-/// Appends `values` to `out` as little-endian f32.
-pub fn f32s_to_bytes(values: &[f32], out: &mut Vec<u8>) {
+// Hidden and Token payloads carry the compute time of every stage the position has passed
+// through, in microseconds, in ring order. The coordinator splits a step's wall time into
+// per-node compute and the rest (network and queueing) from durations alone, so the nodes'
+// clocks need not agree.
+//
+//   Hidden: stage_count u16, stage_us u32 × stage_count, f32 × values
+//   Token:  token u32, stage_count u16, stage_us u32 × stage_count
+
+/// Encodes a hidden-state payload.
+pub fn encode_hidden(stage_us: &[u32], values: &[f32], out: &mut Vec<u8>) {
     out.clear();
-    out.reserve(values.len() * 4);
+    out.reserve(2 + 4 * stage_us.len() + 4 * values.len());
+    write_stages(stage_us, out);
     for v in values {
         out.extend_from_slice(&v.to_le_bytes());
     }
 }
 
-/// Decodes little-endian f32 values into `out`, which must hold exactly `bytes.len() / 4` values.
-pub fn bytes_to_f32s(bytes: &[u8], out: &mut [f32]) -> Result<(), FrameError> {
-    if bytes.len() != out.len() * 4 {
-        return Err(FrameError::Remote(format!(
-            "hidden payload of {} bytes, expected {}",
-            bytes.len(),
-            out.len() * 4
-        )));
+/// Decodes a hidden-state payload into `values` (which must be the right length) and
+/// `stage_us`.
+pub fn decode_hidden(bytes: &[u8], values: &mut [f32], stage_us: &mut Vec<u32>) -> Result<(), FrameError> {
+    let rest = read_stages(bytes, stage_us)?;
+    if rest.len() != values.len() * 4 {
+        return Err(bad_payload(format!("hidden of {} bytes, expected {}", rest.len(), values.len() * 4)));
     }
-    for (v, c) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+    for (v, c) in values.iter_mut().zip(rest.chunks_exact(4)) {
         *v = f32::from_le_bytes(c.try_into().unwrap());
     }
     Ok(())
+}
+
+/// Encodes a token payload.
+pub fn encode_token(token: u32, stage_us: &[u32], out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(&token.to_le_bytes());
+    write_stages(stage_us, out);
+}
+
+/// Decodes a token payload, filling `stage_us`.
+pub fn decode_token(bytes: &[u8], stage_us: &mut Vec<u32>) -> Result<u32, FrameError> {
+    let (token, rest) = bytes.split_at_checked(4).ok_or_else(|| bad_payload("token payload too short".into()))?;
+    if !read_stages(rest, stage_us)?.is_empty() {
+        return Err(bad_payload("trailing bytes after token stage times".into()));
+    }
+    Ok(u32::from_le_bytes(token.try_into().unwrap()))
+}
+
+fn write_stages(stage_us: &[u32], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(stage_us.len() as u16).to_le_bytes());
+    for t in stage_us {
+        out.extend_from_slice(&t.to_le_bytes());
+    }
+}
+
+/// Reads the stage times and returns the bytes after them.
+fn read_stages<'a>(bytes: &'a [u8], stage_us: &mut Vec<u32>) -> Result<&'a [u8], FrameError> {
+    let short = || bad_payload("stage times truncated".into());
+    let (n, rest) = bytes.split_at_checked(2).ok_or_else(short)?;
+    let n = u16::from_le_bytes(n.try_into().unwrap()) as usize;
+    let (times, rest) = rest.split_at_checked(4 * n).ok_or_else(short)?;
+    stage_us.clear();
+    stage_us.extend(times.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())));
+    Ok(rest)
+}
+
+fn bad_payload(msg: String) -> FrameError {
+    FrameError::Remote(msg)
 }
 
 #[cfg(test)]
@@ -197,14 +243,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn f32_payload_round_trip_is_exact() {
+    fn hidden_payload_round_trip_is_exact() {
         let v = [0.0f32, -1.5, f32::MIN_POSITIVE, 1e-40, f32::MAX, std::f32::consts::PI];
         let mut bytes = Vec::new();
-        f32s_to_bytes(&v, &mut bytes);
-        let mut out = [0f32; 6];
-        bytes_to_f32s(&bytes, &mut out).unwrap();
+        encode_hidden(&[120, 95], &v, &mut bytes);
+        let (mut out, mut stages) = ([0f32; 6], Vec::new());
+        decode_hidden(&bytes, &mut out, &mut stages).unwrap();
         assert_eq!(v.map(f32::to_bits), out.map(f32::to_bits));
-        assert!(bytes_to_f32s(&bytes[..20], &mut out).is_err());
+        assert_eq!(stages, [120, 95]);
+        assert!(decode_hidden(&bytes[..bytes.len() - 4], &mut out, &mut stages).is_err());
+        assert!(decode_hidden(&bytes[..3], &mut out, &mut stages).is_err());
+    }
+
+    #[test]
+    fn token_payload_round_trip() {
+        let mut bytes = Vec::new();
+        encode_token(50_279, &[7, 8, 9], &mut bytes);
+        let mut stages = Vec::new();
+        assert_eq!(decode_token(&bytes, &mut stages).unwrap(), 50_279);
+        assert_eq!(stages, [7, 8, 9]);
+        assert!(decode_token(&bytes[..5], &mut stages).is_err());
+        bytes.push(0);
+        assert!(decode_token(&bytes, &mut stages).is_err());
     }
 
     #[test]
@@ -217,7 +277,7 @@ mod tests {
     fn header_is_little_endian() {
         let b = Header::new(MsgType::Token, 1, 2, 4).encode();
         assert_eq!(&b[0..4], b"MSHN");
-        assert_eq!(&b[4..6], &[1, 0]);
+        assert_eq!(&b[4..6], &PROTOCOL_VERSION.to_le_bytes());
         assert_eq!(b[6], 2);
         assert_eq!(&b[8..16], &[1, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(&b[16..20], &[2, 0, 0, 0]);

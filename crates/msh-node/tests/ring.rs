@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use msh_net::MsgType;
 use msh_node::config::{Config, NodeConfig};
 use msh_node::engine::MockEngine;
+use msh_node::metrics::{Metrics, RunInfo};
 use msh_node::node::{join_ring, Ring, Worker};
 use msh_node::scheduler::{self, collect, Client, Event, SchedulerConfig};
 use msh_node::Error;
@@ -30,6 +31,15 @@ impl Cluster {
     /// Starts every node on loopback threads. With `fail = Some((node, req))`, that node's
     /// engine fails every step of request `req`.
     fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig, fail: Option<(usize, u64)>) -> Cluster {
+        Cluster::start_full(splits, sched, fail, None)
+    }
+
+    fn start_full(
+        splits: &[[u32; 2]],
+        sched: SchedulerConfig,
+        fail: Option<(usize, u64)>,
+        metrics: Option<Metrics>,
+    ) -> Cluster {
         let listeners: Vec<TcpListener> =
             splits.iter().map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
         let cfg = Config {
@@ -38,6 +48,7 @@ impl Cluster {
             scheduler: sched,
             engine: Default::default(),
             http: None,
+            metrics: None,
             nodes: splits
                 .iter()
                 .zip(&listeners)
@@ -74,7 +85,7 @@ impl Cluster {
             })
             .collect();
         let ring = join_ring(&cfg, 0, coord_listener, Duration::from_secs(5)).unwrap();
-        let (client, coordinator) = scheduler::spawn(engine(0), ring, cfg.scheduler);
+        let (client, coordinator) = scheduler::spawn_with_metrics(engine(0), ring, cfg.scheduler, metrics);
         Cluster { client, coordinator, workers }
     }
 
@@ -179,6 +190,7 @@ fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Ring) + Send + 'st
         scheduler: sched,
         engine: Default::default(),
         http: None,
+        metrics: None,
         nodes: vec![node("n0", &l0, [0, 20]), node("n1", &l1, [20, 40])],
     };
     let worker_cfg = cfg.clone();
@@ -229,4 +241,41 @@ fn frequent_health_pings_do_not_disturb_generation() {
     let got: Vec<_> = rxs.into_iter().map(|rx| collect(rx).unwrap().tokens).collect();
     assert_eq!(got, want);
     c.stop_and_check_freed();
+}
+
+#[test]
+fn metrics_has_a_row_per_position_with_every_node_timed() {
+    let dir = std::env::temp_dir().join(format!("msh-ring-metrics-{}", std::process::id()));
+    let path = dir.join("run.csv");
+    let run = RunInfo {
+        run_id: 1,
+        git_hash: "test".into(),
+        host: "h".into(),
+        hardware: "hw".into(),
+        split: "n0:0-20 n1:20-30 n2:30-40".into(),
+        engine: "mock".into(),
+    };
+    let metrics = Metrics::create(&path, &run).unwrap();
+    let c = Cluster::start_full(THREE, SchedulerConfig::default(), None, Some(metrics));
+    let rxs: Vec<_> = (0..2).map(|i| c.client.submit(prompt(i), 6)).collect();
+    for rx in rxs {
+        collect(rx).unwrap();
+    }
+    c.stop_and_check_freed();
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split(',').collect()).collect();
+    // Two requests, each 5 prompt positions + 5 more decode steps (the 6th token ends it).
+    assert_eq!(rows.len(), 2 * 10);
+    for r in &rows {
+        let (kind, step, coord, workers, network, stages) = (r[8], r[10], r[11], r[12], r[13], r[14]);
+        assert_eq!(stages.split(';').count(), 3, "every node reports a time: {r:?}");
+        let step: u64 = step.parse().unwrap();
+        let total = coord.parse::<u64>().unwrap() + workers.parse::<u64>().unwrap() + network.parse::<u64>().unwrap();
+        assert!(total >= step, "compute + network covers the step: {r:?}");
+        assert!(["prefill", "first_token", "decode"].contains(&kind));
+    }
+    let count = |k| rows.iter().filter(|r| r[8] == k).count();
+    assert_eq!((count("prefill"), count("first_token"), count("decode")), (8, 2, 10));
+    std::fs::remove_dir_all(dir).unwrap();
 }

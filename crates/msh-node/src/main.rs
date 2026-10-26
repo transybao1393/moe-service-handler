@@ -1,8 +1,10 @@
 //! msh-node --config FILE --node NAME [--prompt 1,2,3] [--max-tokens N] [--requests K]
+//!          [--metrics FILE]
 //!
 //! The first node in the config is the coordinator. With an `[http]` table and no `--prompt`,
 //! it serves the OpenAI-compatible API. With `--prompt` (token ids) it submits K concurrent
-//! greedy generations, prints throughput and exits.
+//! greedy generations, prints throughput and exits. `--metrics FILE` (or `[metrics] csv`)
+//! appends one row per position to a CSV.
 //! Every other node is a worker and serves until the coordinator disconnects.
 //! `[engine] kind` picks the mock (default) or streammoe, which needs a model feature at build
 //! time, e.g. `cargo build --release --features olmoe`.
@@ -17,6 +19,7 @@ use std::sync::Arc;
 use msh_node::chat::Codec;
 use msh_node::config::{expand_home, Config, EngineKind, HttpConfig};
 use msh_node::http::{self, HttpState};
+use msh_node::metrics::{Metrics, RunInfo};
 use msh_node::node::Ring;
 use msh_node::engine::{Engine, MockEngine};
 use msh_node::node::{join_ring, Worker};
@@ -37,7 +40,8 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).map(String::as_str);
-    let usage = "usage: msh-node --config FILE --node NAME [--prompt 1,2,3] [--max-tokens N] [--requests K]";
+    let usage = "usage: msh-node --config FILE --node NAME [--prompt 1,2,3] [--max-tokens N] [--requests K] \
+                 [--metrics FILE]";
     let path = flag("--config").ok_or(usage)?;
     let name = flag("--node").ok_or(usage)?;
 
@@ -93,8 +97,9 @@ fn serve<'a, E: Engine + 'static>(
         return Ok(());
     }
 
+    let metrics = open_metrics(cfg, flag("--metrics"))?;
     if let (None, Some(http)) = (flag("--prompt"), &cfg.http) {
-        return serve_http(cfg, http, engine, ring);
+        return serve_http(cfg, http, engine, ring, metrics);
     }
     let prompt: Vec<u32> = flag("--prompt")
         .unwrap_or("1,2,3,4,5,6,7,8")
@@ -106,7 +111,7 @@ fn serve<'a, E: Engine + 'static>(
 
     let requests: u32 = flag("--requests").unwrap_or("1").parse().map_err(|e| format!("--requests: {e}"))?;
 
-    let (client, sched) = scheduler::spawn(engine, ring, cfg.scheduler);
+    let (client, sched) = scheduler::spawn_with_metrics(engine, ring, cfg.scheduler, metrics);
     let t0 = Instant::now();
     let rxs: Vec<_> = (0..requests).map(|_| client.submit(prompt.clone(), max_new)).collect();
     let mut total = 0;
@@ -140,9 +145,10 @@ fn serve_http<E: Engine + 'static>(
     http: &HttpConfig,
     engine: E,
     ring: Option<Ring>,
+    metrics: Option<Metrics>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let codec = Codec::load(&expand_home(&http.tokenizer), http.chat_template)?;
-    let (client, _sched) = scheduler::spawn(engine, ring, cfg.scheduler);
+    let (client, _sched) = scheduler::spawn_with_metrics(engine, ring, cfg.scheduler, metrics);
     let state = Arc::new(HttpState {
         client,
         codec,
@@ -157,4 +163,29 @@ fn serve_http<E: Engine + 'static>(
         axum::serve(listener, http::router(state)).await?;
         Ok(())
     })
+}
+
+/// Opens the metrics CSV from `--metrics` or `[metrics] csv`, if either is set.
+fn open_metrics(cfg: &Config, flag: Option<&str>) -> Result<Option<Metrics>, Box<dyn std::error::Error>> {
+    let Some(path) = flag.map(String::from).or_else(|| cfg.metrics.as_ref().map(|m| m.csv.clone())) else {
+        return Ok(None);
+    };
+    let split: Vec<String> =
+        cfg.nodes.iter().map(|n| format!("{}:{}-{}", n.name, n.layers[0], n.layers[1])).collect();
+    let engine = match cfg.engine.kind {
+        EngineKind::Mock => "mock".to_string(),
+        EngineKind::StreamMoe => format!("streammoe {}", cfg.engine.model_dir),
+    };
+    let run = RunInfo {
+        run_id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+        git_hash: msh_net::host::GIT_HASH.into(),
+        host: msh_net::host::hostname(),
+        hardware: msh_net::host::hardware(),
+        split: split.join(" "),
+        engine,
+    };
+    let path = expand_home(&path);
+    let m = Metrics::create(&path, &run).map_err(|e| format!("metrics {}: {e}", path.display()))?;
+    eprintln!("{}: writing metrics to {}", cfg.nodes[0].name, path.display());
+    Ok(Some(m))
 }

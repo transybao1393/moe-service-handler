@@ -10,7 +10,7 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use msh_net::{bytes_to_f32s, f32s_to_bytes, Connection, FrameError, MsgType};
+use msh_net::{decode_hidden, encode_hidden, encode_token, Connection, FrameError, MsgType};
 
 use crate::config::Config;
 use crate::engine::{Engine, StageIn};
@@ -101,6 +101,7 @@ impl<E: Engine> Worker<E> {
         let mut hidden_out = vec![0.0; self.engine.hidden_dim()];
         let mut buf = Vec::new();
         let mut out = Vec::new();
+        let mut stages = Vec::new();
         loop {
             let h = match self.ring.prev.recv_frame(&mut buf) {
                 Ok(h) => h,
@@ -109,16 +110,20 @@ impl<E: Engine> Worker<E> {
             };
             match h.msg_type {
                 MsgType::Hidden => {
-                    let result = bytes_to_f32s(&buf, &mut hidden).map_err(Error::from).and_then(|()| {
-                        let input = StageIn::Hidden(&hidden);
-                        self.engine.step(h.request_id, h.position, input, &mut hidden_out)
+                    let result = decode_hidden(&buf, &mut hidden, &mut stages).map_err(Error::from).and_then(|()| {
+                        let t0 = Instant::now();
+                        let r = self.engine.step(h.request_id, h.position, StageIn::Hidden(&hidden), &mut hidden_out);
+                        // This node's compute time travels on with the position (CL-10).
+                        stages.push(t0.elapsed().as_micros().min(u32::MAX as u128) as u32);
+                        r
                     });
                     let sent = match result {
                         Ok(Some(token)) => {
-                            self.ring.next.send(MsgType::Token, h.request_id, h.position, &token.to_le_bytes())
+                            encode_token(token, &stages, &mut out);
+                            self.ring.next.send(MsgType::Token, h.request_id, h.position, &out)
                         }
                         Ok(None) => {
-                            f32s_to_bytes(&hidden_out, &mut out);
+                            encode_hidden(&stages, &hidden_out, &mut out);
                             self.ring.next.send(MsgType::Hidden, h.request_id, h.position, &out)
                         }
                         Err(e) => {

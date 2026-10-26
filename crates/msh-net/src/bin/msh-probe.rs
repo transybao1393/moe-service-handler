@@ -9,9 +9,10 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::TcpListener;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use msh_net::host::{hardware, hostname, GIT_HASH};
 use msh_net::probe::{self, Stats};
 use msh_net::{Connection, PROTOCOL_VERSION};
 
@@ -53,7 +54,7 @@ fn run(addr: &str, link: &str, csv: Option<&str>) -> Result<(), String> {
     let meta = format!(
         "{},{},{},{},{},{link}",
         unix_secs(),
-        env!("MSH_GIT_HASH"),
+        GIT_HASH,
         hostname(),
         hardware(),
         conn.peer_name()
@@ -92,28 +93,4 @@ fn run(addr: &str, link: &str, csv: Option<&str>) -> Result<(), String> {
 
 fn unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
-fn sh(cmd: &str, args: &[&str]) -> String {
-    Command::new(cmd)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().replace(',', " "))
-        .unwrap_or_else(|| "?".into())
-}
-
-fn hostname() -> String {
-    sh("hostname", &["-s"])
-}
-
-/// e.g. "Apple M4 / 16 GB / macOS 15.1".
-fn hardware() -> String {
-    let mem_gb = sh("sysctl", &["-n", "hw.memsize"]).parse::<u64>().map(|b| b >> 30).unwrap_or(0);
-    format!(
-        "{} / {mem_gb} GB / macOS {}",
-        sh("sysctl", &["-n", "machdep.cpu.brand_string"]),
-        sh("sw_vers", &["-productVersion"])
-    )
 }

@@ -36,6 +36,10 @@ flowchart LR
 - **Health:** a `Ping` travels the ring every second. A broken connection, or a ping not back
   within 5 s (a hung node), marks the ring down: in-flight requests fail and new ones are
   rejected until the cluster is restarted.
+- **Metrics:** each worker appends its compute time to the frame it forwards, so the
+  coordinator splits every step into per-node compute and network/queueing without clock
+  sync. `--metrics FILE` or `[metrics] csv` writes one CSV row per position with that split,
+  queue wait, requests in flight, ring round trip and run metadata (git hash, hardware, split).
 - **API:** the coordinator serves OpenAI-compatible `GET /v1/models` and
   `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
   429, a ring that is down 503.
@@ -45,7 +49,7 @@ flowchart LR
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Coordinator / worker, config, ring, scheduler, HTTP API, engines | Ring, scheduler (CL-5), dead-node handling (CL-8), HTTP API (CL-2); runs real streammoe (tested on OLMoE) |
+| `msh-node` | binary | Coordinator / worker, config, ring, scheduler, HTTP API, metrics, engines | Ring, scheduler (CL-5), dead-node handling (CL-8), HTTP API (CL-2), run metrics (CL-10, CL-11); runs real streammoe (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
 The engine sits behind an `Engine` trait shaped like streammoe's `eval_request` (token or
@@ -71,7 +75,7 @@ cargo test --release
 B=target/release/msh-node
 $B --config configs/local-3node.toml --node m1b &
 $B --config configs/local-3node.toml --node m1a &
-$B --config configs/local-3node.toml --node m4 --max-tokens 500 --requests 3
+$B --config configs/local-3node.toml --node m4 --max-tokens 500 --requests 3 --metrics results/run.csv
 
 # the real engine on OLMoE, served over HTTP, and its model-backed tests
 cargo build --release --features msh-node/olmoe

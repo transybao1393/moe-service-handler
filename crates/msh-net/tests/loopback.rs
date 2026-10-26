@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use msh_net::frame::{Header, MsgType, HEADER_LEN};
-use msh_net::{probe, Connection, FrameError};
+use msh_net::{probe, Connection, FrameError, PROTOCOL_VERSION};
 
 #[test]
 fn echo_round_trip_over_loopback() {
@@ -36,7 +36,7 @@ fn version_mismatch_is_refused_at_connect() {
     s.write_all(b"old").unwrap();
 
     let err = server.join().unwrap().expect("server must refuse");
-    assert!(matches!(err, FrameError::VersionMismatch { local: 1, remote: 99 }));
+    assert!(matches!(err, FrameError::VersionMismatch { local: PROTOCOL_VERSION, remote: 99 }));
 
     // The server's reply is its Hello followed by an Error frame.
     let mut buf = Vec::new();

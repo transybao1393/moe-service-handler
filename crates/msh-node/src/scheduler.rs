@@ -21,10 +21,11 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use msh_net::{f32s_to_bytes, Connection, Header, MsgType};
+use msh_net::{decode_token, encode_hidden, Connection, Header, MsgType};
 use serde::Deserialize;
 
 use crate::engine::{Engine, StageIn};
+use crate::metrics::{Metrics, StepKind, StepRecord};
 use crate::node::Ring;
 use crate::Error;
 
@@ -136,6 +137,16 @@ pub fn spawn<E: Engine + 'static>(
     ring: Option<Ring>,
     cfg: SchedulerConfig,
 ) -> (Client, JoinHandle<E>) {
+    spawn_with_metrics(engine, ring, cfg, None)
+}
+
+/// [`spawn`], also writing one metrics row per position to `metrics`.
+pub fn spawn_with_metrics<E: Engine + 'static>(
+    engine: E,
+    ring: Option<Ring>,
+    cfg: SchedulerConfig,
+    metrics: Option<Metrics>,
+) -> (Client, JoinHandle<E>) {
     let (tx, rx) = mpsc::channel();
     let next = ring.map(|Ring { prev, next }| {
         let tx = tx.clone();
@@ -159,6 +170,9 @@ pub fn spawn<E: Engine + 'static>(
         ping: None,
         ping_seq: 0,
         next_ping_at: Instant::now(),
+        ring_rtt: None,
+        metrics,
+        stages: Vec::new(),
     };
     (Client { inner: Arc::new(ClientInner { tx }) }, thread::spawn(move || s.run()))
 }
@@ -198,6 +212,8 @@ struct Request {
     generated: usize,
     events: Sender<Event>,
     step_started: Instant,
+    /// Time spent waiting for an in-flight slot.
+    queued: Duration,
     phase: Phase,
 }
 
@@ -219,6 +235,11 @@ struct Scheduler<E: Engine> {
     ping: Option<(u64, Instant)>,
     ping_seq: u64,
     next_ping_at: Instant,
+    /// Last health ping's trip round the ring (NET-5).
+    ring_rtt: Option<Duration>,
+    metrics: Option<Metrics>,
+    /// Scratch for the stage times of a returning token.
+    stages: Vec<u32>,
 }
 
 impl<E: Engine> Scheduler<E> {
@@ -322,7 +343,9 @@ impl<E: Engine> Scheduler<E> {
             input,
             generated: 0,
             events,
+            // Holds the submit time until admission turns it into the queue wait.
             step_started: Instant::now(),
+            queued: Duration::ZERO,
             phase: Phase::Ready,
         };
         self.waiting.push_back((id, r));
@@ -330,7 +353,8 @@ impl<E: Engine> Scheduler<E> {
 
     fn admit(&mut self) {
         while self.active.len() < self.cfg.max_in_flight.max(1) {
-            let Some((id, r)) = self.waiting.pop_front() else { break };
+            let Some((id, mut r)) = self.waiting.pop_front() else { break };
+            r.queued = r.step_started.elapsed();
             self.active.insert(id, r);
             self.ready.push_back(id);
         }
@@ -345,16 +369,21 @@ impl<E: Engine> Scheduler<E> {
             Ok(token) => token,
             Err(e) => return self.finish(id, Event::Failed(e.to_string())),
         };
+        let coord_us = r.step_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
         let next = match (token, &mut self.next) {
-            // Mode A: this node holds the head.
-            (Some(token), None) => return self.on_token(id, pos, token),
+            // One node holds every layer and the head.
+            (Some(token), None) => {
+                self.stages.clear();
+                self.stages.push(coord_us);
+                return self.on_token(id, pos, token);
+            }
             (None, Some(next)) => next,
             (Some(_), Some(_)) | (None, None) => {
                 let msg = "coordinator stage does not match the ring (head on the wrong node)";
                 return self.finish(id, Event::Failed(msg.into()));
             }
         };
-        f32s_to_bytes(&self.hidden, &mut self.buf);
+        encode_hidden(&[coord_us], &self.hidden, &mut self.buf);
         if let Err(e) = next.send(MsgType::Hidden, id, pos, &self.buf) {
             let reason = format!("send to {}: {e}", next.peer_name());
             return self.ring_down(reason);
@@ -368,14 +397,16 @@ impl<E: Engine> Scheduler<E> {
         let id = h.request_id;
         let in_flight = matches!(self.active.get(&id).map(|r| &r.phase), Some(Phase::InFlight));
         match h.msg_type {
-            MsgType::Token if in_flight && payload.len() == 4 => {
-                self.on_token(id, h.position, u32::from_le_bytes(payload[..4].try_into().unwrap()))
-            }
+            MsgType::Token if in_flight => match decode_token(&payload, &mut self.stages) {
+                Ok(token) => self.on_token(id, h.position, token),
+                Err(e) => self.finish(id, Event::Failed(format!("bad token frame: {e}"))),
+            },
             MsgType::Error if in_flight => {
                 self.finish(id, Event::Failed(String::from_utf8_lossy(&payload).into_owned()))
             }
             MsgType::Ping => {
-                if self.ping.is_some_and(|(seq, _)| seq == id) {
+                if let Some((_, sent)) = self.ping.filter(|&(seq, _)| seq == id) {
+                    self.ring_rtt = Some(sent.elapsed());
                     self.ping = None;
                 }
             }
@@ -390,12 +421,36 @@ impl<E: Engine> Scheduler<E> {
         }
     }
 
+    /// Handles the token produced at `pos`; `self.stages` holds the step's per-node times.
     fn on_token(&mut self, id: u64, pos: u32, token: u32) {
         let eos = self.engine.eos();
+        let in_flight = self.active.len();
         let Some(r) = self.active.get_mut(&id) else { return };
         if pos as usize != r.pos {
             let msg = format!("token for position {pos}, expected {}", r.pos);
             return self.finish(id, Event::Failed(msg));
+        }
+        if let Some(m) = &mut self.metrics {
+            let kind = match r.pos + 1 {
+                n if n < r.prompt.len() => StepKind::Prefill,
+                n if n == r.prompt.len() => StepKind::FirstToken,
+                _ => StepKind::Decode,
+            };
+            let rec = StepRecord {
+                request: id,
+                pos,
+                kind,
+                token,
+                step_us: r.step_started.elapsed().as_micros() as u64,
+                stage_us: &self.stages,
+                queue_us: r.queued.as_micros() as u64,
+                in_flight,
+                ring_rtt_us: self.ring_rtt.map(|d| d.as_micros() as u64),
+            };
+            if let Err(e) = m.record(&rec) {
+                eprintln!("metrics: {e}; no more rows will be written");
+                self.metrics = None;
+            }
         }
         r.pos += 1;
         r.phase = Phase::Ready;
@@ -424,6 +479,9 @@ impl<E: Engine> Scheduler<E> {
     /// reported once `Drop` returns, so a finished request is freed on every node (CL-9).
     fn finish(&mut self, id: u64, outcome: Event) {
         self.engine.free(id);
+        if let Some(Err(e)) = self.metrics.as_mut().map(Metrics::flush) {
+            eprintln!("metrics: {e}");
+        }
         self.ready.retain(|&r| r != id);
         let Some(next) = &mut self.next else {
             if let Some(r) = self.active.remove(&id) {

@@ -73,6 +73,7 @@ fn start(splits: &[[u32; 2]]) -> Cluster {
         scheduler: sched,
         engine: Default::default(),
         http: None,
+            metrics: None,
         nodes: splits
             .iter()
             .zip(&listeners)
