@@ -16,3 +16,11 @@
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Model weights and converted artifacts: keep them outside the repo (e.g. ~/models/)
+*.safetensors
+*.gguf
+model_weights.bin
+model_weights.json
+vocab.bin
+packed_experts/
