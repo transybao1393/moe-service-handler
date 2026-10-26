@@ -33,12 +33,17 @@ flowchart LR
 - **Scheduler:** up to `max_in_flight` requests (default 3) step through the ring at once, so
   each node works on a different request; extra requests queue up to `max_queue`, then are
   rejected. Dropping a request's event channel cancels it.
+- **Prefill in chunks:** the prompt goes round the ring `prefill_chunk` positions at a time
+  (default 64) in one `Hidden` frame, which streammoe runs on its batched path. Up to
+  `prefill_depth` chunks (default 3) of a request are in the ring at once, so the nodes work
+  on consecutive chunks together.
 - **Health:** a `Ping` travels the ring every second. A broken connection, or a ping not back
   within 5 s (a hung node), marks the ring down: in-flight requests fail and new ones are
   rejected until the cluster is restarted.
 - **Metrics:** each worker appends its compute time to the frame it forwards, so the
   coordinator splits every step into per-node compute and network/queueing without clock
-  sync. `--metrics FILE` or `[metrics] csv` writes one CSV row per position with that split,
+  sync. `--metrics FILE` or `[metrics] csv` writes one CSV row per step (prompt chunk or
+  decode position) with that split,
   queue wait, requests in flight, ring round trip and run metadata (git hash, hardware, split).
 - **API:** the coordinator serves OpenAI-compatible `GET /v1/models` and
   `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
@@ -49,11 +54,12 @@ flowchart LR
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Coordinator / worker, config, ring, scheduler, HTTP API, metrics, engines | Ring, scheduler (CL-5), dead-node handling (CL-8), HTTP API (CL-2), run metrics (CL-10, CL-11); runs real streammoe (tested on OLMoE) |
+| `msh-node` | binary | Coordinator / worker, config, ring, scheduler, HTTP API, metrics, engines | Ring, scheduler (CL-5), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), run metrics (CL-10, CL-11); runs real streammoe (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
 The engine sits behind an `Engine` trait shaped like streammoe's `eval_request` (token or
-hidden state in; hidden state or sampled token out). Two implementations:
+hidden states in, one or a chunk of positions; hidden states or sampled token out). Two
+implementations:
 
 - `MockEngine`: deterministic, no model needed; the default.
 - `StreamMoeEngine`: streammoe on the node's layer range, one streammoe request slot per request in
@@ -101,6 +107,16 @@ the software floor for the M4↔M1 runs:
 | 4 KB | 13.7 µs | ~7 µs |
 | 1 MB | 137 µs | ~68 µs |
 | 16 MB | 3.2 ms | ~1.6 ms |
+
+Prefill of a 400-token prompt, OLMoE 8/4/4 split in 3 processes on the M3 Pro, by
+`prefill_chunk` (time to first token):
+
+| Chunk | 1 | 64 (default) | 128 | 256 |
+| --- | --- | --- | --- | --- |
+| Time to first token | 5.6 s | 1.4 s | 1.2 s | 0.95 s |
+
+Bigger chunks are faster but hold the coordinator longer, delaying other requests' decode
+steps (a 64-token chunk takes ~180 ms on m4's 8 layers).
 
 ## License
 

@@ -10,12 +10,23 @@ use std::ops::Range;
 
 use crate::Error;
 
-/// Input to one position of a node's stage.
+/// Input to a run of consecutive positions on a node's stage: one position while decoding, a
+/// chunk of the prompt during prefill (CL-6).
 pub enum StageIn<'a> {
-    /// Token id; only the first node (it holds the embedding).
-    Token(u32),
-    /// The previous node's output, `hidden_dim` f32s.
+    /// Token ids; only the first node (it holds the embedding).
+    Tokens(&'a [u32]),
+    /// The previous node's output, `hidden_dim` f32s per position, row-major.
     Hidden(&'a [f32]),
+}
+
+impl StageIn<'_> {
+    /// Positions carried, given the model's hidden size.
+    pub fn len(&self, hidden_dim: usize) -> usize {
+        match self {
+            StageIn::Tokens(t) => t.len(),
+            StageIn::Hidden(h) => h.len() / hidden_dim,
+        }
+    }
 }
 
 pub trait Engine: Send {
@@ -24,15 +35,16 @@ pub trait Engine: Send {
     fn eos(&self) -> Option<u32> {
         None
     }
-    /// Runs this node's layer range for one position of request `req`. On the node holding the
-    /// head, returns the greedy token; elsewhere writes the next node's input to `hidden_out`
-    /// and returns `None`. A request's positions must arrive in order from 0.
+    /// Runs this node's layer range for positions `start_pos..` of request `req`. On the node
+    /// holding the head, returns the greedy token after the last position; elsewhere resizes
+    /// `hidden_out` to the next node's input, one row per position, and returns `None`. A
+    /// request's positions must arrive in order from 0.
     fn step(
         &mut self,
         req: u64,
-        pos: u32,
+        start_pos: u32,
         input: StageIn<'_>,
-        hidden_out: &mut [f32],
+        hidden_out: &mut Vec<f32>,
     ) -> Result<Option<u32>, Error>;
     /// Frees all state held for `req`. Freeing an unknown request is a no-op.
     fn free(&mut self, req: u64);
@@ -84,44 +96,57 @@ impl Engine for MockEngine {
     fn step(
         &mut self,
         req: u64,
-        pos: u32,
+        start_pos: u32,
         input: StageIn<'_>,
-        h: &mut [f32],
+        out: &mut Vec<f32>,
     ) -> Result<Option<u32>, Error> {
         if self.fail_on == Some(req) {
             return Err(Error::Engine(format!("mock failure on request {req}")));
         }
+        let dim = self.dim;
+        let n = input.len(dim);
+        out.clear();
         match input {
-            StageIn::Token(_) if self.layers.start != 0 => {
+            StageIn::Tokens(_) if self.layers.start != 0 => {
                 return Err(Error::Engine("token input on a stage without the embedding".into()))
             }
-            StageIn::Token(token) => {
-                for (i, v) in h.iter_mut().enumerate() {
-                    *v = ((token as f32 + 1.0) * (i as f32 + 1.0) * 1e-3).sin();
+            StageIn::Tokens(tokens) => {
+                for &token in tokens {
+                    out.extend((0..dim).map(|i| ((token as f32 + 1.0) * (i as f32 + 1.0) * 1e-3).sin()));
                 }
             }
-            StageIn::Hidden(src) => h.copy_from_slice(src),
+            StageIn::Hidden(src) if n == 0 || src.len() != n * dim => {
+                return Err(Error::Engine(format!("hidden input of {} values, not whole rows", src.len())))
+            }
+            StageIn::Hidden(src) => out.extend_from_slice(src),
         }
-        let n = self.layers.len() * self.dim;
-        let (next_pos, st) = self.state.entry(req).or_insert_with(|| (0, vec![0.0; n]));
-        if pos != *next_pos {
+        if n == 0 {
+            return Err(Error::Engine("no positions".into()));
+        }
+        let state_len = self.layers.len() * dim;
+        let (next_pos, st) = self.state.entry(req).or_insert_with(|| (0, vec![0.0; state_len]));
+        if start_pos != *next_pos {
             return Err(Error::Engine(format!(
-                "request {req}: position {pos} out of order, expected {next_pos}"
+                "request {req}: position {start_pos} out of order, expected {next_pos}"
             )));
         }
-        *next_pos += 1;
-        for (k, layer) in self.layers.clone().enumerate() {
-            let s = &mut st[k * self.dim..(k + 1) * self.dim];
-            for i in 0..self.dim {
-                let x = (h[i] * Self::weight(layer, i) + s[i]).tanh();
-                s[i] = 0.9 * s[i] + 0.1 * x;
-                h[i] = x;
+        *next_pos += n as u32;
+        // Position by position, so a chunk gives exactly what single positions would.
+        for h in out.chunks_exact_mut(dim) {
+            for (k, layer) in self.layers.clone().enumerate() {
+                let s = &mut st[k * dim..(k + 1) * dim];
+                for i in 0..dim {
+                    let x = (h[i] * Self::weight(layer, i) + s[i]).tanh();
+                    s[i] = 0.9 * s[i] + 0.1 * x;
+                    h[i] = x;
+                }
             }
         }
         if !self.head {
             return Ok(None);
         }
         // Bit-sensitive on purpose: any difference in the hidden state changes the token.
+        let h = &out[(n - 1) * dim..];
         let s: f32 = h.iter().enumerate().map(|(i, v)| v * (i % 7 + 1) as f32).sum();
         Ok(Some(((s.to_bits() as u64).wrapping_mul(2_654_435_761) % self.vocab as u64) as u32))
     }
@@ -139,10 +164,11 @@ mod tests {
     fn split_ranges_compose_to_the_full_range() {
         let mut full = MockEngine::new(0..40, 40, 64);
         let mut parts = [MockEngine::new(0..20, 40, 64), MockEngine::new(20..30, 40, 64), MockEngine::new(30..40, 40, 64)];
-        let (mut a, mut b, mut c) = (vec![0.0; 64], vec![0.0; 64], vec![0.0; 64]);
+        let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
         for pos in 0..5 {
-            let want = full.step(1, pos, StageIn::Token(pos + 3), &mut a).unwrap();
-            assert_eq!(parts[0].step(1, pos, StageIn::Token(pos + 3), &mut b).unwrap(), None);
+            let t = [pos + 3];
+            let want = full.step(1, pos, StageIn::Tokens(&t), &mut a).unwrap();
+            assert_eq!(parts[0].step(1, pos, StageIn::Tokens(&t), &mut b).unwrap(), None);
             assert_eq!(parts[1].step(1, pos, StageIn::Hidden(&b), &mut c).unwrap(), None);
             assert_eq!(parts[2].step(1, pos, StageIn::Hidden(&c), &mut b).unwrap(), want);
             assert!(want.is_some());
@@ -150,18 +176,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_out_of_order_positions_until_freed() {
-        let mut e = MockEngine::new(0..2, 2, 8);
-        let mut h = vec![0.0; 8];
-        e.step(7, 0, StageIn::Token(1), &mut h).unwrap();
-        assert!(e.step(7, 2, StageIn::Token(1), &mut h).is_err());
-        e.free(7);
-        e.step(7, 0, StageIn::Token(1), &mut h).unwrap();
+    fn a_chunk_matches_its_positions_one_by_one() {
+        let prompt = [5, 9, 2, 7, 7, 1, 3];
+        let mut one = MockEngine::new(0..4, 4, 16);
+        let mut h = Vec::new();
+        let mut want = None;
+        for (pos, t) in prompt.iter().enumerate() {
+            want = one.step(1, pos as u32, StageIn::Tokens(std::slice::from_ref(t)), &mut h).unwrap();
+        }
+        let mut chunked = MockEngine::new(0..4, 4, 16);
+        chunked.step(1, 0, StageIn::Tokens(&prompt[..3]), &mut h).unwrap();
+        assert_eq!(h.len(), 3 * 16);
+        assert_eq!(chunked.step(1, 3, StageIn::Tokens(&prompt[3..]), &mut h).unwrap(), want);
+        // Decoding carries on from the same state either way.
+        let next = |e: &mut MockEngine, h: &mut Vec<f32>| e.step(1, 7, StageIn::Tokens(&[4]), h).unwrap();
+        assert_eq!(next(&mut one, &mut h), next(&mut chunked, &mut h));
     }
 
     #[test]
-    fn rejects_tokens_on_a_later_stage() {
+    fn rejects_out_of_order_positions_until_freed() {
+        let mut e = MockEngine::new(0..2, 2, 8);
+        let mut h = Vec::new();
+        e.step(7, 0, StageIn::Tokens(&[1, 2]), &mut h).unwrap();
+        assert!(e.step(7, 1, StageIn::Tokens(&[1]), &mut h).is_err());
+        e.free(7);
+        e.step(7, 0, StageIn::Tokens(&[1]), &mut h).unwrap();
+    }
+
+    #[test]
+    fn rejects_tokens_on_a_later_stage_and_ragged_hidden() {
         let mut e = MockEngine::new(2..4, 4, 8);
-        assert!(e.step(1, 0, StageIn::Token(1), &mut vec![0.0; 8]).is_err());
+        assert!(e.step(1, 0, StageIn::Tokens(&[1]), &mut Vec::new()).is_err());
+        assert!(e.step(1, 0, StageIn::Hidden(&[0.0; 12]), &mut Vec::new()).is_err());
     }
 }

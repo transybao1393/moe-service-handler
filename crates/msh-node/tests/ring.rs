@@ -99,9 +99,10 @@ impl Cluster {
     }
 }
 
-/// Reference output: one node, all 40 layers, one request at a time.
+/// Reference output: one node, all 40 layers, one request at a time, one position per step.
 fn reference(prompts: &[Vec<u32>], max_new: usize) -> Vec<Vec<u32>> {
-    let c = Cluster::start(&[[0, 40]]);
+    let sched = SchedulerConfig { prefill_chunk: 1, ..Default::default() };
+    let c = Cluster::start_with(&[[0, 40]], sched, None);
     prompts.iter().map(|p| c.client.generate(p.clone(), max_new).unwrap().tokens).collect()
 }
 
@@ -127,6 +128,21 @@ fn concurrent_requests_match_their_sequential_results() {
         assert_eq!(got, want, "splits {splits:?}");
         c.stop_and_check_freed();
     }
+}
+
+#[test]
+fn pipelined_prefill_chunks_match_position_by_position() {
+    // Prompts of 1 to 37 positions in chunks of 4, three chunks of a request in the ring at
+    // once, alongside other requests' chunks and decode steps.
+    let prompts: Vec<Vec<u32>> =
+        [37, 1, 4, 9, 23].iter().enumerate().map(|(i, &n)| (0..n).map(|k| 7 * k + 1000 * i as u32).collect()).collect();
+    let want = reference(&prompts, 10);
+    let sched = SchedulerConfig { prefill_chunk: 4, prefill_depth: 3, ..Default::default() };
+    let c = Cluster::start_with(THREE, sched, None);
+    let rxs: Vec<_> = prompts.iter().map(|p| c.client.submit(p.clone(), 10)).collect();
+    let got: Vec<_> = rxs.into_iter().map(|rx| collect(rx).unwrap().tokens).collect();
+    assert_eq!(got, want);
+    c.stop_and_check_freed();
 }
 
 #[test]
@@ -244,7 +260,7 @@ fn frequent_health_pings_do_not_disturb_generation() {
 }
 
 #[test]
-fn metrics_has_a_row_per_position_with_every_node_timed() {
+fn metrics_has_a_row_per_step_with_every_node_timed() {
     let dir = std::env::temp_dir().join(format!("msh-ring-metrics-{}", std::process::id()));
     let path = dir.join("run.csv");
     let run = RunInfo {
@@ -256,7 +272,8 @@ fn metrics_has_a_row_per_position_with_every_node_timed() {
         engine: "mock".into(),
     };
     let metrics = Metrics::create(&path, &run).unwrap();
-    let c = Cluster::start_full(THREE, SchedulerConfig::default(), None, Some(metrics));
+    let sched = SchedulerConfig { prefill_chunk: 2, ..Default::default() };
+    let c = Cluster::start_full(THREE, sched, None, Some(metrics));
     let rxs: Vec<_> = (0..2).map(|i| c.client.submit(prompt(i), 6)).collect();
     for rx in rxs {
         collect(rx).unwrap();
@@ -265,17 +282,20 @@ fn metrics_has_a_row_per_position_with_every_node_timed() {
 
     let text = std::fs::read_to_string(&path).unwrap();
     let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split(',').collect()).collect();
-    // Two requests, each 5 prompt positions + 5 more decode steps (the 6th token ends it).
-    assert_eq!(rows.len(), 2 * 10);
+    // Two requests, each 5 prompt positions in chunks of 2, 2, 1 (the last one gives the first
+    // token) and 5 more decode steps (the 6th token ends it).
+    assert_eq!(rows.len(), 2 * 8);
     for r in &rows {
-        let (kind, step, coord, workers, network, stages) = (r[8], r[10], r[11], r[12], r[13], r[14]);
+        let (kind, step, coord, workers, network, stages) = (r[9], r[11], r[12], r[13], r[14], r[15]);
         assert_eq!(stages.split(';').count(), 3, "every node reports a time: {r:?}");
         let step: u64 = step.parse().unwrap();
         let total = coord.parse::<u64>().unwrap() + workers.parse::<u64>().unwrap() + network.parse::<u64>().unwrap();
         assert!(total >= step, "compute + network covers the step: {r:?}");
         assert!(["prefill", "first_token", "decode"].contains(&kind));
     }
-    let count = |k| rows.iter().filter(|r| r[8] == k).count();
-    assert_eq!((count("prefill"), count("first_token"), count("decode")), (8, 2, 10));
+    let count = |k| rows.iter().filter(|r| r[9] == k).count();
+    assert_eq!((count("prefill"), count("first_token"), count("decode")), (4, 2, 10));
+    let positions = |k| rows.iter().filter(|r| r[9] == k).map(|r| r[8].parse::<u32>().unwrap()).sum::<u32>();
+    assert_eq!((positions("prefill"), positions("first_token")), (8, 2));
     std::fs::remove_dir_all(dir).unwrap();
 }

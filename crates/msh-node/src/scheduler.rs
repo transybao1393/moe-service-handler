@@ -1,8 +1,13 @@
 //! Coordinator scheduler (CL-5): keeps up to `max_in_flight` requests in the ring at once.
 //!
-//! Each request has at most one position in flight, because its next input is the token that
+//! A decoding request has one position in flight, because its next input is the token that
 //! position produces. Throughput comes from interleaving requests: while request A's hidden
 //! state is on the workers, the coordinator runs its own layers for request B.
+//!
+//! The prompt is known up front, so prefill goes in chunks of `prefill_chunk` positions (CL-6),
+//! and up to `prefill_depth` chunks of one request may be in the ring at once: the coordinator
+//! runs chunk 2 while the workers run chunk 1. Every link is FIFO, so chunks reach each node in
+//! order. Only the last chunk's token is used; it is the first generated token.
 //!
 //! Two threads. The scheduler thread owns the engine and the connection to the next node; it
 //! steps ready requests in FIFO order. A reader thread owns the connection from the previous
@@ -13,7 +18,8 @@
 //! Health (CL-8): every `health_interval_ms` the scheduler sends a `Ping` round the ring. If it
 //! has not come back within `health_timeout_ms`, or a connection breaks, the ring is down:
 //! in-flight requests fail and new ones are rejected until the cluster is restarted. The ping
-//! queues behind hidden states on every node, so the timeout must exceed one full ring pass.
+//! queues behind hidden states on every node, so the timeout must exceed one full ring pass,
+//! prefill chunks included.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -40,11 +46,23 @@ pub struct SchedulerConfig {
     pub health_interval_ms: u64,
     /// How long a ping may take to come back before the ring is declared down.
     pub health_timeout_ms: u64,
+    /// Prompt positions per prefill step. Bigger chunks make better use of the engine's
+    /// batched path; smaller ones let other requests' decode steps in sooner.
+    pub prefill_chunk: usize,
+    /// Prefill chunks of one request in the ring at once.
+    pub prefill_depth: usize,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
-        SchedulerConfig { max_in_flight: 3, max_queue: 64, health_interval_ms: 1000, health_timeout_ms: 5000 }
+        SchedulerConfig {
+            max_in_flight: 3,
+            max_queue: 64,
+            health_interval_ms: 1000,
+            health_timeout_ms: 5000,
+            prefill_chunk: 64,
+            prefill_depth: 3,
+        }
     }
 }
 
@@ -52,8 +70,8 @@ impl Default for SchedulerConfig {
 /// `Failed` or `Rejected`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    /// A generated token. `latency` runs from the step's start on the coordinator to the
-    /// token's arrival, network included.
+    /// A generated token. `latency` runs from the start of the step that produced it on the
+    /// coordinator (for the first token, the last prompt chunk) to the token's arrival.
     Token { token: u32, latency: Duration },
     Done,
     Failed(String),
@@ -140,7 +158,7 @@ pub fn spawn<E: Engine + 'static>(
     spawn_with_metrics(engine, ring, cfg, None)
 }
 
-/// [`spawn`], also writing one metrics row per position to `metrics`.
+/// [`spawn`], also writing one metrics row per step to `metrics`.
 pub fn spawn_with_metrics<E: Engine + 'static>(
     engine: E,
     ring: Option<Ring>,
@@ -153,13 +171,12 @@ pub fn spawn_with_metrics<E: Engine + 'static>(
         thread::spawn(move || read_ring(prev, tx));
         next
     });
-    let hidden = vec![0.0; engine.hidden_dim()];
     let s = Scheduler {
         engine,
         next,
         cfg,
         rx,
-        hidden,
+        hidden: Vec::new(),
         buf: Vec::new(),
         next_id: 1,
         waiting: VecDeque::new(),
@@ -194,27 +211,48 @@ fn read_ring(mut prev: Connection, tx: Sender<Msg>) {
     }
 }
 
-enum Phase {
-    /// Waiting for its next step on the coordinator.
-    Ready,
-    /// A position is on the workers.
-    InFlight,
-    /// `Drop` sent; the outcome is reported when it comes back round the ring.
-    Freeing(Event),
+/// A step sent round the ring and not back yet.
+struct Step {
+    start: u32,
+    positions: u32,
+    started: Instant,
 }
 
 struct Request {
     prompt: Vec<u32>,
     max_new: usize,
-    /// Position of the next step, and the token fed into it.
-    pos: usize,
-    input: u32,
+    /// Position of the next step on the coordinator.
+    next_pos: usize,
+    /// The last generated token: the input of the next decode step.
+    last: u32,
     generated: usize,
     events: Sender<Event>,
-    step_started: Instant,
+    /// Oldest first.
+    in_flight: VecDeque<Step>,
+    submitted: Instant,
     /// Time spent waiting for an in-flight slot.
     queued: Duration,
-    phase: Phase,
+    /// `Drop` sent; this outcome is reported when it comes back round the ring.
+    freeing: Option<Event>,
+}
+
+impl Request {
+    /// Whether the coordinator can run this request's next step now.
+    fn can_step(&self, cfg: &SchedulerConfig) -> bool {
+        if self.freeing.is_some() {
+            false
+        } else if self.next_pos < self.prompt.len() {
+            self.in_flight.len() < cfg.prefill_depth.max(1)
+        } else {
+            self.in_flight.is_empty()
+        }
+    }
+}
+
+fn push_ready(ready: &mut VecDeque<u64>, id: u64) {
+    if !ready.contains(&id) {
+        ready.push_back(id);
+    }
 }
 
 struct Scheduler<E: Engine> {
@@ -335,18 +373,17 @@ impl<E: Engine> Scheduler<E> {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let input = prompt[0];
         let r = Request {
             prompt,
             max_new,
-            pos: 0,
-            input,
+            next_pos: 0,
+            last: 0,
             generated: 0,
             events,
-            // Holds the submit time until admission turns it into the queue wait.
-            step_started: Instant::now(),
+            in_flight: VecDeque::new(),
+            submitted: Instant::now(),
             queued: Duration::ZERO,
-            phase: Phase::Ready,
+            freeing: None,
         };
         self.waiting.push_back((id, r));
     }
@@ -354,28 +391,36 @@ impl<E: Engine> Scheduler<E> {
     fn admit(&mut self) {
         while self.active.len() < self.cfg.max_in_flight.max(1) {
             let Some((id, mut r)) = self.waiting.pop_front() else { break };
-            r.queued = r.step_started.elapsed();
+            r.queued = r.submitted.elapsed();
             self.active.insert(id, r);
             self.ready.push_back(id);
         }
     }
 
-    /// Runs the coordinator's part of one position and sends it on (or, in mode A, finishes it).
+    /// Runs the coordinator's part of the request's next step (a prompt chunk or one decode
+    /// position) and sends it on (or, with one node, finishes it).
     fn step(&mut self, id: u64) {
-        let Some(r) = self.active.get_mut(&id) else { return };
-        r.step_started = Instant::now();
-        let (pos, input) = (r.pos as u32, r.input);
-        let token = match self.engine.step(id, pos, StageIn::Token(input), &mut self.hidden) {
+        let Some(r) = self.active.get_mut(&id).filter(|r| r.can_step(&self.cfg)) else { return };
+        let started = Instant::now();
+        let start = r.next_pos;
+        let tokens = match r.prompt.get(start..) {
+            Some(rest) if !rest.is_empty() => &rest[..rest.len().min(self.cfg.prefill_chunk.max(1))],
+            _ => std::slice::from_ref(&r.last),
+        };
+        let positions = tokens.len() as u32;
+        let token = match self.engine.step(id, start as u32, StageIn::Tokens(tokens), &mut self.hidden) {
             Ok(token) => token,
             Err(e) => return self.finish(id, Event::Failed(e.to_string())),
         };
-        let coord_us = r.step_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        let coord_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        r.next_pos += positions as usize;
+        r.in_flight.push_back(Step { start: start as u32, positions, started });
         let next = match (token, &mut self.next) {
             // One node holds every layer and the head.
             (Some(token), None) => {
                 self.stages.clear();
                 self.stages.push(coord_us);
-                return self.on_token(id, pos, token);
+                return self.on_token(id, start as u32, token);
             }
             (None, Some(next)) => next,
             (Some(_), Some(_)) | (None, None) => {
@@ -384,18 +429,19 @@ impl<E: Engine> Scheduler<E> {
             }
         };
         encode_hidden(&[coord_us], &self.hidden, &mut self.buf);
-        if let Err(e) = next.send(MsgType::Hidden, id, pos, &self.buf) {
+        if let Err(e) = next.send(MsgType::Hidden, id, start as u32, &self.buf) {
             let reason = format!("send to {}: {e}", next.peer_name());
             return self.ring_down(reason);
         }
-        if let Some(r) = self.active.get_mut(&id) {
-            r.phase = Phase::InFlight;
+        // The next prompt chunk can follow right behind this one.
+        if r.can_step(&self.cfg) {
+            push_ready(&mut self.ready, id);
         }
     }
 
     fn on_frame(&mut self, h: Header, payload: Vec<u8>) {
         let id = h.request_id;
-        let in_flight = matches!(self.active.get(&id).map(|r| &r.phase), Some(Phase::InFlight));
+        let in_flight = self.active.get(&id).is_some_and(|r| r.freeing.is_none() && !r.in_flight.is_empty());
         match h.msg_type {
             MsgType::Token if in_flight => match decode_token(&payload, &mut self.stages) {
                 Ok(token) => self.on_token(id, h.position, token),
@@ -411,8 +457,9 @@ impl<E: Engine> Scheduler<E> {
                 }
             }
             MsgType::Drop => {
-                if let Some(Request { phase: Phase::Freeing(outcome), events, .. }) = self.active.remove(&id) {
-                    let _ = events.send(outcome);
+                if let Some(outcome) = self.active.get_mut(&id).and_then(|r| r.freeing.take()) {
+                    let r = self.active.remove(&id).unwrap();
+                    let _ = r.events.send(outcome);
                 }
             }
             // Frames for requests that already failed are expected and harmless.
@@ -421,27 +468,30 @@ impl<E: Engine> Scheduler<E> {
         }
     }
 
-    /// Handles the token produced at `pos`; `self.stages` holds the step's per-node times.
-    fn on_token(&mut self, id: u64, pos: u32, token: u32) {
+    /// Handles the token produced by the step starting at `start`; `self.stages` holds the
+    /// step's per-node times.
+    fn on_token(&mut self, id: u64, start: u32, token: u32) {
         let eos = self.engine.eos();
         let in_flight = self.active.len();
         let Some(r) = self.active.get_mut(&id) else { return };
-        if pos as usize != r.pos {
-            let msg = format!("token for position {pos}, expected {}", r.pos);
+        let Some(step) = r.in_flight.pop_front().filter(|s| s.start == start) else {
+            let msg = format!("unexpected token for position {start}");
             return self.finish(id, Event::Failed(msg));
-        }
+        };
+        let end = (step.start + step.positions) as usize;
+        let kind = match end {
+            n if n < r.prompt.len() => StepKind::Prefill,
+            n if n == r.prompt.len() => StepKind::FirstToken,
+            _ => StepKind::Decode,
+        };
         if let Some(m) = &mut self.metrics {
-            let kind = match r.pos + 1 {
-                n if n < r.prompt.len() => StepKind::Prefill,
-                n if n == r.prompt.len() => StepKind::FirstToken,
-                _ => StepKind::Decode,
-            };
             let rec = StepRecord {
                 request: id,
-                pos,
+                pos: step.start,
+                positions: step.positions,
                 kind,
                 token,
-                step_us: r.step_started.elapsed().as_micros() as u64,
+                step_us: step.started.elapsed().as_micros() as u64,
                 stage_us: &self.stages,
                 queue_us: r.queued.as_micros() as u64,
                 in_flight,
@@ -452,18 +502,18 @@ impl<E: Engine> Scheduler<E> {
                 self.metrics = None;
             }
         }
-        r.pos += 1;
-        r.phase = Phase::Ready;
-        if r.pos < r.prompt.len() {
-            r.input = r.prompt[r.pos];
-            self.ready.push_back(id);
+        if kind == StepKind::Prefill {
+            // A token predicted inside the prompt; the prompt's own next token wins.
+            if r.can_step(&self.cfg) {
+                push_ready(&mut self.ready, id);
+            }
             return;
         }
         if Some(token) == eos {
             return self.finish(id, Event::Done);
         }
         r.generated += 1;
-        let ev = Event::Token { token, latency: r.step_started.elapsed() };
+        let ev = Event::Token { token, latency: step.started.elapsed() };
         if r.events.send(ev).is_err() {
             // The client went away: cancel. Nobody is listening for the outcome.
             return self.finish(id, Event::Done);
@@ -471,8 +521,8 @@ impl<E: Engine> Scheduler<E> {
         if r.generated == r.max_new {
             return self.finish(id, Event::Done);
         }
-        r.input = token;
-        self.ready.push_back(id);
+        r.last = token;
+        push_ready(&mut self.ready, id);
     }
 
     /// Frees the request on this node and, for a ring, sends `Drop` round it; the outcome is
@@ -494,7 +544,7 @@ impl<E: Engine> Scheduler<E> {
             return self.ring_down(reason);
         }
         if let Some(r) = self.active.get_mut(&id) {
-            r.phase = Phase::Freeing(outcome);
+            r.freeing = Some(outcome);
         }
     }
 
@@ -507,8 +557,8 @@ impl<E: Engine> Scheduler<E> {
         let failed = format!("ring down: {reason}");
         for (id, r) in self.active.drain() {
             self.engine.free(id);
-            let ev = match r.phase {
-                Phase::Freeing(outcome @ Event::Done) => outcome,
+            let ev = match r.freeing {
+                Some(outcome @ Event::Done) => outcome,
                 _ => Event::Failed(failed.clone()),
             };
             let _ = r.events.send(ev);

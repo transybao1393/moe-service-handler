@@ -82,8 +82,9 @@ fn connect_with_retry(addr: &str, me: &str, timeout: Duration) -> Result<Connect
     }
 }
 
-/// Nodes 1..n: run the layer range on each incoming hidden state and pass it on; the node
-/// holding the head sends the sampled token back to the coordinator instead.
+/// Nodes 1..n: run the layer range on each incoming hidden state (one position, or a prompt
+/// chunk) and pass it on; the node holding the head sends the sampled token back to the
+/// coordinator instead.
 pub struct Worker<E: Engine> {
     engine: E,
     ring: Ring,
@@ -97,8 +98,9 @@ impl<E: Engine> Worker<E> {
 
     /// Serves until the previous node closes the connection; returns the engine for inspection.
     pub fn run(mut self) -> Result<E, Error> {
-        let mut hidden = vec![0.0; self.engine.hidden_dim()];
-        let mut hidden_out = vec![0.0; self.engine.hidden_dim()];
+        let dim = self.engine.hidden_dim();
+        let mut hidden = Vec::new();
+        let mut hidden_out = Vec::new();
         let mut buf = Vec::new();
         let mut out = Vec::new();
         let mut stages = Vec::new();
@@ -110,10 +112,11 @@ impl<E: Engine> Worker<E> {
             };
             match h.msg_type {
                 MsgType::Hidden => {
-                    let result = decode_hidden(&buf, &mut hidden, &mut stages).map_err(Error::from).and_then(|()| {
+                    let decoded = decode_hidden(&buf, dim, &mut hidden, &mut stages).map_err(Error::from);
+                    let result = decoded.and_then(|_| {
                         let t0 = Instant::now();
                         let r = self.engine.step(h.request_id, h.position, StageIn::Hidden(&hidden), &mut hidden_out);
-                        // This node's compute time travels on with the position (CL-10).
+                        // This node's compute time travels on with the positions (CL-10).
                         stages.push(t0.elapsed().as_micros().min(u32::MAX as u128) as u32);
                         r
                     });

@@ -64,8 +64,11 @@ impl std::ops::Deref for Cluster {
 }
 
 fn start(splits: &[[u32; 2]]) -> Cluster {
+    start_with(splits, SchedulerConfig::default())
+}
+
+fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
     let cap = (splits.len() == 1).then_some(3 << 30);
-    let sched = SchedulerConfig::default();
     let listeners: Vec<TcpListener> = splits.iter().map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
     let cfg = Config {
         hidden_dim: 2048,
@@ -73,7 +76,7 @@ fn start(splits: &[[u32; 2]]) -> Cluster {
         scheduler: sched,
         engine: Default::default(),
         http: None,
-            metrics: None,
+        metrics: None,
         nodes: splits
             .iter()
             .zip(&listeners)
@@ -108,14 +111,19 @@ fn start(splits: &[[u32; 2]]) -> Cluster {
 #[test]
 #[ignore = "needs the OLMoE model on disk"]
 fn one_node_matches_mlx_reference() {
-    let client = start(&[[0, 16]]);
-    assert_eq!(client.generate(PROMPT.to_vec(), 32).unwrap().tokens, REF);
+    // Position by position, and the whole prompt as one batched chunk.
+    for prefill_chunk in [1, 64] {
+        let client = start_with(&[[0, 16]], SchedulerConfig { prefill_chunk, ..Default::default() });
+        assert_eq!(client.generate(PROMPT.to_vec(), 32).unwrap().tokens, REF, "chunk {prefill_chunk}");
+    }
 }
 
 #[test]
 #[ignore = "needs the OLMoE model on disk"]
 fn three_node_ring_matches_mlx_reference_with_requests_in_flight() {
-    let client = start(&[[0, 8], [8, 12], [12, 16]]);
+    // The 25-token prompt in chunks of 8, 8, 8 and 1, pipelined round the ring.
+    let sched = SchedulerConfig { prefill_chunk: 8, ..Default::default() };
+    let client = start_with(&[[0, 8], [8, 12], [12, 16]], sched);
     // Three at once: each request's state must stay separate on every node.
     let rxs: Vec<_> = (0..3).map(|_| client.submit(PROMPT.to_vec(), 32)).collect();
     for rx in rxs {

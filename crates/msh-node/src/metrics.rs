@@ -1,4 +1,5 @@
-//! Run-level metrics (CL-10, CL-11): one CSV row per position of every request.
+//! Run-level metrics (CL-10, CL-11): one CSV row per step of every request: a prompt chunk or
+//! one decode position.
 //!
 //! Each row splits the step's wall time on the coordinator into each node's compute time, as
 //! reported in the frames (no clock sync needed), and the remainder: network transfer and
@@ -9,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-const HEADER: &str = "run_id,git_hash,host,hardware,split,engine,request,pos,kind,token,\
+const HEADER: &str = "run_id,git_hash,host,hardware,split,engine,request,pos,positions,kind,token,\
                       step_us,coord_us,workers_us,network_us,stage_us,queue_us,in_flight,ring_rtt_us";
 
 /// Describes the run; repeated on every row.
@@ -27,9 +28,9 @@ pub struct RunInfo {
 /// What a row describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepKind {
-    /// A prompt position whose output is discarded.
+    /// A prompt chunk whose output is discarded.
     Prefill,
-    /// The last prompt position, which produces the first token.
+    /// The last prompt chunk, which produces the first token.
     FirstToken,
     /// A generated token fed back in.
     Decode,
@@ -37,7 +38,10 @@ pub enum StepKind {
 
 pub struct StepRecord<'a> {
     pub request: u64,
+    /// First position of the step.
     pub pos: u32,
+    /// Positions in the step: the chunk size in prefill, 1 when decoding.
+    pub positions: u32,
     pub kind: StepKind,
     pub token: u32,
     pub step_us: u64,
@@ -93,10 +97,11 @@ impl Metrics {
         let token = if r.kind == StepKind::Prefill { String::new() } else { r.token.to_string() };
         writeln!(
             self.out,
-            "{},{},{},{kind},{token},{},{coord},{},{},{},{},{},{}",
+            "{},{},{},{},{kind},{token},{},{coord},{},{},{},{},{},{}",
             self.run,
             r.request,
             r.pos,
+            r.positions,
             r.step_us,
             compute - coord,
             r.step_us.saturating_sub(compute),
@@ -141,6 +146,7 @@ mod tests {
         let rec = |kind, stage_us| StepRecord {
             request: 1,
             pos: 3,
+            positions: 1,
             kind,
             token: 42,
             step_us: 1000,
@@ -160,7 +166,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], HEADER);
-        assert_eq!(lines[1], "7,abc,h,\"Apple M4, 16 GB\",m4:0-8 m1a:8-16,mock,1,3,prefill,,1000,400,350,250,400;350,5,2,300");
+        assert_eq!(lines[1], "7,abc,h,\"Apple M4, 16 GB\",m4:0-8 m1a:8-16,mock,1,3,1,prefill,,1000,400,350,250,400;350,5,2,300");
         assert!(lines[2].contains(",decode,42,"));
         std::fs::remove_dir_all(dir).unwrap();
     }

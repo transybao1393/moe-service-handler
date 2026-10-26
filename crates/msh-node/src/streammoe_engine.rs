@@ -4,6 +4,8 @@
 //! released on `free`. The pool is sized from the scheduler's `max_in_flight`; the coordinator
 //! admits a new request only after the previous one's `Drop` has gone round the ring, so no
 //! node's pool overflows. Sampling is greedy on the node holding the head.
+//!
+//! A prompt chunk goes to streammoe as one call, which takes its batched prefill path.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -28,6 +30,8 @@ pub struct StreamMoeEngine {
     ctx: Ctx,
     admitted: HashSet<u64>,
     logits: Vec<f32>,
+    /// Token ids as streammoe takes them.
+    tokens: Vec<i32>,
 }
 
 impl StreamMoeEngine {
@@ -52,7 +56,7 @@ impl StreamMoeEngine {
         )
         .map_err(|e| Error::Engine(format!("open {}: {e}", spec.model_dir.display())))?;
         let logits = vec![0.0; ctx.n_vocab()];
-        Ok(StreamMoeEngine { ctx, admitted: HashSet::new(), logits })
+        Ok(StreamMoeEngine { ctx, admitted: HashSet::new(), logits, tokens: Vec::new() })
     }
 }
 
@@ -68,34 +72,39 @@ impl Engine for StreamMoeEngine {
     fn step(
         &mut self,
         req: u64,
-        pos: u32,
+        start_pos: u32,
         input: StageIn<'_>,
-        hidden_out: &mut [f32],
+        hidden_out: &mut Vec<f32>,
     ) -> Result<Option<u32>, Error> {
-        let engine_err = |e: streammoe::Error| Error::Engine(format!("request {req} position {pos}: {e}"));
+        let engine_err = |e: streammoe::Error| Error::Engine(format!("request {req} position {start_pos}: {e}"));
+        let dim = self.hidden_dim();
+        let n = input.len(dim);
+        if n == 0 {
+            return Err(Error::Engine(format!("request {req}: no positions")));
+        }
         if !self.admitted.contains(&req) {
-            if pos != 0 {
-                return Err(Error::Engine(format!("request {req}: first position {pos}, expected 0")));
+            if start_pos != 0 {
+                return Err(Error::Engine(format!("request {req}: first position {start_pos}, expected 0")));
             }
             self.ctx.admit_request(ReqId(req)).map_err(engine_err)?;
             self.admitted.insert(req);
         }
-        let token;
         let input = match input {
-            StageIn::Token(t) => {
-                token = [t as i32];
-                StageInput::Tokens(&token)
+            StageIn::Tokens(t) => {
+                self.tokens.clear();
+                self.tokens.extend(t.iter().map(|&t| t as i32));
+                StageInput::Tokens(&self.tokens)
             }
             StageIn::Hidden(h) => StageInput::Hidden(h),
         };
-        if !self.ctx.has_head() {
-            let out = StageOutput::Hidden(hidden_out);
-            self.ctx.eval_request(ReqId(req), input, pos as usize, out).map_err(engine_err)?;
-            return Ok(None);
-        }
-        let out = StageOutput::Logits(&mut self.logits);
-        self.ctx.eval_request(ReqId(req), input, pos as usize, out).map_err(engine_err)?;
-        Ok(Some(argmax(&self.logits)))
+        let out = if self.ctx.has_head() {
+            StageOutput::Logits(&mut self.logits)
+        } else {
+            hidden_out.resize(n * dim, 0.0);
+            StageOutput::Hidden(hidden_out)
+        };
+        self.ctx.eval_request(ReqId(req), input, start_pos as usize, out).map_err(engine_err)?;
+        Ok(self.ctx.has_head().then(|| argmax(&self.logits)))
     }
 
     fn free(&mut self, req: u64) {

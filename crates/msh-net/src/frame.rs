@@ -9,14 +9,18 @@
 //! | 6      | 1    | message type                  |
 //! | 7      | 1    | flags (reserved, must be 0)   |
 //! | 8      | 8    | request id                    |
-//! | 16     | 4    | position                      |
+//! | 16     | 4    | position (first, for a chunk) |
 //! | 20     | 4    | payload length in bytes       |
+//!
+//! A `Hidden` frame carries one or more consecutive positions starting at `position` (a
+//! prefill chunk); the matching `Token` frame repeats that start position and holds the token
+//! sampled after the chunk's last position.
 
 use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"MSHN";
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const HEADER_LEN: usize = 24;
 /// Upper bound on a payload; guards against a corrupt length field allocating gigabytes.
 /// 64 MiB covers an 8k-token f32 prefill chunk (8192 × 2048 × 4 = 64 MiB).
@@ -169,12 +173,12 @@ pub fn read_frame<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Header, F
     Ok(header)
 }
 
-// Hidden and Token payloads carry the compute time of every stage the position has passed
+// Hidden and Token payloads carry the compute time of every stage the positions have passed
 // through, in microseconds, in ring order. The coordinator splits a step's wall time into
 // per-node compute and the rest (network and queueing) from durations alone, so the nodes'
 // clocks need not agree.
 //
-//   Hidden: stage_count u16, stage_us u32 × stage_count, f32 × values
+//   Hidden: stage_count u16, stage_us u32 × stage_count, f32 × (positions × hidden_dim)
 //   Token:  token u32, stage_count u16, stage_us u32 × stage_count
 
 /// Encodes a hidden-state payload.
@@ -187,17 +191,22 @@ pub fn encode_hidden(stage_us: &[u32], values: &[f32], out: &mut Vec<u8>) {
     }
 }
 
-/// Decodes a hidden-state payload into `values` (which must be the right length) and
-/// `stage_us`.
-pub fn decode_hidden(bytes: &[u8], values: &mut [f32], stage_us: &mut Vec<u32>) -> Result<(), FrameError> {
+/// Decodes a hidden-state payload of `hidden_dim`-wide rows into `values`, resized to fit, and
+/// `stage_us`. Returns the number of rows (positions).
+pub fn decode_hidden(
+    bytes: &[u8],
+    hidden_dim: usize,
+    values: &mut Vec<f32>,
+    stage_us: &mut Vec<u32>,
+) -> Result<usize, FrameError> {
     let rest = read_stages(bytes, stage_us)?;
-    if rest.len() != values.len() * 4 {
-        return Err(bad_payload(format!("hidden of {} bytes, expected {}", rest.len(), values.len() * 4)));
+    let row = hidden_dim * 4;
+    if row == 0 || rest.is_empty() || rest.len() % row != 0 {
+        return Err(bad_payload(format!("hidden of {} bytes is not whole rows of {row}", rest.len())));
     }
-    for (v, c) in values.iter_mut().zip(rest.chunks_exact(4)) {
-        *v = f32::from_le_bytes(c.try_into().unwrap());
-    }
-    Ok(())
+    values.clear();
+    values.extend(rest.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())));
+    Ok(rest.len() / row)
 }
 
 /// Encodes a token payload.
@@ -247,12 +256,15 @@ mod tests {
         let v = [0.0f32, -1.5, f32::MIN_POSITIVE, 1e-40, f32::MAX, std::f32::consts::PI];
         let mut bytes = Vec::new();
         encode_hidden(&[120, 95], &v, &mut bytes);
-        let (mut out, mut stages) = ([0f32; 6], Vec::new());
-        decode_hidden(&bytes, &mut out, &mut stages).unwrap();
-        assert_eq!(v.map(f32::to_bits), out.map(f32::to_bits));
+        let (mut out, mut stages) = (Vec::new(), Vec::new());
+        assert_eq!(decode_hidden(&bytes, 3, &mut out, &mut stages).unwrap(), 2);
+        assert_eq!(v.map(f32::to_bits)[..], out.iter().map(|x| x.to_bits()).collect::<Vec<_>>()[..]);
         assert_eq!(stages, [120, 95]);
-        assert!(decode_hidden(&bytes[..bytes.len() - 4], &mut out, &mut stages).is_err());
-        assert!(decode_hidden(&bytes[..3], &mut out, &mut stages).is_err());
+        assert_eq!(decode_hidden(&bytes, 6, &mut out, &mut stages).unwrap(), 1);
+        assert!(decode_hidden(&bytes, 4, &mut out, &mut stages).is_err());
+        assert!(decode_hidden(&bytes[..bytes.len() - 4], 3, &mut out, &mut stages).is_err());
+        assert!(decode_hidden(&bytes[..3], 3, &mut out, &mut stages).is_err());
+        assert!(decode_hidden(&bytes[..10], 3, &mut out, &mut stages).is_err());
     }
 
     #[test]
