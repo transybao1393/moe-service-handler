@@ -24,3 +24,8 @@ model_weights.bin
 model_weights.json
 vocab.bin
 packed_experts/
+tokenizer.json
+tokenizer_config.json
+
+# Node and server logs
+*.log

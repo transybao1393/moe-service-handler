@@ -1,13 +1,10 @@
 # moe-service-handler
 
-Turns streammoe into a service that runs Qwen3.6-35B-A3B on one Mac mini
-(mode A) or a three-node pipeline of Mac minis (mode B). streammoe owns everything inside one
-machine (memory cap, expert streaming, kernels); this repo owns everything that spans
-machines or requests. Full requirements: [`moe-service-handler-prd.md`](moe-service-handler-prd.md).
+Turns streammoe into a service that runs Qwen3.6-35B-A3B across a three-node pipeline of Mac
+minis (mode B). streammoe owns everything inside one machine (memory cap, expert streaming,
+kernels); this repo owns everything that spans machines or requests. Full requirements: [`moe-service-handler-prd.md`](moe-service-handler-prd.md).
 
 ## Architecture
-
-### Mode B — three-node pipeline
 
 Each node runs a contiguous layer range. Nodes form a ring: hidden states flow forward,
 the last node samples a token and sends it back to the coordinator.
@@ -39,23 +36,16 @@ flowchart LR
 - **Health:** a `Ping` travels the ring every second. A broken connection, or a ping not back
   within 5 s (a hung node), marks the ring down: in-flight requests fail and new ones are
   rejected until the cluster is restarted.
-
-### Mode A — single node
-
-Same binary and config format, one node with `layers = [0, 40]`; no network.
-
-```mermaid
-flowchart LR
-    C(["client"]) --> M4["<b>m4 · coordinator</b><br/>embed + layers 0–39 + head"]
-    SSD[("external SSD<br/>experts")] -- "stream on miss" --> M4
-```
+- **API:** the coordinator serves OpenAI-compatible `GET /v1/models` and
+  `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
+  429, a ring that is down 503.
 
 ## Crates
 
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Coordinator / worker, config, ring, scheduler, engines | Ring, scheduler (CL-5), dead-node handling (CL-8); runs real streammoe (tested on OLMoE) |
+| `msh-node` | binary | Coordinator / worker, config, ring, scheduler, HTTP API, engines | Ring, scheduler (CL-5), dead-node handling (CL-8), HTTP API (CL-2); runs real streammoe (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
 The engine sits behind an `Engine` trait shaped like streammoe's `eval_request` (token or
@@ -68,8 +58,8 @@ hidden state in; hidden state or sampled token out). Two implementations:
   `main` is pushed (see `crates/msh-node/Cargo.toml`).
 
 For development the real engine runs **OLMoE-1B-7B** (16 layers, 3.9 GB at 4-bit) from
-`~/models/olmoe-1b-7b`: one node and a 3-process 8/4/4 split both reproduce streammoe's MLX
-reference answer token for token.
+`~/models/olmoe-1b-7b`: a 3-process 8/4/4 split reproduces streammoe's MLX reference answer
+token for token.
 
 ## Quick start
 
@@ -82,9 +72,14 @@ $B --config configs/local-3node.toml --node m1b &
 $B --config configs/local-3node.toml --node m1a &
 $B --config configs/local-3node.toml --node m4 --max-tokens 500 --requests 3
 
-# the real engine on OLMoE (configs/olmoe-*.toml), and its model-backed tests
+# the real engine on OLMoE, served over HTTP, and its model-backed tests
 cargo build --release --features msh-node/olmoe
-cargo test -p msh-node --features olmoe --release --test olmoe -- --ignored --test-threads=1
+$B --config configs/olmoe-3node.toml --node m1b &
+$B --config configs/olmoe-3node.toml --node m1a &
+$B --config configs/olmoe-3node.toml --node m4 &
+curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is the capital of France?"}]}'
+cargo test -p msh-node --features olmoe --release -- --ignored --test-threads=1
 
 # network round-trip probe: serve on one machine, run from another
 target/release/msh-probe serve 0.0.0.0:7070
