@@ -3,7 +3,7 @@
 //! The first node in the config is the coordinator; it submits K concurrent greedy generations
 //! over the prompt (token ids, until the HTTP endpoint lands) and prints throughput.
 //! Every other node is a worker and serves until the coordinator disconnects.
-//! `[engine] kind` picks the mock (default) or moeflux, which needs a model feature at build
+//! `[engine] kind` picks the mock (default) or streammoe, which needs a model feature at build
 //! time, e.g. `cargo build --release --features olmoe`.
 
 use std::net::TcpListener;
@@ -40,30 +40,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Open the engine before joining the ring, so a range that does not fit fails here (DEP-4).
     match cfg.engine.kind {
         EngineKind::Mock => serve(&cfg, idx, MockEngine::new(node.layer_range(), cfg.num_layers, cfg.hidden_dim), &flag),
-        EngineKind::Moeflux => serve(&cfg, idx, open_moeflux(&cfg, idx)?, &flag),
+        EngineKind::StreamMoe => serve(&cfg, idx, open_streammoe(&cfg, idx)?, &flag),
     }
 }
 
-#[cfg(feature = "moeflux")]
-fn open_moeflux(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box<dyn std::error::Error>> {
-    use msh_node::moeflux_engine::{expand_home, MoefluxEngine, OpenSpec};
+#[cfg(feature = "streammoe")]
+fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box<dyn std::error::Error>> {
+    use msh_node::streammoe_engine::{expand_home, StreamMoeEngine, OpenSpec};
     let node = &cfg.nodes[idx];
     let model_dir = expand_home(&cfg.engine.model_dir);
     let t0 = Instant::now();
-    let engine = MoefluxEngine::open(&OpenSpec {
+    let engine = StreamMoeEngine::open(&OpenSpec {
         model_dir: &model_dir,
         layers: node.layer_range(),
         n_ctx: cfg.engine.n_ctx,
         mem_cap: node.mem_cap(&cfg.engine),
         max_requests: cfg.scheduler.max_in_flight,
     })?;
-    eprintln!("{}: moeflux opened layers {:?} in {:.1} s", node.name, node.layer_range(), t0.elapsed().as_secs_f64());
+    eprintln!("{}: streammoe opened layers {:?} in {:.1} s", node.name, node.layer_range(), t0.elapsed().as_secs_f64());
     Ok(engine)
 }
 
-#[cfg(not(feature = "moeflux"))]
-fn open_moeflux(_: &Config, _: usize) -> Result<MockEngine, Box<dyn std::error::Error>> {
-    Err("engine kind \"moeflux\" needs a build with a model feature, e.g. --features olmoe".into())
+#[cfg(not(feature = "streammoe"))]
+fn open_streammoe(_: &Config, _: usize) -> Result<MockEngine, Box<dyn std::error::Error>> {
+    Err("engine kind \"streammoe\" needs a build with a model feature, e.g. --features olmoe".into())
 }
 
 fn serve<'a, E: Engine + 'static>(

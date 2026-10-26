@@ -3,10 +3,11 @@ hidden_dim = 2048
 num_layers = 16
 
 [engine]
-kind = "moeflux"
+kind = "streammoe"
 model_dir = "~/models/olmoe-1b-7b"
 n_ctx = 2048
-mem_cap_gib = 3.0
+# 4 request slots (3 in flight + streammoe's default) × 0.5 GiB of KV at n_ctx 2048 need > 3 GiB.
+mem_cap_gib = 4.0
 
 [[nodes]]
 name = "m4"

@@ -5,8 +5,8 @@
 
 pub mod config;
 pub mod engine;
-#[cfg(feature = "moeflux")]
-pub mod moeflux_engine;
+#[cfg(feature = "streammoe")]
+pub mod streammoe_engine;
 pub mod node;
 pub mod scheduler;
 

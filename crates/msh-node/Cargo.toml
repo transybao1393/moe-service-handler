@@ -6,15 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-# The real engine. Pick exactly one model feature: moeflux compiles shapes in per model.
-moeflux = ["dep:moeflux"]
-olmoe = ["moeflux", "moeflux/model-olmoe-1b-7b"]
-qwen36 = ["moeflux", "moeflux/model-qwen3-6-35b-a3b"]
+# The real engine. Pick exactly one model feature: streammoe compiles shapes in per model.
+streammoe = ["dep:streammoe"]
+olmoe = ["streammoe", "streammoe/model-olmoe-1b-7b"]
+qwen36 = ["streammoe", "streammoe/model-qwen3-6-35b-a3b"]
 
 [dependencies]
-# Pinned to a commit of the local moeflux checkout (its main is not pushed yet). Switch the
-# URL to https://github.com/transybao1393/moeflux.git once that commit is on GitHub.
-moeflux = { git = "file:///Users/johnathan/Documents/projects/moeflux", rev = "748bb3e8b83c59ce79ca98b1512958e023670fc8", optional = true }
+# streammoe is published as the `moeflux` crate. Pinned to a commit of the local checkout (its
+# main is not pushed yet); switch the URL to https://github.com/transybao1393/moeflux.git once
+# that commit is on GitHub.
+streammoe = { package = "moeflux", git = "file:///Users/johnathan/Documents/projects/moeflux", rev = "748bb3e8b83c59ce79ca98b1512958e023670fc8", optional = true }
 msh-net = { version = "0.1.0", path = "../msh-net" }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.0.7"

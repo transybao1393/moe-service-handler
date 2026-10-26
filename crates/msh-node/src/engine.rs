@@ -1,4 +1,4 @@
-//! What a node needs from moeflux (DEP-1, DEP-2, DEP-3), as a trait shaped like moeflux's
+//! What a node needs from streammoe (DEP-1, DEP-2, DEP-3), as a trait shaped like streammoe's
 //! `eval_request`: a stage takes a token (first node) or a hidden state, and produces a hidden
 //! state for the next node or, on the last node, the sampled token.
 //!

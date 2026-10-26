@@ -4,7 +4,7 @@ hidden_dim = 2048
 num_layers = 16
 
 [engine]
-kind = "moeflux"
+kind = "streammoe"
 model_dir = "~/models/olmoe-1b-7b"
 n_ctx = 2048
 mem_cap_gib = 3.0

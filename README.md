@@ -1,7 +1,7 @@
 # moe-service-handler
 
-Turns moeflux into a service that runs Qwen3.6-35B-A3B on one Mac mini
-(mode A) or a three-node pipeline of Mac minis (mode B). moeflux owns everything inside one
+Turns streammoe into a service that runs Qwen3.6-35B-A3B on one Mac mini
+(mode A) or a three-node pipeline of Mac minis (mode B). streammoe owns everything inside one
 machine (memory cap, expert streaming, kernels); this repo owns everything that spans
 machines or requests. Full requirements: [`moe-service-handler-prd.md`](moe-service-handler-prd.md).
 
@@ -55,20 +55,20 @@ flowchart LR
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Coordinator / worker, config, ring, scheduler, engines | Ring, scheduler (CL-5), dead-node handling (CL-8); runs real moeflux (tested on OLMoE) |
+| `msh-node` | binary | Coordinator / worker, config, ring, scheduler, engines | Ring, scheduler (CL-5), dead-node handling (CL-8); runs real streammoe (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
-The engine sits behind an `Engine` trait shaped like moeflux's `eval_request` (token or
+The engine sits behind an `Engine` trait shaped like streammoe's `eval_request` (token or
 hidden state in; hidden state or sampled token out). Two implementations:
 
 - `MockEngine`: deterministic, no model needed; the default.
-- `MoefluxEngine`: moeflux on the node's layer range, one moeflux request slot per request in
+- `StreamMoeEngine`: streammoe on the node's layer range, one streammoe request slot per request in
   flight. Built with a model feature (`--features olmoe` or `qwen36`) and selected with
-  `[engine] kind = "moeflux"`. moeflux is pinned to a commit of the local checkout until its
+  `[engine] kind = "streammoe"`. streammoe is pinned to a commit of the local checkout until its
   `main` is pushed (see `crates/msh-node/Cargo.toml`).
 
 For development the real engine runs **OLMoE-1B-7B** (16 layers, 3.9 GB at 4-bit) from
-`~/models/olmoe-1b-7b`: one node and a 3-process 8/4/4 split both reproduce moeflux's MLX
+`~/models/olmoe-1b-7b`: one node and a 3-process 8/4/4 split both reproduce streammoe's MLX
 reference answer token for token.
 
 ## Quick start

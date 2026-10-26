@@ -1,5 +1,5 @@
 //! The real engine on OLMoE-1B-7B: one node against a three-node ring over loopback, checked
-//! against moeflux's MLX reference continuation.
+//! against streammoe's MLX reference continuation.
 //!
 //! Needs the converted model at `$HOME/models/olmoe-1b-7b` (or `MSH_OLMOE_DIR`), so it is
 //! `#[ignore]`d. Run with:
@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use msh_node::config::{Config, NodeConfig};
-use msh_node::moeflux_engine::{expand_home, MoefluxEngine, OpenSpec};
+use msh_node::streammoe_engine::{expand_home, StreamMoeEngine, OpenSpec};
 use msh_node::node::{join_ring, Worker};
 use msh_node::scheduler::{self, collect, Client, SchedulerConfig};
 
@@ -32,11 +32,11 @@ fn model_dir() -> PathBuf {
     std::env::var("MSH_OLMOE_DIR").map(PathBuf::from).unwrap_or_else(|_| expand_home("~/models/olmoe-1b-7b"))
 }
 
-/// moeflux's cap is checked against the whole process's footprint, so it only holds with one
+/// streammoe's cap is checked against the whole process's footprint, so it only holds with one
 /// context per process, as in a real deployment. A ring of threads runs uncapped.
-fn open(layers: std::ops::Range<u32>, max_requests: usize, mem_cap: Option<u64>) -> MoefluxEngine {
+fn open(layers: std::ops::Range<u32>, max_requests: usize, mem_cap: Option<u64>) -> StreamMoeEngine {
     let dir = model_dir();
-    MoefluxEngine::open(&OpenSpec { model_dir: &dir, layers, n_ctx: 512, mem_cap, max_requests })
+    StreamMoeEngine::open(&OpenSpec { model_dir: &dir, layers, n_ctx: 512, mem_cap, max_requests })
         .expect("open OLMoE (is the model converted at ~/models/olmoe-1b-7b?)")
 }
 
