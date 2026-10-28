@@ -1,0 +1,32 @@
+# Qwen3.6-35B-A3B (40 layers) split 20 / 10 / 10 in the M4 + M1 + M4 shape, on loopback
+# addresses. Build with --features qwen36. For the Mac minis: change the addresses and the
+# split; not run on the dev Mac.
+hidden_dim = 2048
+num_layers = 40
+
+[engine]
+kind = "streammoe"
+model_dir = "~/models/qwen3-6-35b-a3b"
+n_ctx = 2048
+mem_cap_gib = 4.0
+
+[http]
+listen = "127.0.0.1:8080"
+tokenizer = "~/models/qwen3-6-35b-a3b/mlx-4bit/tokenizer.json"
+chat_template = "chatml"
+model = "qwen3.6-35b-a3b"
+
+[[nodes]]
+name = "m4"
+addr = "127.0.0.1:7301"
+layers = [0, 20]
+
+[[nodes]]
+name = "m1"
+addr = "127.0.0.1:7302"
+layers = [20, 30]
+
+[[nodes]]
+name = "m4b"
+addr = "127.0.0.1:7303"
+layers = [30, 40]
