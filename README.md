@@ -1,27 +1,24 @@
 # moe-service-handler
 
-Turns streammoe into a service that runs Qwen3.6-35B-A3B across a three-node pipeline of Mac
-minis (mode B). streammoe owns everything inside one machine (memory cap, expert streaming,
-kernels); this repo owns everything that spans machines or requests. Full requirements: [`moe-service-handler-prd.md`](moe-service-handler-prd.md).
+<p align="center">
+  <img src="docs/assets/dataflow.svg" width="920" alt="Data flow: a client's prompt enters the M4 coordinator; hidden states pass through the layer ranges on the M4, the M1 and a second M4; the last node samples a token, sends it back to the coordinator, and the coordinator streams it to the client. Three requests are in the ring at once.">
+</p>
+
+Turns streammoe into a service that runs a large MoE model, Qwen3.6-35B-A3B, across three
+Mac minis: an M4 as the controller (coordinator), an M1 and a second M4. Every node holds part
+of the model, computes its share of each token and passes the result on; the coordinator
+answers the user. streammoe owns everything inside one machine (memory cap, expert streaming,
+kernels); this repo owns everything that spans machines or requests. Full requirements:
+[`moe-service-handler-prd.md`](moe-service-handler-prd.md).
 
 ## Architecture
 
-Each node runs a contiguous layer range. Nodes form a ring: hidden states flow forward,
-the last node samples a token and sends it back to the coordinator.
-
-```mermaid
-flowchart LR
-    C(["client"]) -- "request" --> M4
-    subgraph R["ring · one persistent TCP connection per hop"]
-        direction LR
-        M4["<b>m4 · coordinator</b><br/>Mac mini M4<br/>embed + layers 0–19"]
-        M1A["<b>m1a · worker</b><br/>Mac mini M1<br/>layers 20–29"]
-        M1B["<b>m1b · worker</b><br/>Mac mini M1<br/>layers 30–39 + head"]
-        M4 -- "Hidden · f32 · 8 KB/token" --> M1A
-        M1A -- "Hidden" --> M1B
-        M1B -- "Token · u32" --> M4
-    end
-```
+Each node runs a contiguous layer range. Nodes form a ring over one persistent TCP connection
+per hop: hidden states flow forward, and the last node, which holds the head, samples a token
+and sends it back to the coordinator. The coordinator streams it to the client and starts the
+next step. The split in the picture (20 / 10 / 10 of Qwen3.6's 40 layers) is
+[`configs/qwen36-3node.toml`](configs/qwen36-3node.toml); leave out `layers` and the planner
+picks one from each node's speed and memory.
 
 - **Frames:** 24-byte little-endian header (magic, version, type, request id, position,
   length) + payload. Types: `Hidden`, `Token`, `Drop`, `Rewind`, `Ping`/`Pong`, `Hello`, `Error`.
@@ -48,15 +45,15 @@ flowchart LR
   `msh-node --config FILE --plan` prints the split and each node's memory budget;
   `msh-node --speeds-from run.csv` turns a previous run's metrics into `speed` values.
 - **Prefix reuse** (`prefix_cache` > 0): finished requests keep their state on every node; the
-  next chat turn takes it over and prefills only the new message.
+  next chat turn takes it over and prefills only the new message. Off by default.
 - **Health:** a `Ping` travels the ring every second. A broken connection, or a ping not back
   within 5 s (a hung node), marks the ring down: in-flight requests fail and new ones are
   rejected until the cluster is restarted.
 - **Metrics:** each worker appends its compute time to the frame it forwards, so the
   coordinator splits every step into per-node compute and network/queueing without clock
-  sync. `--metrics FILE` or `[metrics] csv` writes one CSV row per step (prompt chunk or
-  decode position) with that split,
-  queue wait, requests in flight, ring round trip and run metadata (git hash, hardware, split).
+  sync. `--metrics FILE` or `[metrics] csv` writes one CSV row per step (a prompt chunk, or a
+  decode step with its drafts) with that split, queue wait, requests in flight, ring round
+  trip, reused and drafted/accepted positions, and run metadata (git hash, hardware, split).
 - **API:** the coordinator serves OpenAI-compatible `GET /v1/models` and
   `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
   429, a ring that is down 503.
@@ -66,19 +63,21 @@ flowchart LR
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Coordinator / worker, config, ring, scheduler, HTTP API, metrics, engines | Ring, scheduler (CL-5), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), run metrics (CL-10, CL-11); runs real streammoe (tested on OLMoE) |
+| `msh-node` | binary | Coordinator / worker, config, planner, ring, scheduler, HTTP API, metrics, engines | Ring, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11); runs real streammoe (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
-The engine sits behind an `Engine` trait shaped like streammoe's `eval_request` (token or
-hidden states in, one or a chunk of positions; hidden states or sampled token out). Two
-implementations:
+The engine sits behind an `Engine` trait shaped like streammoe's `eval_request`: tokens or
+hidden states in, for one position or a chunk; hidden states out, or on the head node the
+sampled token for the last position or for every position (to verify drafts); plus `rewind`
+and `free`. Two implementations:
 
 - `MockEngine`: deterministic, no model needed; the default.
-- `StreamMoeEngine`: streammoe on the node's layer range, one streammoe request slot per request in
-  flight. Built with a model feature (`--features olmoe` or `qwen36`) and selected with
-  `[engine] kind = "streammoe"`. streammoe comes from
-  [transybao1393/streamoe](https://github.com/transybao1393/streamoe), pinned to a commit in
-  `crates/msh-node/Cargo.toml` (0.2.0-beta.1).
+- `StreamMoeEngine`: streammoe on the node's layer range, with one request slot per request
+  in flight plus one per kept conversation (`max_in_flight + prefix_cache`). It cannot
+  verify drafts yet, so speculative decoding stays off with it. Built with a model feature
+  (`--features olmoe` or `qwen36`) and selected with `[engine] kind = "streammoe"`.
+  streammoe comes from [transybao1393/streamoe](https://github.com/transybao1393/streamoe),
+  pinned to a commit in `crates/msh-node/Cargo.toml` (0.2.0-beta.1).
 
 Each node opens streammoe for its own role in the ring:
 
@@ -89,10 +88,11 @@ Each node opens streammoe for its own role in the ring:
 - **Frame buffers counted in the cap** (`host_buffers`).
 - `[engine]` passes on `kv_format` (`f32` default, `f16`, `turbo4`, `turbo3`), `attn_threads`,
   `runtime_overhead_gib` and the expert streaming settings (`experts_dir`, `prefetch_guess`,
-  `prefetch_experts`, `fast_experts_dir`; see [`docs/speed.md`](docs/speed.md)). Only `f32` keeps a split bit-identical to one node; `f16` gave
-  the same tokens in our runs, TurboQuant did not.
+  `prefetch_experts`, `fast_experts_dir`; see [`docs/speed.md`](docs/speed.md)). Only `f32`
+  keeps a split bit-identical to one node; `f16` gave the same tokens in our runs, TurboQuant
+  did not.
 
-streamoe's multi-request decode (`eval_requests`) and multi-token passes (`eval_tokens`, for
+streammoe's multi-request decode (`eval_requests`) and multi-token passes (`eval_tokens`, for
 speculative decoding) run on the whole model only, so the cluster cannot use them yet; each
 node runs one request's step at a time.
 
@@ -105,20 +105,24 @@ token for token.
 ```bash
 cargo test --release
 
-# three nodes on one machine over loopback
+# three nodes on one machine over loopback (start the coordinator last)
 B=target/release/msh-node
-$B --config configs/local-3node.toml --node m1b &
-$B --config configs/local-3node.toml --node m1a &
+$B --config configs/local-3node.toml --node m4b &
+$B --config configs/local-3node.toml --node m1 &
 $B --config configs/local-3node.toml --node m4 --max-tokens 500 --requests 3 --metrics results/run.csv
 
 # the real engine on OLMoE, served over HTTP, and its model-backed tests
 cargo build --release --features msh-node/olmoe
-$B --config configs/olmoe-3node.toml --node m1b &
-$B --config configs/olmoe-3node.toml --node m1a &
+$B --config configs/olmoe-3node.toml --plan    # split and memory budget per node
+$B --config configs/olmoe-3node.toml --node m4b &
+$B --config configs/olmoe-3node.toml --node m1 &
 $B --config configs/olmoe-3node.toml --node m4 &
 curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
   -d '{"messages":[{"role":"user","content":"What is the capital of France?"}]}'
 cargo test -p msh-node --features olmoe --release -- --ignored --test-threads=1
+
+# after a run with --metrics: measured speed per node, for the planner
+$B --speeds-from results/run.csv
 
 # network round-trip probe: serve on one machine, run from another
 target/release/msh-probe serve 0.0.0.0:7070
@@ -128,7 +132,7 @@ target/release/msh-probe run <host>:7070 ethernet results/m0-<name>.csv
 ## Baseline numbers
 
 Loopback on a MacBook Pro M3 Pro ([`results/m0-m3pro-local.csv`](results/m0-m3pro-local.csv)),
-the software floor for the M4↔M1 runs:
+the software floor for the runs between the Mac minis:
 
 | Payload | Round trip p50 | One hop |
 | --- | --- | --- |

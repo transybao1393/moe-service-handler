@@ -1,4 +1,4 @@
-# Mode A reference for qwen36-3node.toml: all 40 layers in one process. Build with --features qwen36.
+# Reference for qwen36-3node.toml: all 40 layers in one process. Build with --features qwen36.
 hidden_dim = 2048
 num_layers = 40
 

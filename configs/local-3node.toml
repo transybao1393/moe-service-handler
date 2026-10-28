@@ -1,4 +1,4 @@
-# Three processes on one machine over loopback; same split as the planned M4 + 2 × M1 cluster.
+# Three processes on one machine over loopback, in the shape of the M4 + M1 + M4 cluster.
 hidden_dim = 2048
 num_layers = 40
 
@@ -8,11 +8,11 @@ addr = "127.0.0.1:7101"
 layers = [0, 20]
 
 [[nodes]]
-name = "m1a"
+name = "m1"
 addr = "127.0.0.1:7102"
 layers = [20, 30]
 
 [[nodes]]
-name = "m1b"
+name = "m4b"
 addr = "127.0.0.1:7103"
 layers = [30, 40]

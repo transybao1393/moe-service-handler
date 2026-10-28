@@ -1,4 +1,4 @@
-# Mode A with the real engine: OLMoE-1B-7B (16 layers), one node. Build with --features olmoe.
+# The real engine on one node: OLMoE-1B-7B (16 layers), the reference for olmoe-3node.toml. Build with --features olmoe.
 hidden_dim = 2048
 num_layers = 16
 
@@ -6,7 +6,7 @@ num_layers = 16
 kind = "streammoe"
 model_dir = "~/models/olmoe-1b-7b"
 n_ctx = 2048
-# 4 request slots (3 in flight + streammoe's default) × 0.5 GiB of KV at n_ctx 2048 need > 3 GiB.
+# 3 request slots (max_in_flight) × 0.5 GiB of KV at n_ctx 2048, plus weights and hot tier.
 mem_cap_gib = 4.0
 
 [http]

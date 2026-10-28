@@ -1,4 +1,4 @@
-# Mode A: one node runs all 40 layers.
+# One node runs all 40 layers: the reference a split must match.
 hidden_dim = 2048
 num_layers = 40
 

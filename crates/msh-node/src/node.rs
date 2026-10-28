@@ -24,7 +24,7 @@ pub struct Ring {
     pub next: Connection,
 }
 
-/// Joins the ring as node `idx`. Returns `None` for a one-node cluster (mode A).
+/// Joins the ring as node `idx`. Returns `None` for a one-node cluster (no ring).
 ///
 /// Accepting from the previous node runs on its own thread while this one connects to the next
 /// node: doing them in sequence deadlocks, as every node would wait on its neighbour's handshake.
