@@ -1,12 +1,14 @@
 //! The expert split on the mock engine: a controller and two workers on loopback threads,
 //! checked token for token against one process running every expert itself.
 
-use std::net::TcpListener;
+use std::io;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use msh_net::{Connection, MsgType};
-use msh_node::config::{Config, ExpertsConfig, NodeConfig, Split};
+use msh_node::config::{Config, ExpertsConfig, NetConfig, NodeConfig, Split};
 use msh_node::engine::MockEngine;
 use msh_node::metrics::{Metrics, RunInfo};
 use msh_node::node::{accept_controller, connect_workers, Worker};
@@ -40,6 +42,12 @@ fn reference(prompts: &[Vec<u32>], max_new: usize, vocab: u32) -> Vec<Vec<u32>> 
 }
 
 fn config(listeners: &[TcpListener], sched: SchedulerConfig, experts: ExpertsConfig) -> Config {
+    let addrs: Vec<String> = listeners.iter().map(|l| l.local_addr().unwrap().to_string()).collect();
+    config_at(&addrs, sched, experts, NetConfig::default())
+}
+
+/// An expert-split config: node `i` at `addrs[i]`.
+fn config_at(addrs: &[String], sched: SchedulerConfig, experts: ExpertsConfig, net: NetConfig) -> Config {
     let cfg = Config {
         hidden_dim: DIM,
         num_layers: LAYERS,
@@ -51,12 +59,13 @@ fn config(listeners: &[TcpListener], sched: SchedulerConfig, experts: ExpertsCon
         metrics: None,
         log: Default::default(),
         service: Default::default(),
-        nodes: listeners
+        net,
+        nodes: addrs
             .iter()
             .enumerate()
-            .map(|(i, l)| NodeConfig {
+            .map(|(i, addr)| NodeConfig {
                 name: format!("n{i}"),
-                addr: l.local_addr().unwrap().to_string(),
+                addr: addr.clone(),
                 listen: None,
                 layers: None,
                 speed: None,
@@ -84,8 +93,20 @@ impl Cluster {
         metrics: Option<Metrics>,
         worker: impl Fn(usize, MockEngine) -> MockEngine,
     ) -> Cluster {
+        Cluster::start_net(sched, experts, vocab, metrics, NetConfig::default(), worker)
+    }
+
+    fn start_net(
+        sched: SchedulerConfig,
+        experts: ExpertsConfig,
+        vocab: u32,
+        metrics: Option<Metrics>,
+        net: NetConfig,
+        worker: impl Fn(usize, MockEngine) -> MockEngine,
+    ) -> Cluster {
         let listeners: Vec<TcpListener> = (0..3).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
-        let cfg = config(&listeners, sched, experts);
+        let addrs: Vec<String> = listeners.iter().map(|l| l.local_addr().unwrap().to_string()).collect();
+        let cfg = config_at(&addrs, sched, experts, net);
         let mut listeners = listeners.into_iter();
         drop(listeners.next());
         let workers = listeners
@@ -135,6 +156,19 @@ fn three_nodes_match_one_process_with_requests_in_flight() {
     let held: Vec<usize> = workers.iter().map(MockEngine::held_experts).collect();
     assert_eq!(held, [32, 32]);
     assert!(workers.iter().all(|w| w.expert_loads() == (0, 0)));
+}
+
+#[test]
+fn small_chunks_give_the_same_tokens() {
+    // 4 KiB chunks: a 64-position prompt chunk's rows (8 KiB) and its picks' output rows
+    // (32 KiB) go in several frames each, between other requests' frames.
+    let prompts: Vec<Vec<u32>> = (0..4).map(|i| (0..90 + 7 * i).map(|k| 13 * k + 500 * i).collect()).collect();
+    let want = reference(&prompts, 8, VOCAB);
+    let sched = SchedulerConfig { prefill_chunk: 64, max_in_flight: 3, ..Default::default() };
+    let net = NetConfig { max_chunk_kib: 4, ..Default::default() };
+    let c = Cluster::start_net(sched, experts(), VOCAB, None, net, |_, e| e);
+    assert_eq!(c.run(&prompts, 8), want);
+    c.stop();
 }
 
 #[test]
@@ -288,4 +322,83 @@ fn engine_must_match_the_expert_config() {
     // Without workers, the controller runs every expert itself.
     let (client, _) = scheduler::spawn_experts(engine(VOCAB), None, SchedulerConfig::default(), experts(), None).unwrap();
     assert_eq!(client.generate(prompt(2), 6).unwrap().tokens, reference(&[prompt(2)], 6, VOCAB)[0]);
+}
+
+/// Forwards connections to `to` and can cut them all, as a pulled cable would.
+struct Proxy {
+    addr: String,
+    conns: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl Proxy {
+    fn start(to: SocketAddr) -> Proxy {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let conns: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
+        let held = conns.clone();
+        thread::spawn(move || {
+            for down in l.incoming() {
+                let down = down.unwrap();
+                let up = TcpStream::connect(to).unwrap();
+                held.lock().unwrap().extend([down.try_clone().unwrap(), up.try_clone().unwrap()]);
+                for (mut from, mut to) in [(down.try_clone().unwrap(), up.try_clone().unwrap()), (up, down)] {
+                    thread::spawn(move || {
+                        let _ = io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(Shutdown::Write);
+                    });
+                }
+            }
+        });
+        Proxy { addr, conns }
+    }
+
+    fn cut(&self) {
+        for c in self.conns.lock().unwrap().drain(..) {
+            let _ = c.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// Generates once the cluster takes requests again.
+fn once_up(client: &Client, p: Vec<u32>, n: usize) -> Vec<u32> {
+    let t0 = Instant::now();
+    loop {
+        match client.generate(p.clone(), n) {
+            Ok(g) => return g.tokens,
+            Err(Error::Rejected(m)) if m.contains("cluster down") => {
+                assert!(t0.elapsed() < Duration::from_secs(10), "still down: {m}");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+#[test]
+fn a_cut_link_takes_the_cluster_down_until_the_worker_owns_its_experts_again() {
+    let sched = SchedulerConfig { health_interval_ms: 20, health_timeout_ms: 1000, ..Default::default() };
+    let net = NetConfig { reconnect_min_ms: 20, reconnect_max_ms: 100, ..Default::default() };
+    let want = reference(&[prompt(0), prompt(1)], 8, VOCAB);
+    let ls: Vec<TcpListener> = (0..3).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+    let mut addrs: Vec<String> = ls.iter().map(|l| l.local_addr().unwrap().to_string()).collect();
+    let proxy = Proxy::start(addrs[2].parse().unwrap());
+    addrs[2] = proxy.addr.clone();
+    let cfg = config_at(&addrs, sched, experts(), net);
+    for (i, l) in ls.into_iter().enumerate().skip(1) {
+        let cfg = cfg.clone();
+        thread::spawn(move || Worker::idle(engine(VOCAB), &cfg.nodes[i].name).serve_forever(&cfg, i, &l).unwrap());
+    }
+    let star = connect_workers(&cfg, Duration::from_secs(5)).unwrap();
+    let (client, _sched) = scheduler::spawn_experts(engine(VOCAB), star, sched, cfg.experts, None).unwrap();
+    assert_eq!(client.generate(prompt(0), 8).unwrap().tokens, want[0]);
+
+    let rx = client.submit(prompt(2), 100_000);
+    assert!(matches!(rx.recv().unwrap(), scheduler::Event::Token { .. }));
+    proxy.cut();
+    let err = collect(rx).unwrap_err().to_string();
+    assert!(err.contains("cluster down"), "{err}");
+    // n2 starts from a clean state and holds no experts until `Own` tells it again: right
+    // tokens after the rejoin show it was sent.
+    assert_eq!(once_up(&client, prompt(1), 8), want[1]);
+    assert_eq!(client.generate(prompt(0), 8).unwrap().tokens, want[0]);
 }

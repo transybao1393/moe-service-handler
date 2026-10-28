@@ -98,6 +98,22 @@
 //! An optional `[service]` table sets `mem_allowance_mib` (default 256): memory for the
 //! service itself (network buffers, requests, HTTP, metrics), beside the engine's cap (NF-2).
 //!
+//! An optional `[net]` table tunes the links between the controller and the workers:
+//!
+//! ```toml
+//! [net]
+//! max_chunk_kib = 64       # largest frame payload (4..=4096); bigger messages go in chunks,
+//!                          # so a token or ping waits at most one chunk behind a prompt chunk
+//! reconnect_min_ms = 500   # first wait before reconnecting a lost worker, doubled each try
+//! reconnect_max_ms = 10000 # longest wait between tries; the controller tries forever
+//! ```
+//!
+//! Every split reconnects a lost worker in the background. On the layer and expert splits the
+//! cluster is down until every worker is back (in-flight requests fail, new ones are refused),
+//! then serves again by itself. A worker that hears nothing from the controller for
+//! `health_timeout_ms` (the controller pings every `health_interval_ms`) drops the link, frees
+//! what it held and waits for the next controller.
+//!
 //! An optional `[log]` table sets the log (NF-5). `RUST_LOG` overrides `level`.
 //!
 //! ```toml
@@ -136,7 +152,34 @@ pub struct Config {
     pub log: LogConfig,
     #[serde(default)]
     pub service: ServiceConfig,
+    #[serde(default)]
+    pub net: NetConfig,
     pub nodes: Vec<NodeConfig>,
+}
+
+/// The links between the controller and the workers.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetConfig {
+    /// Largest frame payload in KiB; bigger messages are sent in chunks of this size.
+    pub max_chunk_kib: usize,
+    /// First wait before reconnecting a lost worker; doubled after each failed try.
+    pub reconnect_min_ms: u64,
+    /// Longest wait between tries.
+    pub reconnect_max_ms: u64,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        NetConfig { max_chunk_kib: 64, reconnect_min_ms: 500, reconnect_max_ms: 10_000 }
+    }
+}
+
+impl NetConfig {
+    /// The largest frame payload in bytes.
+    pub fn max_chunk(&self) -> usize {
+        self.max_chunk_kib << 10
+    }
 }
 
 /// How the model is divided across the nodes.
@@ -373,6 +416,13 @@ impl Config {
         }
         if self.nodes.is_empty() {
             return bad("no nodes".into());
+        }
+        let n = &self.net;
+        if !(4..=4096).contains(&n.max_chunk_kib) {
+            return bad(format!("net.max_chunk_kib = {} must be 4..=4096", n.max_chunk_kib));
+        }
+        if n.reconnect_min_ms == 0 || n.reconnect_min_ms > n.reconnect_max_ms {
+            return bad("net.reconnect_min_ms must be positive and at most net.reconnect_max_ms".into());
         }
         for (i, n) in self.nodes.iter().enumerate() {
             if self.nodes[..i].iter().any(|m| m.name == n.name) {
@@ -641,6 +691,19 @@ mod tests {
         assert!(Config::parse(&alone).is_err(), "no worker");
         let streammoe = text.replace("[scheduler]", "[engine]\nkind = \"streammoe\"\nmodel_dir = \"/m\"\n[scheduler]");
         assert!(Config::parse(&streammoe).is_ok());
+    }
+
+    #[test]
+    fn net_section() {
+        let c = Config::parse(THREE).unwrap();
+        assert_eq!((c.net.max_chunk(), c.net.reconnect_min_ms, c.net.reconnect_max_ms), (64 << 10, 500, 10_000));
+        let text = |t: &str| THREE.replace("num_layers = 40", &format!("num_layers = 40\n[net]\n{t}"));
+        let c = Config::parse(&text("max_chunk_kib = 4\nreconnect_min_ms = 50\nreconnect_max_ms = 50")).unwrap();
+        assert_eq!((c.net.max_chunk(), c.net.reconnect_min_ms), (4096, 50));
+        assert!(Config::parse(&text("max_chunk_kib = 4096")).is_ok());
+        for bad in ["max_chunk_kib = 3", "max_chunk_kib = 4097", "reconnect_min_ms = 0", "reconnect_min_ms = 20000", "chunk = 1"] {
+            assert!(Config::parse(&text(bad)).is_err(), "{bad} accepted");
+        }
     }
 
     #[test]

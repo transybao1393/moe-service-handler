@@ -12,7 +12,8 @@
 //! it serves the OpenAI-compatible API. With `--prompt` (token ids) it submits K concurrent
 //! greedy generations, prints throughput and exits. `--metrics FILE` (or `[metrics] csv`)
 //! appends one row per position to a CSV.
-//! Every other node is a worker and serves until the coordinator disconnects. With
+//! Every other node is a worker and serves one coordinator connection after another, from a
+//! clean state each time; the coordinator reconnects a lost worker by itself. With
 //! `split = "requests"` the coordinator opens no engine and serves once at least one worker is
 //! ready (waiting up to 60 s for all); each worker opens the whole model and serves one
 //! coordinator connection after another, so a coordinator that lost it can reconnect.
@@ -35,7 +36,7 @@ use msh_node::{memory, stats};
 use msh_node::metrics::{Metrics, RunInfo};
 use msh_node::node::Star;
 use msh_node::engine::{Engine, MockEngine};
-use msh_node::node::{accept_controller, connect_workers, RequestWorker, Worker};
+use msh_node::node::{connect_workers, RequestWorker, Worker};
 use msh_node::planner;
 use msh_node::scheduler::{self, collect};
 
@@ -296,10 +297,7 @@ fn serve<'a, E: Engine + 'static>(
     if idx > 0 {
         let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
         info!(role = "worker", runs = role(cfg, idx), listen = node.listen_addr(), "waiting for the controller");
-        let link = accept_controller(cfg, idx, listener)?;
-        info!(controller = link.peer_name(), "connected");
-        Worker::new(engine, link, name).run()?;
-        info!("controller disconnected, exiting");
+        Worker::idle(engine, name).serve_forever(cfg, idx, &listener)?;
         return Ok(());
     }
     info!(role = "controller", runs = role(cfg, 0), workers = cfg.nodes.len() - 1, "connecting to workers");

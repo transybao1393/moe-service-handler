@@ -9,8 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use msh_net::{decode_start, encode_done, encode_status, encode_token, Connection, DoneReason, MsgType, RunStatus, Status};
-use msh_node::config::{Config, NodeConfig, Split};
+use msh_net::{
+    decode_start, encode_done, encode_status, encode_token, Connection, DoneReason, FrameError, MsgType, RunStatus, Status,
+};
+use msh_node::config::{Config, NetConfig, NodeConfig, Split};
 use msh_node::engine::{Engine, MockEngine, Sample, StageIn};
 use msh_node::node::{accept_controller, RequestWorker};
 use msh_node::requests::{self, Board, WorkerState};
@@ -82,6 +84,7 @@ fn config(addrs: &[String], sched: SchedulerConfig) -> Config {
         metrics: None,
         log: Default::default(),
         service: Default::default(),
+        net: Default::default(),
         nodes,
     };
     cfg.validate().unwrap();
@@ -523,4 +526,96 @@ mod endpoints {
         tokio::task::spawn_blocking(move || until("the request gone", || b2.requests().is_empty())).await.unwrap();
         assert_eq!(call(&app, "GET", "/v1/requests", None).await.1["requests"], json!([]));
     }
+}
+
+#[test]
+fn small_chunks_give_the_same_tokens() {
+    // 4 KiB chunks: a `Start` with 1500 prompt ids (6 KiB) or more goes in two frames or more,
+    // beside the other link traffic.
+    let prompts: Vec<Vec<u32>> =
+        (0..3).map(|i| (0..1500 + 300 * i).map(|k| (13 * k + 7 * i) % 5000).collect()).collect();
+    let want = reference(&prompts, 6);
+    let sched = SchedulerConfig { max_in_flight: 2, prefill_chunk: 64, ..Default::default() };
+    let (ls, addrs) = listeners(1);
+    let cfg = Config { net: NetConfig { max_chunk_kib: 4, ..Default::default() }, ..config(&addrs, sched) };
+    let w = worker(&cfg, 1, ls.into_iter().next().unwrap(), mock(), 1);
+    let (client, sched) = requests::spawn(&cfg).unwrap();
+    assert_eq!(board(&client).wait_ready(1, Duration::from_secs(5)), 1);
+    let rxs: Vec<_> = prompts.iter().map(|p| client.submit(p.clone(), 6)).collect();
+    let got: Vec<_> = rxs.into_iter().map(|rx| collect(rx).unwrap().tokens).collect();
+    assert_eq!(got, want);
+    client.shutdown();
+    sched.join().unwrap();
+    assert_eq!(w.join().unwrap().live_requests(), 0);
+}
+
+#[test]
+fn a_worker_drops_a_silent_controller_and_takes_the_next() {
+    let sched = SchedulerConfig { health_interval_ms: 20, health_timeout_ms: 200, ..Default::default() };
+    let (ls, addrs) = listeners(1);
+    let cfg = config(&addrs, sched);
+    let l = ls.into_iter().next().unwrap();
+    let worker_cfg = cfg.clone();
+    thread::spawn(move || {
+        let mut w = RequestWorker::new(mock(), "n1", sched.prefill_chunk, None);
+        w.serve_forever(&worker_cfg, 1, &l).unwrap();
+    });
+    // A controller that says `Hello`, then nothing, as a frozen machine would.
+    let mut frozen = Connection::connect(addrs[0].as_str(), "n0", Duration::from_secs(1)).unwrap();
+    let t0 = Instant::now();
+    match frozen.recv_frame(&mut Vec::new()) {
+        Err(FrameError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+        other => panic!("expected the worker to drop the link, got {other:?}"),
+    }
+    let took = t0.elapsed();
+    assert!(took >= Duration::from_millis(150) && took < Duration::from_secs(3), "{took:?}");
+    // The next controller, pinging, is served, and keeps its link.
+    let (client, sched_thread) = requests::spawn(&cfg).unwrap();
+    assert_eq!(board(&client).wait_ready(1, Duration::from_secs(5)), 1);
+    assert_eq!(client.generate(prompt(1), 6).unwrap().tokens, reference(&[prompt(1)], 6)[0]);
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(state(&client, "n1"), WorkerState::Ready);
+    assert_eq!(client.generate(prompt(2), 6).unwrap().tokens, reference(&[prompt(2)], 6)[0]);
+    client.shutdown();
+    sched_thread.join().unwrap();
+}
+
+#[test]
+fn reconnect_tries_back_off_as_configured() {
+    // Nothing listens at n1's address yet.
+    let (ls, addrs) = listeners(1);
+    drop(ls);
+    let net = NetConfig { reconnect_min_ms: 50, reconnect_max_ms: 200, ..Default::default() };
+    let cfg = Config { net, ..config(&addrs, SchedulerConfig::default()) };
+    let (client, sched) = requests::spawn(&cfg).unwrap();
+    let b = board(&client);
+    // When each try count is first seen.
+    let mut seen: Vec<(u32, Instant)> = Vec::new();
+    let t0 = Instant::now();
+    while seen.len() < 6 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "tries seen: {seen:?}");
+        let v = b.worker("n1").unwrap();
+        if v.reconnect_tries > seen.last().map_or(0, |s| s.0) {
+            assert!(v.next_try.is_some(), "no next try time while down");
+            seen.push((v.reconnect_tries, Instant::now()));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    // Each wait is the nominal one (50, 100, 200, 200, ... ms) shortened by up to a quarter.
+    for w in seen.windows(2) {
+        assert_eq!(w[1].0, w[0].0 + 1, "{seen:?}");
+        let nominal = Duration::from_millis((50u64 << (w[0].0 - 1)).min(200));
+        let gap = w[1].1 - w[0].1;
+        let ok = gap >= nominal.mul_f64(0.7) && gap <= nominal + Duration::from_millis(150);
+        assert!(ok, "after try {}: {gap:?} for {nominal:?}", w[0].0);
+    }
+    // Started on that address, the worker is found and the count cleared.
+    let w = worker(&cfg, 1, TcpListener::bind(addrs[0].as_str()).unwrap(), mock(), 1);
+    assert_eq!(b.wait_ready(1, Duration::from_secs(5)), 1);
+    let v = b.worker("n1").unwrap();
+    assert_eq!((v.reconnect_tries, v.next_try), (0, None));
+    assert_eq!(client.generate(prompt(0), 6).unwrap().tokens, reference(&[prompt(0)], 6)[0]);
+    client.shutdown();
+    sched.join().unwrap();
+    assert_eq!(w.join().unwrap().live_requests(), 0);
 }

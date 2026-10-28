@@ -640,6 +640,9 @@ dependencies = [
 [[package]]
 name = "msh-net"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "msh-node"

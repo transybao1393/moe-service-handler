@@ -6,6 +6,7 @@
 //! the whole model for whole requests. The controller talks to every worker; workers never talk
 //! to each other. Its scheduler keeps several requests in flight.
 
+pub mod backoff;
 pub mod chat;
 pub mod config;
 pub mod draft;

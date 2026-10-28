@@ -1,12 +1,14 @@
-use std::net::TcpListener;
+use std::io;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use msh_net::MsgType;
-use msh_node::config::{Config, NodeConfig};
+use msh_node::config::{Config, NetConfig, NodeConfig};
 use msh_node::engine::MockEngine;
 use msh_node::metrics::{Metrics, RunInfo};
-use msh_net::Connection;
+use msh_net::{Connection, FrameError};
 use msh_node::node::{accept_controller, connect_workers, Worker};
 use msh_node::scheduler::{self, collect, Client, Event, SchedulerConfig};
 use msh_node::Error;
@@ -44,6 +46,17 @@ impl Cluster {
         metrics: Option<Metrics>,
         vocab: u32,
     ) -> Cluster {
+        Cluster::start_net(splits, sched, fail, metrics, vocab, NetConfig::default())
+    }
+
+    fn start_net(
+        splits: &[[u32; 2]],
+        sched: SchedulerConfig,
+        fail: Option<(usize, u64)>,
+        metrics: Option<Metrics>,
+        vocab: u32,
+        net: NetConfig,
+    ) -> Cluster {
         let listeners: Vec<TcpListener> =
             splits.iter().map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
         let cfg = Config {
@@ -57,6 +70,7 @@ impl Cluster {
             metrics: None,
             log: Default::default(),
             service: Default::default(),
+            net,
             nodes: splits
                 .iter()
                 .zip(&listeners)
@@ -229,6 +243,7 @@ fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Connection) + Send
         metrics: None,
         log: Default::default(),
         service: Default::default(),
+        net: Default::default(),
         nodes: vec![node("n0", &l0, [0, 20]), node("n1", &l1, [20, 40])],
     };
     let worker_cfg = cfg.clone();
@@ -441,4 +456,193 @@ fn oldest_parked_request_is_dropped_everywhere() {
     let sched = SchedulerConfig { prefix_cache: 1, ..Default::default() };
     let got = chat_turns(sched, VOCAB, &[(a, 4), (b, 4), (a2, 4)]);
     assert_eq!(got[2], (want, 0));
+}
+
+#[test]
+fn small_chunks_give_the_same_tokens() {
+    // 4 KiB chunks: a prompt chunk of 16 positions (128 KiB) goes in 33 frames, between other
+    // requests' frames, three chunks of a request in the cluster at once.
+    let prompts: Vec<Vec<u32>> =
+        [40, 3, 17, 33].iter().enumerate().map(|(i, &n)| (0..n).map(|k| 13 * k + 500 * i as u32).collect()).collect();
+    let want = reference(&prompts, 8);
+    let sched = SchedulerConfig { prefill_chunk: 16, prefill_depth: 3, ..Default::default() };
+    let net = NetConfig { max_chunk_kib: 4, ..Default::default() };
+    let c = Cluster::start_net(THREE, sched, None, None, VOCAB, net);
+    let rxs: Vec<_> = prompts.iter().map(|p| c.client.submit(p.clone(), 8)).collect();
+    let got: Vec<_> = rxs.into_iter().map(|rx| collect(rx).unwrap().tokens).collect();
+    assert_eq!(got, want);
+    c.stop_and_check_freed();
+}
+
+/// Forwards connections to `to` and can cut them all, as a pulled cable would.
+struct Proxy {
+    addr: String,
+    conns: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl Proxy {
+    fn start(to: SocketAddr) -> Proxy {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let conns: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
+        let held = conns.clone();
+        thread::spawn(move || {
+            for down in l.incoming() {
+                let down = down.unwrap();
+                let up = TcpStream::connect(to).unwrap();
+                held.lock().unwrap().extend([down.try_clone().unwrap(), up.try_clone().unwrap()]);
+                for (mut from, mut to) in [(down.try_clone().unwrap(), up.try_clone().unwrap()), (up, down)] {
+                    thread::spawn(move || {
+                        let _ = io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(Shutdown::Write);
+                    });
+                }
+            }
+        });
+        Proxy { addr, conns }
+    }
+
+    fn cut(&self) {
+        for c in self.conns.lock().unwrap().drain(..) {
+            let _ = c.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// A layer-split config: node `i` at `addrs[i]` runs `splits[i]`.
+fn config(addrs: &[String], splits: &[[u32; 2]], sched: SchedulerConfig, net: NetConfig) -> Config {
+    let cfg = Config {
+        hidden_dim: DIM,
+        num_layers: 40,
+        split: Default::default(),
+        experts: Default::default(),
+        scheduler: sched,
+        engine: Default::default(),
+        http: None,
+        metrics: None,
+        log: Default::default(),
+        service: Default::default(),
+        net,
+        nodes: addrs
+            .iter()
+            .zip(splits)
+            .enumerate()
+            .map(|(i, (addr, layers))| NodeConfig {
+                name: format!("n{i}"),
+                addr: addr.clone(),
+                listen: None,
+                layers: Some(*layers),
+                speed: None,
+                mem_cap_gib: None,
+                prometheus: None,
+            })
+            .collect(),
+    };
+    cfg.validate().unwrap();
+    cfg
+}
+
+fn bind() -> (TcpListener, String) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    (l, addr)
+}
+
+/// Worker `i` on `l`, serving one controller after another, as `msh-node` does.
+fn worker_forever(cfg: &Config, i: usize, l: TcpListener) {
+    let cfg = cfg.clone();
+    thread::spawn(move || {
+        let e = MockEngine::new(cfg.nodes[i].layer_range(), 40, DIM);
+        Worker::idle(e, &cfg.nodes[i].name).serve_forever(&cfg, i, &l).unwrap();
+    });
+}
+
+/// Generates once the cluster takes requests again.
+fn once_up(client: &Client, p: Vec<u32>, n: usize) -> Vec<u32> {
+    let t0 = Instant::now();
+    loop {
+        match client.generate(p.clone(), n) {
+            Ok(g) => return g.tokens,
+            Err(Error::Rejected(m)) if m.contains("cluster down") => {
+                assert!(t0.elapsed() < Duration::from_secs(10), "still down: {m}");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+fn quick() -> (SchedulerConfig, NetConfig) {
+    let sched = SchedulerConfig { health_interval_ms: 20, health_timeout_ms: 1000, ..Default::default() };
+    (sched, NetConfig { reconnect_min_ms: 20, reconnect_max_ms: 100, ..Default::default() })
+}
+
+#[test]
+fn a_cut_link_takes_the_cluster_down_until_the_worker_is_back() {
+    let (sched, net) = quick();
+    let want = reference(&[prompt(0), prompt(1)], 6);
+    let (nodes, mut addrs): (Vec<_>, Vec<_>) = (0..3).map(|_| bind()).unzip();
+    let proxy = Proxy::start(addrs[2].parse().unwrap());
+    addrs[2] = proxy.addr.clone();
+    let cfg = config(&addrs, THREE, sched, net);
+    for (i, l) in nodes.into_iter().enumerate().skip(1) {
+        worker_forever(&cfg, i, l);
+    }
+    let star = connect_workers(&cfg, Duration::from_secs(5)).unwrap();
+    let (client, _sched) = scheduler::spawn(MockEngine::new(0..20, 40, DIM), star, sched);
+    assert_eq!(client.generate(prompt(0), 6).unwrap().tokens, want[0]);
+
+    // A long generation in flight when the cable to n2 is pulled: it fails, its state is gone.
+    let rx = client.submit(prompt(2), 100_000);
+    assert!(matches!(rx.recv().unwrap(), Event::Token { .. }));
+    proxy.cut();
+    let err = collect(rx).unwrap_err().to_string();
+    assert!(err.contains("cluster down"), "{err}");
+    // Every worker is reconnected, from a clean state, and the cluster serves again by itself.
+    assert_eq!(once_up(&client, prompt(1), 6), want[1]);
+    assert_eq!(client.generate(prompt(0), 6).unwrap().tokens, want[0]);
+}
+
+#[test]
+fn a_crashed_worker_restarted_on_its_address_rejoins() {
+    let (sched, net) = quick();
+    let ((l0, a0), (l1, a1)) = (bind(), bind());
+    let cfg = config(&[a0, a1.clone()], &[[0, 20], [20, 40]], sched, net);
+    drop(l0);
+    let worker_cfg = cfg.clone();
+    // n1 crashes at its first hidden state; its listener is gone with it.
+    thread::spawn(move || wait_for_hidden(&mut accept_controller(&worker_cfg, 1, l1).unwrap()));
+    let star = connect_workers(&cfg, Duration::from_secs(5)).unwrap();
+    let (client, _sched) = scheduler::spawn(MockEngine::new(0..20, 40, DIM), star, sched);
+    let err = client.generate(prompt(0), 8).unwrap_err().to_string();
+    assert!(err.contains("cluster down"), "{err}");
+    let err = client.generate(prompt(0), 8).unwrap_err();
+    assert!(matches!(&err, Error::Rejected(m) if m.contains("cluster down")), "{err}");
+    // Restarted on the same address: the controller finds it.
+    thread::sleep(Duration::from_millis(100));
+    worker_forever(&cfg, 1, TcpListener::bind(&a1).unwrap());
+    assert_eq!(once_up(&client, prompt(1), 8), reference(&[prompt(1)], 8)[0]);
+}
+
+#[test]
+fn a_worker_drops_a_silent_controller_and_takes_the_next() {
+    let sched = SchedulerConfig { health_interval_ms: 20, health_timeout_ms: 200, ..Default::default() };
+    let ((_l0, a0), (l1, a1)) = (bind(), bind());
+    let cfg = config(&[a0, a1.clone()], &[[0, 20], [20, 40]], sched, NetConfig::default());
+    worker_forever(&cfg, 1, l1);
+    // A controller that says `Hello`, then nothing, as a frozen machine would.
+    let mut frozen = Connection::connect(a1.as_str(), "n0", Duration::from_secs(1)).unwrap();
+    let t0 = Instant::now();
+    match frozen.recv_frame(&mut Vec::new()) {
+        Err(FrameError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+        other => panic!("expected the worker to drop the link, got {other:?}"),
+    }
+    assert!(t0.elapsed() >= Duration::from_millis(150) && t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    // The next controller, pinging, is served.
+    let star = connect_workers(&cfg, Duration::from_secs(5)).unwrap();
+    let (client, _sched) = scheduler::spawn(MockEngine::new(0..20, 40, DIM), star, sched);
+    assert_eq!(client.generate(prompt(3), 8).unwrap().tokens, reference(&[prompt(3)], 8)[0]);
+    // It keeps the link while pings come.
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(client.generate(prompt(4), 4).unwrap().tokens, reference(&[prompt(4)], 4)[0]);
 }

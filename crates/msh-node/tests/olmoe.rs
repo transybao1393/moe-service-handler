@@ -81,6 +81,7 @@ fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
         metrics: None,
         log: Default::default(),
         service: Default::default(),
+        net: Default::default(),
         nodes: splits
             .iter()
             .zip(&listeners)
@@ -175,6 +176,7 @@ fn request_split_two_workers_match_the_reference() {
         metrics: None,
         log: Default::default(),
         service: Default::default(),
+        net: Default::default(),
         nodes,
     };
     cfg.validate().unwrap();

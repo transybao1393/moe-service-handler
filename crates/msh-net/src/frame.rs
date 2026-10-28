@@ -7,7 +7,7 @@
 //! | 0      | 4    | magic `b"MSHN"`               |
 //! | 4      | 2    | protocol version              |
 //! | 6      | 1    | message type                  |
-//! | 7      | 1    | flags (see [`FLAG_EVERY_TOKEN`]) |
+//! | 7      | 1    | flags (see [`FLAG_EVERY_TOKEN`], [`FLAG_MORE`]) |
 //! | 8      | 8    | request id                    |
 //! | 16     | 4    | position (first, for a chunk) |
 //! | 20     | 4    | payload length in bytes       |
@@ -25,21 +25,34 @@
 //! worker a whole request, the worker sends back each `Token` as it is made and a `Done` when
 //! it stops. A worker answers `Ping` with a `Pong` carrying its status report (see
 //! [`encode_status`]).
+//!
+//! Chunking: a message whose payload is larger than the link's `max_chunk` goes as several
+//! frames with the same type, request id and position, so a small frame never waits behind a
+//! whole prompt chunk. Every frame but the last has [`FLAG_MORE`]; the first frame's payload
+//! starts with the message's whole payload length (u32), then its first bytes. No frame's
+//! payload is larger than `max_chunk`. Chunks of messages of different requests may
+//! interleave; a request's own messages never do. Small messages are one frame, as before.
 
 use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"MSHN";
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// On a `Hidden` frame: the head returns the token sampled after every position, not just the
 /// last. Workers pass it on.
 pub const FLAG_EVERY_TOKEN: u8 = 1;
-const KNOWN_FLAGS: u8 = FLAG_EVERY_TOKEN;
+/// More chunks of this message follow (see the module docs). The top bit, apart from the
+/// flags messages carry, which take the low bits.
+pub const FLAG_MORE: u8 = 0x80;
+const KNOWN_FLAGS: u8 = FLAG_EVERY_TOKEN | FLAG_MORE;
 pub const HEADER_LEN: usize = 24;
 /// Upper bound on a payload; guards against a corrupt length field allocating gigabytes.
-/// 64 MiB covers an 8k-token f32 prefill chunk (8192 × 2048 × 4 = 64 MiB).
+/// 64 MiB covers an 8k-token f32 prefill chunk (8192 × 2048 × 4 = 64 MiB). A chunked
+/// message's whole payload has the same limit.
 pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
+/// Largest frame payload a link sends by default; bigger messages go in chunks.
+pub const DEFAULT_MAX_CHUNK: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -180,6 +193,8 @@ pub enum FrameError {
     VersionMismatch { local: u16, remote: u16 },
     Unexpected { expected: MsgType, got: MsgType },
     Remote(String),
+    /// The connection ended in the middle of a chunked message.
+    Incomplete { msg_type: MsgType, request_id: u64 },
 }
 
 impl fmt::Display for FrameError {
@@ -197,6 +212,9 @@ impl fmt::Display for FrameError {
                 write!(f, "expected {expected:?} frame, got {got:?}")
             }
             FrameError::Remote(msg) => write!(f, "remote error: {msg}"),
+            FrameError::Incomplete { msg_type, request_id } => {
+                write!(f, "connection ended inside a chunked {msg_type:?} of request {request_id}")
+            }
         }
     }
 }
@@ -615,7 +633,7 @@ pub(crate) fn write_stages(stage_us: &[u32], out: &mut Vec<u8>) {
 }
 
 /// Reads the stage times and returns the bytes after them.
-fn read_stages<'a>(bytes: &'a [u8], stage_us: &mut Vec<u32>) -> Result<&'a [u8], FrameError> {
+pub(crate) fn read_stages<'a>(bytes: &'a [u8], stage_us: &mut Vec<u32>) -> Result<&'a [u8], FrameError> {
     let short = || bad_payload("stage times truncated".into());
     let (n, rest) = bytes.split_at_checked(2).ok_or_else(short)?;
     let n = u16::from_le_bytes(n.try_into().unwrap()) as usize;
@@ -627,6 +645,101 @@ fn read_stages<'a>(bytes: &'a [u8], stage_us: &mut Vec<u32>) -> Result<&'a [u8],
 
 pub(crate) fn bad_payload(msg: String) -> FrameError {
     FrameError::Remote(msg)
+}
+
+/// Appends the header of the frame carrying the next chunk of a message with header `h`
+/// (`h.payload_len` the whole payload), from payload byte `off`, to `out`; on the first of
+/// several chunks the whole length too. Returns the payload bytes the frame carries.
+pub(crate) fn chunk_header(h: &Header, off: usize, max_chunk: usize, out: &mut Vec<u8>) -> usize {
+    let total = h.payload_len as usize;
+    if total <= max_chunk {
+        out.extend_from_slice(&h.encode());
+        return total;
+    }
+    let first = off == 0;
+    let n = (if first { max_chunk - 4 } else { max_chunk }).min(total - off);
+    let mut c = *h;
+    c.payload_len = (n + if first { 4 } else { 0 }) as u32;
+    if off + n < total {
+        c.flags |= FLAG_MORE;
+    }
+    out.extend_from_slice(&c.encode());
+    if first {
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+    }
+    n
+}
+
+/// Bytes `off..off + n` of the payload `head` then `rows`, as the part in each.
+pub(crate) fn payload_range<'a>(head: &'a [u8], rows: &'a [u8], off: usize, n: usize) -> (&'a [u8], &'a [u8]) {
+    let end = off + n;
+    let h = &head[off.min(head.len())..end.min(head.len())];
+    let r = &rows[off.saturating_sub(head.len())..end.saturating_sub(head.len())];
+    (h, r)
+}
+
+/// Writes every byte of `parts`, one `writev` at a time.
+pub(crate) fn write_parts<W: Write>(w: &mut W, parts: &mut [&[u8]]) -> io::Result<()> {
+    let mut i = 0;
+    while i < parts.len() {
+        if parts[i].is_empty() {
+            i += 1;
+            continue;
+        }
+        let mut slices = [io::IoSlice::new(&[]); 4];
+        for (s, p) in slices.iter_mut().zip(&parts[i..]) {
+            *s = io::IoSlice::new(p);
+        }
+        let mut n = w.write_vectored(&slices[..(parts.len() - i).min(4)])?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        while n > 0 {
+            let take = n.min(parts[i].len());
+            parts[i] = &parts[i][take..];
+            n -= take;
+            if parts[i].is_empty() {
+                i += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes one message as one frame, or in chunks of at most `max_chunk` payload bytes.
+pub(crate) fn write_message<W: Write>(w: &mut W, h: &Header, head: &[u8], rows: &[u8], max_chunk: usize) -> io::Result<()> {
+    debug_assert_eq!(h.payload_len as usize, head.len() + rows.len());
+    let mut hb = Vec::with_capacity(HEADER_LEN + 4);
+    let mut off = 0;
+    loop {
+        hb.clear();
+        let n = chunk_header(h, off, max_chunk, &mut hb);
+        let (a, b) = payload_range(head, rows, off, n);
+        write_parts(w, &mut [&hb, a, b])?;
+        off += n;
+        if off >= h.payload_len as usize {
+            return Ok(());
+        }
+    }
+}
+
+/// For a message type whose payload ends in f32 rows (`Hidden`, `Experts`, `Partial`): the
+/// payload bytes needed to know the length of what comes before the rows.
+pub(crate) fn rows_base(t: MsgType) -> Option<usize> {
+    match t {
+        MsgType::Hidden => Some(2),
+        MsgType::Experts | MsgType::Partial => Some(6),
+        _ => None,
+    }
+}
+
+/// The payload bytes before the rows, from the first [`rows_base`] bytes.
+pub(crate) fn rows_prefix(t: MsgType, head: &[u8]) -> usize {
+    match t {
+        MsgType::Hidden => 2 + 4 * u16_at(head, 0) as usize,
+        MsgType::Experts => EXPERTS_PREFIX + PICK_LEN * u32::from_le_bytes(head[2..6].try_into().unwrap()) as usize,
+        _ => PARTIAL_PREFIX,
+    }
 }
 
 #[cfg(test)]
@@ -828,8 +941,36 @@ mod tests {
         assert!(matches!(Header::decode(&b), Err(FrameError::TooLarge(_))));
 
         let mut b = Header::new(MsgType::Ping, 0, 0, 0).encode();
-        b[7] = 0x80;
-        assert!(matches!(Header::decode(&b), Err(FrameError::BadFlags(0x80))));
+        b[7] = 0x40;
+        assert!(matches!(Header::decode(&b), Err(FrameError::BadFlags(0x40))));
+    }
+
+    #[test]
+    fn chunked_messages_split_and_rejoin() {
+        let head = b"head".to_vec();
+        let rows: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        for max in [16, 64, 1004, 2000] {
+            let h = Header::new(MsgType::Hidden, 3, 9, head.len() + rows.len()).with_flags(FLAG_EVERY_TOKEN);
+            let mut wire = Vec::new();
+            write_message(&mut wire, &h, &head, &rows, max).unwrap();
+            let mut r = wire.as_slice();
+            let (mut payload, mut joined, mut frames) = (Vec::new(), Vec::new(), 0);
+            loop {
+                let f = read_frame(&mut r, &mut payload).unwrap();
+                assert!(f.payload_len as usize <= max && (f.request_id, f.position) == (3, 9));
+                assert_eq!(f.flags & FLAG_EVERY_TOKEN, FLAG_EVERY_TOKEN);
+                // The first of several chunks starts with the whole length.
+                let body = if frames == 0 && max < 1004 { &payload[4..] } else { &payload[..] };
+                joined.extend_from_slice(body);
+                frames += 1;
+                if f.flags & FLAG_MORE == 0 {
+                    break;
+                }
+            }
+            assert!(r.is_empty());
+            assert_eq!(joined, [&head[..], &rows[..]].concat(), "max {max}");
+            assert_eq!(frames > 1, max < 1004, "max {max}");
+        }
     }
 
     #[test]
