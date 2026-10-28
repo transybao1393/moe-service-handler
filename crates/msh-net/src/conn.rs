@@ -1,10 +1,13 @@
 //! Persistent TCP connection to a neighbouring node (NET-3, NET-4, NET-7).
 
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::frame::{read_frame, write_frame, FrameError, Header, MsgType, PROTOCOL_VERSION};
+use crate::frame::{
+    bad_payload, f32_bytes, f32_bytes_mut, read_frame, write_frame, write_stages, FrameError, Header, MsgType,
+    HEADER_LEN, PROTOCOL_VERSION,
+};
 
 /// Bytes of each connection's read and write buffers.
 pub const BUFFER_BYTES: usize = 256 * 1024;
@@ -14,6 +17,8 @@ pub struct Connection {
     writer: BufWriter<TcpStream>,
     peer_name: String,
     peer_addr: SocketAddr,
+    /// Scratch for a hidden frame's stage times.
+    prefix: Vec<u8>,
 }
 
 impl Connection {
@@ -49,6 +54,7 @@ impl Connection {
             writer: BufWriter::with_capacity(BUFFER_BYTES, stream),
             peer_name: String::new(),
             peer_addr,
+            prefix: Vec::new(),
         };
         conn.send(MsgType::Hello, 0, 0, local_name.as_bytes())?;
 
@@ -99,6 +105,82 @@ impl Connection {
         let h = Header::new(msg_type, request_id, position, payload.len()).with_flags(flags);
         write_frame(&mut self.writer, &h, payload)?;
         self.writer.flush()
+    }
+
+    /// Sends a `Hidden` frame (the [`crate::encode_hidden`] payload) straight from `values`,
+    /// without building the payload first (NET-6). Large states bypass the write buffer too.
+    pub fn send_hidden(
+        &mut self,
+        flags: u8,
+        request_id: u64,
+        position: u32,
+        stage_us: &[u32],
+        values: &[f32],
+    ) -> io::Result<()> {
+        self.prefix.clear();
+        write_stages(stage_us, &mut self.prefix);
+        let bytes = f32_bytes(values);
+        let h = Header::new(MsgType::Hidden, request_id, position, self.prefix.len() + bytes.len()).with_flags(flags);
+        self.writer.write_all(&h.encode())?;
+        self.writer.write_all(&self.prefix)?;
+        self.writer.write_all(bytes)?;
+        self.writer.flush()
+    }
+
+    /// Reads the next frame's header; its payload must be read next, with
+    /// [`Connection::recv_payload`] or [`Connection::recv_hidden`].
+    pub fn recv_header(&mut self) -> Result<Header, FrameError> {
+        let mut hb = [0u8; HEADER_LEN];
+        self.reader.read_exact(&mut hb)?;
+        Header::decode(&hb)
+    }
+
+    pub fn recv_payload(&mut self, h: &Header, payload: &mut Vec<u8>) -> Result<(), FrameError> {
+        payload.resize(h.payload_len as usize, 0);
+        self.reader.read_exact(payload)?;
+        Ok(())
+    }
+
+    /// Reads a `Hidden` frame's payload straight into `values` (whole rows of `hidden_dim`)
+    /// and its stage times into `stage_us`, as [`crate::decode_hidden`] would; returns the
+    /// rows. A malformed payload is still read in full, so the next frame can follow.
+    pub fn recv_hidden(
+        &mut self,
+        h: &Header,
+        hidden_dim: usize,
+        values: &mut Vec<f32>,
+        stage_us: &mut Vec<u32>,
+    ) -> Result<usize, FrameError> {
+        let len = h.payload_len as usize;
+        let mut n = [0u8; 2];
+        if len < 2 {
+            self.skip(len)?;
+            return Err(bad_payload("stage times truncated".into()));
+        }
+        self.reader.read_exact(&mut n)?;
+        let stages = 4 * u16::from_le_bytes(n) as usize;
+        let row = hidden_dim * 4;
+        let Some(rest) = (len - 2).checked_sub(stages) else {
+            self.skip(len - 2)?;
+            return Err(bad_payload("stage times truncated".into()));
+        };
+        self.prefix.resize(stages, 0);
+        self.reader.read_exact(&mut self.prefix)?;
+        stage_us.clear();
+        stage_us.extend(self.prefix.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())));
+        if row == 0 || rest == 0 || rest % row != 0 {
+            self.skip(rest)?;
+            return Err(bad_payload(format!("hidden of {rest} bytes is not whole rows of {row}")));
+        }
+        // Grows without zeroing what is already there; every byte is overwritten below.
+        values.truncate(rest / 4);
+        values.resize(rest / 4, 0.0);
+        self.reader.read_exact(f32_bytes_mut(values))?;
+        Ok(rest / row)
+    }
+
+    fn skip(&mut self, n: usize) -> io::Result<()> {
+        io::copy(&mut (&mut self.reader).take(n as u64), &mut io::sink()).map(|_| ())
     }
 
     /// Receives one frame into `payload`. A remote `Error` frame is surfaced as `FrameError::Remote`.

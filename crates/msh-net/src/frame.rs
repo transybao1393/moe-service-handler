@@ -254,7 +254,20 @@ pub fn decode_token(bytes: &[u8], tokens: &mut Vec<u32>, stage_us: &mut Vec<u32>
     Ok(())
 }
 
-fn write_stages(stage_us: &[u32], out: &mut Vec<u8>) {
+/// `values` as the little-endian bytes the wire carries: on a little-endian host (every Apple
+/// Silicon Mac, NF-3) that is their own memory, so hidden states need no copy (NET-6).
+pub(crate) fn f32_bytes(values: &[f32]) -> &[u8] {
+    // SAFETY: any f32 is 4 valid bytes, u8 needs no alignment, and the length covers the slice.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+/// [`f32_bytes`] for writing into: every byte pattern is a valid f32.
+pub(crate) fn f32_bytes_mut(values: &mut [f32]) -> &mut [u8] {
+    // SAFETY: as in `f32_bytes`; any bytes written form valid f32s.
+    unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+pub(crate) fn write_stages(stage_us: &[u32], out: &mut Vec<u8>) {
     out.extend_from_slice(&(stage_us.len() as u16).to_le_bytes());
     for t in stage_us {
         out.extend_from_slice(&t.to_le_bytes());
@@ -272,7 +285,7 @@ fn read_stages<'a>(bytes: &'a [u8], stage_us: &mut Vec<u32>) -> Result<&'a [u8],
     Ok(rest)
 }
 
-fn bad_payload(msg: String) -> FrameError {
+pub(crate) fn bad_payload(msg: String) -> FrameError {
     FrameError::Remote(msg)
 }
 

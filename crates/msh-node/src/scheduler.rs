@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use msh_net::{decode_token, encode_hidden, Connection, Header, MsgType, FLAG_EVERY_TOKEN};
+use msh_net::{decode_token, Connection, Header, MsgType, FLAG_EVERY_TOKEN};
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
@@ -233,7 +233,6 @@ pub fn spawn_with_metrics<E: Engine + 'static>(
         hidden: Vec::new(),
         input: Vec::new(),
         tokens: Vec::new(),
-        buf: Vec::new(),
         waiting: VecDeque::new(),
         active: HashMap::new(),
         ready: VecDeque::new(),
@@ -347,7 +346,6 @@ struct Scheduler<E: Engine> {
     /// Scratch for a step's input tokens and the head's output tokens.
     input: Vec<u32>,
     tokens: Vec<u32>,
-    buf: Vec<u8>,
     /// Keyed by client id until admitted; the ring id is chosen then.
     waiting: VecDeque<(u64, Request)>,
     active: HashMap<u64, Request>,
@@ -569,9 +567,9 @@ impl<E: Engine> Scheduler<E> {
                 return self.finish(id, Event::Failed(msg.into()));
             }
         };
-        encode_hidden(&[coord_us], &self.hidden, &mut self.buf);
         let flags = if sample == Sample::Every { FLAG_EVERY_TOKEN } else { 0 };
-        if let Err(e) = next.send_flagged(MsgType::Hidden, flags, id, start as u32, &self.buf) {
+        // Straight from the engine's output (NET-6).
+        if let Err(e) = next.send_hidden(flags, id, start as u32, &[coord_us], &self.hidden) {
             let reason = format!("send to {}: {e}", next.peer_name());
             return self.ring_down(reason);
         }

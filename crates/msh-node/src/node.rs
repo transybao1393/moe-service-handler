@@ -11,7 +11,7 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use msh_net::{decode_hidden, encode_hidden, encode_token, Connection, FrameError, MsgType, FLAG_EVERY_TOKEN};
+use msh_net::{encode_token, Connection, FrameError, MsgType, FLAG_EVERY_TOKEN};
 
 use crate::config::Config;
 use crate::engine::{Engine, Sample, StageIn};
@@ -108,15 +108,19 @@ impl<E: Engine> Worker<E> {
         let mut out = Vec::new();
         let mut stages = Vec::new();
         loop {
-            let h = match self.ring.prev.recv_frame(&mut buf) {
+            let h = match self.ring.prev.recv_header() {
                 Ok(h) => h,
                 Err(FrameError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => return Ok(self.engine),
                 Err(e) => return Err(e.into()),
             };
+            if h.msg_type != MsgType::Hidden {
+                self.ring.prev.recv_payload(&h, &mut buf)?;
+            }
             match h.msg_type {
                 MsgType::Hidden => {
                     let sample = if h.flags & FLAG_EVERY_TOKEN != 0 { Sample::Every } else { Sample::Last };
-                    let decoded = decode_hidden(&buf, dim, &mut hidden, &mut stages).map_err(Error::from);
+                    // Straight into `hidden`, and sent on straight from `hidden_out` (NET-6).
+                    let decoded = self.ring.prev.recv_hidden(&h, dim, &mut hidden, &mut stages).map_err(Error::from);
                     let result = decoded.and_then(|rows| {
                         let t0 = Instant::now();
                         let input = StageIn::Hidden(&hidden);
@@ -134,10 +138,7 @@ impl<E: Engine> Worker<E> {
                             encode_token(&tokens, &stages, &mut out);
                             next.send(MsgType::Token, h.request_id, h.position, &out)
                         }
-                        Ok(()) => {
-                            encode_hidden(&stages, &hidden_out, &mut out);
-                            next.send_flagged(MsgType::Hidden, h.flags, h.request_id, h.position, &out)
-                        }
+                        Ok(()) => next.send_hidden(h.flags, h.request_id, h.position, &stages, &hidden_out),
                         Err(e) => {
                             warn!(ring = h.request_id, pos = h.position, error = %e, "step failed");
                             let msg = format!("{}: {e}", self.name);

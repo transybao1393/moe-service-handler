@@ -23,7 +23,8 @@ picks one from each node's speed and memory.
 - **Frames:** 24-byte little-endian header (magic, version, type, request id, position,
   length) + payload. Types: `Hidden`, `Token`, `Drop`, `Rewind`, `Ping`/`Pong`, `Hello`, `Error`.
 - **f32 on the wire:** the engine works in f32, so a split pipeline stays bit-identical to
-  one process.
+  one process. Hidden states go on the wire straight from the engine's output buffer and are
+  read straight into the next engine's input, with no encode or decode copy (NET-6).
 - **`Drop`** travels the whole ring; when it returns, every node has freed the request.
 - **Errors** on a worker reach the coordinator as an `Error` frame tagged with the request;
   only that request fails and the ring stays up.
@@ -156,6 +157,14 @@ the software floor for the runs between the Mac minis:
 | 4 KB | 13.7 µs | ~7 µs |
 | 1 MB | 137 µs | ~68 µs |
 | 16 MB | 3.2 ms | ~1.6 ms |
+
+Sending a hidden-state frame over loopback and reading it back
+(`cargo test -p msh-net --release --test loopback -- --ignored --nocapture`):
+
+| Frame | Encoded payload (before) | Direct (NET-6) |
+| --- | --- | --- |
+| 1 position (8 KiB, a decode step) | 4.8 µs | 2.4 µs |
+| 64 positions (512 KiB, a prompt chunk) | 133.5 µs | 33.5 µs |
 
 Prefill of a 400-token prompt, OLMoE 8/4/4 split in 3 processes on the M3 Pro, by
 `prefill_chunk` (time to first token):

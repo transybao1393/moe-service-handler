@@ -68,8 +68,8 @@ pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
         b.items.push(("connections", 2 * 2 * msh_net::conn::BUFFER_BYTES as u64));
     }
     if idx == 0 {
-        // Step input and output, and the frame encoded from it.
-        b.items.push(("frames", 2 * positions * row));
+        // The step's output, sent straight from it.
+        b.items.push(("frames", positions * row));
         // Every admitted, queued or parked request holds up to n_ctx token ids.
         let held = (s.max_in_flight.max(1) + s.max_queue + s.prefix_cache) as u64;
         b.items.push(("requests", held * cfg.engine.n_ctx as u64 * 4));
@@ -80,8 +80,8 @@ pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
             b.items.push(("metrics", 64 << 10));
         }
     } else {
-        // Received frame, its hidden state, the step's output, and the frame sent on.
-        b.items.push(("frames", 4 * positions * row));
+        // The hidden state read straight off the wire, and the step's output sent on.
+        b.items.push(("frames", 2 * positions * row));
     }
     b
 }
@@ -168,12 +168,12 @@ mod tests {
         .unwrap();
         let coord = growth(&cfg, 0, true);
         let item = |b: &Budget, n: &str| b.items.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
-        assert_eq!(item(&coord, "frames"), Some(2 * 64 * 2048 * 4));
+        assert_eq!(item(&coord, "frames"), Some(64 * 2048 * 4));
         assert_eq!(item(&coord, "requests"), Some(8 * 2048 * 4));
         assert_eq!(item(&coord, "http bodies"), Some(8 << 20));
         assert_eq!(item(&coord, "connections"), Some(1 << 20));
         let worker = growth(&cfg, 1, false);
-        assert_eq!(item(&worker, "frames"), Some(4 * 64 * 2048 * 4));
+        assert_eq!(item(&worker, "frames"), Some(2 * 64 * 2048 * 4));
         assert_eq!(item(&worker, "requests"), None);
     }
 }
