@@ -1,0 +1,29 @@
+# The real engine, request split, on one machine: each worker runs the whole OLMoE-1B-7B and
+# the controller runs no model. Build with --features olmoe.
+hidden_dim = 2048
+num_layers = 16
+split = "requests"
+
+[engine]
+kind = "streammoe"
+model_dir = "~/models/olmoe-1b-7b"
+n_ctx = 2048
+mem_cap_gib = 3.0
+
+[http]
+listen = "127.0.0.1:8080"
+tokenizer = "~/models/olmoe-1b-7b/hf/tokenizer.json"
+chat_template = "olmoe"
+model = "olmoe-1b-7b"
+
+[[nodes]]
+name = "m4"
+addr = "127.0.0.1:7211"
+
+[[nodes]]
+name = "m1"
+addr = "127.0.0.1:7212"
+
+[[nodes]]
+name = "m4b"
+addr = "127.0.0.1:7213"

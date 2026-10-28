@@ -59,6 +59,9 @@ impl Budget {
 
 /// The most node `idx`'s buffers can grow to beyond what it holds at start-up.
 pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
+    if cfg.split == Split::Requests {
+        return growth_requests(cfg, idx, serves_http);
+    }
     let s = &cfg.scheduler;
     let row = cfg.hidden_dim as u64 * 4;
     // A step brings a prompt chunk, or a token and its drafts.
@@ -105,10 +108,40 @@ pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
     b
 }
 
+/// [`growth`] on the request split. The controller holds token ids, never hidden states: every
+/// request in flight on any worker or queued keeps its prompt (for a retry) up to n_ctx ids,
+/// and one `Start` payload is built at a time. A worker holds its requests' token ids, the
+/// `Start` read off the wire, and the engine's output for a prompt chunk.
+fn growth_requests(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
+    let s = &cfg.scheduler;
+    let workers = cfg.nodes.len() as u64 - 1;
+    let ids = cfg.engine.n_ctx as u64 * 4;
+    let mut b = Budget::default();
+    let links = if idx == 0 { workers } else { 1 };
+    b.items.push(("connections", links * 2 * msh_net::conn::BUFFER_BYTES as u64));
+    b.items.push(("frames", ids));
+    if idx == 0 {
+        let held = workers * s.max_in_flight.max(1) as u64 + s.max_queue as u64;
+        b.items.push(("requests", held * ids));
+        if serves_http {
+            b.items.push(("http bodies", http_max_open(cfg) as u64 * HTTP_BODY_LIMIT as u64));
+        }
+    } else {
+        b.items.push(("requests", s.max_in_flight.max(1) as u64 * ids));
+        b.items.push(("hidden", s.prefill_chunk.max(1) as u64 * cfg.hidden_dim as u64 * 4));
+    }
+    b
+}
+
 /// HTTP requests open at once: as many as the scheduler can hold. More get 429 before their
 /// body is read.
 pub fn http_max_open(cfg: &Config) -> usize {
-    cfg.scheduler.max_in_flight.max(1) + cfg.scheduler.max_queue
+    let s = &cfg.scheduler;
+    match cfg.split {
+        // `max_in_flight` is per worker there.
+        Split::Requests => (cfg.nodes.len() - 1) * s.max_in_flight.max(1) + s.max_queue,
+        _ => s.max_in_flight.max(1) + s.max_queue,
+    }
 }
 
 /// Checks that the footprint now plus `growth` fits the allowance. Call before the engine opens.
@@ -196,6 +229,34 @@ mod tests {
         assert_eq!(item(&worker, "connections"), Some(512 << 10));
         assert_eq!(item(&worker, "frames"), Some(2 * 64 * 2048 * 4));
         assert_eq!(item(&worker, "requests"), None);
+    }
+
+    #[test]
+    fn growth_on_the_request_split() {
+        let cfg = Config::parse(
+            "hidden_dim = 2048\nnum_layers = 40\nsplit = \"requests\"\n\
+             [scheduler]\nprefill_chunk = 64\nmax_in_flight = 2\nmax_queue = 5\n\
+             [engine]\nn_ctx = 4096\n\
+             [[nodes]]\nname = \"m4\"\naddr = \"127.0.0.1:1\"\n\
+             [[nodes]]\nname = \"m1\"\naddr = \"127.0.0.1:2\"\n\
+             [[nodes]]\nname = \"m4b\"\naddr = \"127.0.0.1:3\"\n",
+        )
+        .unwrap();
+        let item = |b: &Budget, n: &str| b.items.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
+        let ids = 4096 * 4;
+        let coord = growth(&cfg, 0, true);
+        assert_eq!(item(&coord, "connections"), Some(2 * (512 << 10)));
+        // Two per worker in flight and five queued, each up to n_ctx ids; no hidden states.
+        assert_eq!(item(&coord, "requests"), Some(9 * ids));
+        assert_eq!(item(&coord, "frames"), Some(ids));
+        assert_eq!(item(&coord, "hidden"), None);
+        assert_eq!(item(&coord, "http bodies"), Some(9 << 20));
+        let worker = growth(&cfg, 1, false);
+        assert_eq!(item(&worker, "connections"), Some(512 << 10));
+        assert_eq!(item(&worker, "requests"), Some(2 * ids));
+        assert_eq!(item(&worker, "hidden"), Some(64 * 2048 * 4));
+        // Well inside 256 MiB on both.
+        assert!(coord.total() < 16 << 20 && worker.total() < 4 << 20);
     }
 
     #[test]

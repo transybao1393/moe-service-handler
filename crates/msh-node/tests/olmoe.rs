@@ -145,6 +145,69 @@ fn three_node_cluster_matches_mlx_reference_with_requests_in_flight() {
 
 #[test]
 #[ignore = "needs the OLMoE model on disk"]
+fn request_split_two_workers_match_the_reference() {
+    // Each worker opens the whole model (mode A); the controller opens nothing.
+    use msh_node::config::Split;
+    use msh_node::node::RequestWorker;
+    use msh_node::requests;
+
+    let sched = SchedulerConfig { max_in_flight: 2, prefill_chunk: 8, ..Default::default() };
+    let listeners: Vec<TcpListener> = (0..2).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+    let node = |i: usize, addr: String| NodeConfig {
+        name: format!("n{i}"),
+        addr,
+        listen: None,
+        layers: None,
+        speed: None,
+        mem_cap_gib: None,
+        prometheus: None,
+    };
+    let mut nodes = vec![node(0, "127.0.0.1:1".into())];
+    nodes.extend(listeners.iter().enumerate().map(|(k, l)| node(k + 1, l.local_addr().unwrap().to_string())));
+    let cfg = Config {
+        hidden_dim: 2048,
+        num_layers: 16,
+        split: Split::Requests,
+        experts: Default::default(),
+        scheduler: sched,
+        engine: Default::default(),
+        http: None,
+        metrics: None,
+        log: Default::default(),
+        service: Default::default(),
+        nodes,
+    };
+    cfg.validate().unwrap();
+    let workers: Vec<_> = listeners
+        .into_iter()
+        .enumerate()
+        .map(|(k, l)| {
+            let (i, cfg) = (k + 1, cfg.clone());
+            let engine = open(0..16, sched.engine_slots(), None);
+            thread::spawn(move || {
+                let mut w = RequestWorker::new(engine, &cfg.nodes[i].name, sched.prefill_chunk, None);
+                w.serve(accept_controller(&cfg, i, l).unwrap()).unwrap();
+            })
+        })
+        .collect();
+    let (client, coordinator) = requests::spawn(&cfg).unwrap();
+    let board = client.board().unwrap().clone();
+    assert_eq!(board.wait_ready(2, Duration::from_secs(30)), 2);
+    // Four at once: two on each worker, interleaved there.
+    let rxs: Vec<_> = (0..4).map(|_| client.submit(PROMPT.to_vec(), 32)).collect();
+    for rx in rxs {
+        assert_eq!(collect(rx).unwrap().tokens, REF);
+    }
+    assert!(board.workers().iter().all(|w| w.done == 2), "{:?}", board.workers());
+    drop(client);
+    coordinator.join().unwrap();
+    for w in workers {
+        w.join().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "needs the OLMoE model on disk"]
 fn planner_memory_estimate_matches_the_open() {
     // The planner's estimate for a node must agree with what streammoe's open accepts.
     use msh_node::streammoe_engine::Budgeter;

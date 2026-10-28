@@ -1,53 +1,80 @@
 # moe-service-handler
 
 <p align="center">
-  <img src="docs/assets/dataflow-experts-v2.svg" width="900" alt="Data flow, experts split across the workers: at start the m4 controller loads its weights from its SSD and sends each worker the experts it owns; the prompt comes in to the m4 controller; for each of the 40 layers the controller runs attention and the router, sends the hidden state to both workers at once with the picked experts each owns, both workers compute their experts at the same time and send the outputs back, and the controller adds them up; after the last layer the controller's head picks the token and streams it to the client. Now and then the controller reads one expert from the SSD and moves it to the less busy worker. The workers never talk to each other.">
+  <img src="docs/assets/dataflow-requests.svg" width="900" alt="Data flow, request split: two prompts come in to the m4 controller, which runs no model; it gives request A to the m1 worker and request B to the m4b worker at the same time; each worker runs streammoe on the whole model from its own SSD and sends every token back as it is made, and the controller streams it to the client. Every second a ping goes out and each worker's status comes back. The controller's worker table shows each worker's state and what it is doing; a worker that hangs is marked stuck, with what it was on, and gets no new work. The workers never talk to each other.">
 </p>
 
-<p align="center"><em>The expert split (<code>split = "experts"</code>): built and tested on the mock engine; the real
-engine needs two streammoe APIs first. Design: <a href="docs/expert-parallel.md"><code>docs/expert-parallel.md</code></a>.</em></p>
-
 Turns streammoe into a service that runs a large MoE model, Qwen3.6-35B-A3B, across three
-Mac minis: an M4 as the controller (coordinator), an M1 and a second M4. Every node holds part
-of the model and computes its share of each token; the workers send their results back to
-the coordinator, which answers the user. streammoe owns everything inside one machine (memory cap, expert streaming,
-kernels); this repo owns everything that spans machines or requests. Full requirements:
+Mac minis: an M4 as the controller and an M1 and a second M4 as workers. Each worker runs
+streammoe on the whole model, inside its memory cap; the controller runs no model and manages
+everything: it takes the requests, gives each to a worker, streams the answers back and keeps
+track of what every worker is doing. streammoe owns everything inside one machine (memory cap,
+expert streaming, kernels); this repo owns everything that spans machines or requests, and
+adapts to what streammoe offers. Full requirements:
 [`moe-service-handler-prd.md`](moe-service-handler-prd.md).
 
 ## Architecture
 
 The controller holds one persistent TCP connection to each worker; workers have no
-connections to each other. The config's `split` picks how the model is divided.
+connections to each other. The config's `split` picks how the work is divided.
 
-**Expert split** (`split = "experts"`, the target design; mock engine only for now). The
-controller runs the embedding, every layer's attention, router and shared expert, the KV
-cache and the head. Every routed expert has one home worker, which keeps it in memory. At
-start the controller loads its weights from its SSD and sends each worker the experts it owns;
-after that the SSD is read only when an expert moves. For each token:
+**Request split** (`split = "requests"`; design: [`docs/request-split.md`](docs/request-split.md)).
+The controller runs no model: it has the HTTP API, the tokenizer, the queue and the worker
+management. Each worker runs streammoe on the whole model from its own SSD, as streammoe is
+built to run. For each request:
 
-1. The prompt comes in to the controller (over HTTP).
-2. For layer L, the controller runs attention and the router, which picks 8 of 256 experts.
-3. It sends the hidden state to **both workers at once**, each with the picked experts it owns.
-4. Both workers compute their experts at the same time and send the outputs back.
-5. The controller adds them up and goes on to layer L+1: about 40 small round trips per token.
-6. After the last layer the head picks the token, and the controller streams it to the client.
+1. The prompt comes in to the controller, which tokenizes it.
+2. The controller gives it to the ready worker with the fewest requests running (`Start`);
+   both workers work at the same time, each on its own requests.
+3. The worker prefills and decodes, sending each `Token` as it is made; the controller
+   streams it to the client.
+4. The worker ends the request at the token limit or the end of text (`Done`); the controller
+   sends `Drop` only to end one early.
 
-The controller counts how often each expert is picked and moves a few between workers so both
-get about the same work: the new owner gets the weights and confirms, then the old owner frees
-its copy. Workers keep no per-request state. A request runs one step at a time; several
-requests overlap, so every node stays busy.
+One answer runs at one Mac's speed; two workers serve two requests at once. At a 9 GiB cap a
+worker holds 3.1 GiB of weights, KV and buffers plus a 5.9 GiB hot tier of the 16.9 GiB of
+experts (from `--plan`); the rest streams from its SSD.
 
-**Layer split** (`split = "layers"`, the default; what streammoe runs today). Each node runs a
-contiguous layer range. The controller runs its layers and sends the hidden state to m1, which
-sends its result back; the controller sends that on to m4b, which runs the last layers and the
-head and sends the token back. The workers take turns on every token, since m4b needs m1's
-result. The 20 / 10 / 10 split of Qwen3.6's 40 layers is
+**Worker management** (on the controller, request split only):
+
+- **Worker table:** each worker's state (`connecting`, `ready`, `draining`, `stuck`, `down`)
+  and since when, ping round trip, the requests it runs (phase, position, tokens sent, last
+  progress), done and failed counts, tokens per second over 10 s, errors over a minute, the
+  last error, and its footprint and cap from the status each `Pong` carries.
+- **Stuck worker:** a ping not back within `health_timeout_ms` (5 s). It gets no new work and
+  its requests show what they were on ("decode, token 212 of 500, no progress for 31 s").
+- **Stalled request:** no progress for `stall_timeout_ms` (30 s): only that request fails.
+- **Lost worker:** requests that sent nothing yet go to the other worker; the rest fail. The
+  controller reconnects, and the worker serves again after its `Hello`.
+- **The cluster stays up while one worker is ready**; with none, requests get 503.
+- **Endpoints:** `GET /v1/workers`, `GET /v1/workers/{name}`, `GET /v1/requests`,
+  `POST /v1/workers/{name}/drain` and `/resume`, `POST /v1/requests/{id}/cancel`; per-worker
+  Prometheus series (`worker="NAME"`) and a log line per state change.
+- **Next (designed, not built):** the controller decides and commands: routing a chat's next
+  turn to the worker that holds it, per-worker load limits, reopening or restarting a stuck
+  worker, and tuning streammoe's open settings one worker at a time.
+
+**Layer split** (`split = "layers"`, the default). Each node runs a contiguous layer range
+(streammoe's `layer_range`). The controller runs its layers and sends the hidden state to m1,
+which sends its result back; the controller sends that on to m4b, which runs the last layers
+and the head and sends the token back. The workers take turns on every token, since m4b needs
+m1's result. The 20 / 10 / 10 split of Qwen3.6's 40 layers is
 [`configs/qwen36-3node.toml`](configs/qwen36-3node.toml); leave out `layers` and the planner
 picks one from each node's speed and memory.
 
+**Expert split** (`split = "experts"`, experimental, mock engine only). The controller runs
+every layer's attention and router and sends each layer's picked experts to both workers at
+once ([`docs/expert-parallel.md`](docs/expert-parallel.md)). It needs streammoe to run a layer
+without its experts and to compute a chosen set of experts, which it does not offer, so it
+stays on the mock.
+
+The notes below cover all three; those about hidden states, chunked prefill, speculative
+decoding and prefix reuse apply to the layer split.
+
 - **Frames:** 24-byte little-endian header (magic, version, type, request id, position,
-  length) + payload. Types: `Hidden`, `Token`, `Drop`, `Rewind`, `Ping`/`Pong`, `Hello`, `Error`; for
-  the expert split also `Experts`, `Partial`, `Own`, `Move`, `Release` (protocol version 5).
+  length) + payload. Types: `Hidden`, `Token`, `Drop`, `Rewind`, `Ping`/`Pong`, `Hello`, `Error`;
+  for the request split also `Start`, `Done` and a status report in `Pong`; for the expert
+  split `Experts`, `Partial`, `Own`, `Move`, `Release` (protocol version 6).
 - **f32 on the wire:** the engine works in f32, so a split pipeline stays bit-identical to
   one process. Hidden states go on the wire straight from the engine's output buffer and are
   read straight into the next engine's input, with no encode or decode copy (NET-6). The
@@ -74,9 +101,10 @@ picks one from each node's speed and memory.
   `msh-node --speeds-from run.csv` turns a previous run's metrics into `speed` values.
 - **Prefix reuse** (`prefix_cache` > 0): finished requests keep their state on every node; the
   next chat turn takes it over and prefills only the new message. Off by default.
-- **Health:** a `Ping` goes through every worker each second. A broken connection, or a ping
-  not back within 5 s (a hung node), marks the cluster down: in-flight requests fail and new ones are
-  rejected until the cluster is restarted.
+- **Health:** a `Ping` goes to every worker each second. In the request split a broken or hung
+  worker is taken out of service on its own (above). In the layer and expert splits every node
+  is needed for every token, so a broken connection or a ping not back within 5 s marks the
+  cluster down: in-flight requests fail and new ones are rejected until it is restarted.
 - **Metrics:** each worker appends its compute time to the frame it sends back, so the
   coordinator splits every step into per-node compute and network/queueing without clock
   sync. `--metrics FILE` or `[metrics] csv` writes one CSV row per step (a prompt chunk, or a
@@ -101,14 +129,15 @@ picks one from each node's speed and memory.
   67 MiB of it HTTP bodies). OLMoE on one node with a 4 GiB cap peaked at 1.16 GiB.
 - **API:** the coordinator serves OpenAI-compatible `GET /v1/models` and
   `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
-  429, a cluster that is down 503.
+  429, a cluster that is down 503. In the request split the controller also serves the worker
+  management endpoints above.
 
 ## Crates
 
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Controller / worker, config, planner, star links, scheduler, HTTP API, metrics, engines | Controller-to-worker links, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11), Prometheus (CL-12), logs (NF-5), service memory allowance (NF-2); runs real streammoe (tested on OLMoE) |
+| `msh-node` | binary | Controller / worker, config, planner, star links, scheduler, HTTP API, metrics, engines | Request split with worker management (tested on OLMoE: 2 workers, whole model each), controller-to-worker links, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11), Prometheus (CL-12), logs (NF-5), service memory allowance (NF-2); runs real streammoe (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
 The engine sits behind an `Engine` trait shaped like streammoe's `eval_request`: tokens or
@@ -150,8 +179,19 @@ token for token.
 ```bash
 cargo test --release
 
-# three nodes on one machine over loopback (the coordinator waits up to 60 s for the workers)
 B=target/release/msh-node
+
+# request split on one machine: a controller and two workers, each running the whole (mock) model
+$B --config configs/local-requests.toml --node m1 &
+$B --config configs/local-requests.toml --node m4b &
+$B --config configs/local-requests.toml --node m4 --max-tokens 500 --requests 4
+
+# the same with OLMoE over HTTP, and the worker table (build with --features msh-node/olmoe)
+#   start m1 and m4b, then m4, with configs/olmoe-requests.toml, then:
+curl localhost:8080/v1/workers
+curl localhost:8080/v1/requests
+
+# layer split, three nodes on one machine (the controller waits up to 60 s for the workers)
 $B --config configs/local-3node.toml --node m4b &
 $B --config configs/local-3node.toml --node m1 &
 $B --config configs/local-3node.toml --node m4 --max-tokens 500 --requests 3 --metrics results/run.csv

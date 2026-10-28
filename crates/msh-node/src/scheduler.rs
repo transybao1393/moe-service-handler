@@ -83,6 +83,9 @@ pub struct SchedulerConfig {
     pub health_interval_ms: u64,
     /// How long a ping may take to come back before the cluster is declared down.
     pub health_timeout_ms: u64,
+    /// Request split: how long a request may go without progress (a token, or prompt
+    /// positions in the worker's status report) before it fails.
+    pub stall_timeout_ms: u64,
     /// Prompt positions per prefill step. Bigger chunks make better use of the engine's
     /// batched path; smaller ones let other requests' decode steps in sooner.
     pub prefill_chunk: usize,
@@ -110,6 +113,7 @@ impl Default for SchedulerConfig {
             max_queue: 64,
             health_interval_ms: 1000,
             health_timeout_ms: 5000,
+            stall_timeout_ms: 30_000,
             prefill_chunk: 64,
             prefill_depth: 3,
             max_draft: 0,
@@ -138,8 +142,10 @@ pub struct Generation {
     pub latencies: Vec<Duration>,
 }
 
-enum Msg {
+pub(crate) enum Msg {
     Submit { id: u64, prompt: Vec<u32>, max_new: usize, events: Sender<Event> },
+    /// Request split: from a worker's link (see [`crate::requests`]).
+    Requests(crate::requests::Note),
     /// Layer split: a frame back from the last worker.
     Frame(Header, Vec<u8>),
     /// Expert split: worker `from`'s outputs for one layer of a step.
@@ -160,6 +166,8 @@ pub struct Client {
 struct ClientInner {
     tx: Sender<Msg>,
     next_id: AtomicU64,
+    /// Request split: the worker table and its actions.
+    board: Option<Arc<crate::requests::Board>>,
 }
 
 impl Drop for ClientInner {
@@ -169,6 +177,15 @@ impl Drop for ClientInner {
 }
 
 impl Client {
+    pub(crate) fn new(tx: Sender<Msg>, board: Option<Arc<crate::requests::Board>>) -> Client {
+        Client { inner: Arc::new(ClientInner { tx, next_id: AtomicU64::new(1), board }) }
+    }
+
+    /// The request split's worker table and actions; `None` on the other splits.
+    pub fn board(&self) -> Option<&Arc<crate::requests::Board>> {
+        self.inner.board.as_ref()
+    }
+
     /// Queues a request for greedy generation of up to `max_new` tokens.
     pub fn submit(&self, prompt: Vec<u32>, max_new: usize) -> Receiver<Event> {
         self.submit_with_id(prompt, max_new).1
@@ -306,7 +323,7 @@ fn start<E: Engine + 'static>(
         stages: Vec::new(),
         workers_us: None,
     };
-    let client = Client { inner: Arc::new(ClientInner { tx, next_id: AtomicU64::new(1) }) };
+    let client = Client::new(tx, None);
     (client, thread::spawn(move || span.in_scope(|| s.run())))
 }
 
@@ -702,6 +719,8 @@ impl<E: Engine> Scheduler<E> {
             Msg::Partial { from, h, layer, compute_us, values } => self.on_partial(from, h, layer, compute_us, values),
             Msg::Reply { from, h, payload } => self.on_reply(from, h, payload),
             Msg::ClusterDown(reason) => self.cluster_down(reason),
+            // Only the request split's scheduler gets these.
+            Msg::Requests(_) => {}
             Msg::Shutdown => {
                 self.shutting_down = true;
                 info!(active = self.active.len(), waiting = self.waiting.len(), "shutting down");

@@ -23,8 +23,9 @@
 //! the same split (CL-3) from each node's optional `speed` (default 1) and, under streammoe,
 //! its memory cap. A single node runs the whole model. An optional `[scheduler]` table sets
 //! `max_in_flight` (default 3), `max_queue` (64), `health_interval_ms` (1000),
-//! `health_timeout_ms` (5000), `prefill_chunk` (64), `prefill_depth` (3), `max_draft` (0:
-//! no speculative decoding), `draft_min_ngram` (3) and `prefix_cache` (0: no prefix reuse).
+//! `health_timeout_ms` (5000), `stall_timeout_ms` (30000; request split only),
+//! `prefill_chunk` (64), `prefill_depth` (3), `max_draft` (0: no speculative decoding),
+//! `draft_min_ngram` (3) and `prefix_cache` (0: no prefix reuse).
 //!
 //! `split` picks how the model is divided. `"layers"` (the default) is the layer split above.
 //! `"experts"` is the expert split (docs/expert-parallel.md): the controller runs every layer's
@@ -41,6 +42,22 @@
 //! [experts]
 //! count = 256
 //! top_k = 8
+//! ```
+//!
+//! `"requests"` is the request split (docs/request-split.md): the controller runs no engine and
+//! holds no weights; it takes the HTTP requests, queues them and gives each whole request to
+//! one worker, which runs every layer (streammoe's whole model inside its cap, mode A) and sends
+//! the tokens back as it makes them. No node takes `layers`, and at least one worker is needed.
+//! `max_in_flight` is then per worker, `max_queue` is the controller's queue, a worker that
+//! does not answer a health ping within `health_timeout_ms` is stuck and gets no new requests,
+//! and a request that makes no progress for `stall_timeout_ms` (default 30000) fails alone.
+//! Speculative decoding (`max_draft`) and prefix reuse (`prefix_cache`) are not available here:
+//!
+//! ```toml
+//! split = "requests"
+//! [scheduler]
+//! max_in_flight = 2        # per worker
+//! stall_timeout_ms = 30000
 //! ```
 //!
 //! An optional `[engine]` table picks the engine (default: the mock):
@@ -132,6 +149,9 @@ pub enum Split {
     /// The controller runs everything but the routed experts; each layer goes to every worker
     /// at once, and each worker runs the experts it owns.
     Experts,
+    /// The controller runs no engine; each worker runs the whole model and serves whole
+    /// requests.
+    Requests,
 }
 
 /// The expert split's shape and rebalancing.
@@ -365,6 +385,9 @@ impl Config {
         if self.split == Split::Experts {
             return self.validate_experts();
         }
+        if self.split == Split::Requests {
+            return self.validate_requests();
+        }
         match self.nodes.iter().filter(|n| n.layers.is_some()).count() {
             0 if self.nodes.len() > self.num_layers as usize => {
                 return bad(format!("{} nodes for {} layers", self.nodes.len(), self.num_layers));
@@ -412,6 +435,37 @@ impl Config {
             return bad(format!("{} nodes; the expert split takes at most 255 workers", self.nodes.len()));
         }
         Ok(())
+    }
+
+    fn validate_requests(&self) -> Result<(), Error> {
+        let bad = |m: String| Err(Error::Config(m));
+        if let Some(n) = self.nodes.iter().find(|n| n.layers.is_some()) {
+            return bad(format!("node {}: split = \"requests\" takes no layers (every worker runs all of them)", n.name));
+        }
+        if self.nodes.len() < 2 {
+            return bad("split = \"requests\" needs at least one worker".into());
+        }
+        let s = &self.scheduler;
+        if s.max_draft > 0 || s.prefix_cache > 0 {
+            return bad("split = \"requests\" has no speculative decoding or prefix reuse: set max_draft and prefix_cache to 0".into());
+        }
+        if s.stall_timeout_ms == 0 || s.health_timeout_ms == 0 {
+            return bad("scheduler.stall_timeout_ms and health_timeout_ms must be positive".into());
+        }
+        if self.engine.kind == EngineKind::StreamMoe && self.engine.model_dir.is_empty() {
+            return bad("engine.model_dir is required for kind = \"streammoe\"".into());
+        }
+        Ok(())
+    }
+
+    /// The layers node `i` runs: its range on the layer split, every layer on a request-split
+    /// worker, `None` on the expert split and on the request split's controller.
+    pub fn layers_of(&self, i: usize) -> Option<Range<u32>> {
+        match self.split {
+            Split::Layers => Some(self.nodes[i].layer_range()),
+            Split::Experts => None,
+            Split::Requests => (i > 0).then_some(0..self.num_layers),
+        }
     }
 
     /// Whether the config leaves the layer split to the planner.
@@ -567,6 +621,26 @@ mod tests {
         assert!(Config::parse(&text.replace("split = \"experts\"", "split = \"rows\"")).is_err());
         let streammoe = text.replace("[experts]", "[engine]\nkind = \"streammoe\"\nmodel_dir = \"/m\"\n[experts]");
         assert!(Config::parse(&streammoe).is_err());
+    }
+
+    #[test]
+    fn request_split_takes_no_layers_and_needs_a_worker() {
+        let layerless = THREE.replace("layers = [0, 20]", "").replace("layers = [20, 30]", "").replace("layers = [30, 40]", "");
+        let text = layerless.replace("num_layers = 40", "num_layers = 40\nsplit = \"requests\"\n[scheduler]\nmax_in_flight = 2");
+        let c = Config::parse(&text).unwrap();
+        assert_eq!((c.split, c.scheduler.max_in_flight, c.scheduler.stall_timeout_ms), (Split::Requests, 2, 30_000));
+        assert_eq!((c.layers_of(0), c.layers_of(2)), (None, Some(0..40)));
+        assert!(!c.is_planned());
+        let stall = text.replace("max_in_flight = 2", "stall_timeout_ms = 500");
+        assert_eq!(Config::parse(&stall).unwrap().scheduler.stall_timeout_ms, 500);
+        assert!(Config::parse(&THREE.replace("num_layers = 40", "num_layers = 40\nsplit = \"requests\"")).is_err());
+        assert!(Config::parse(&text.replace("max_in_flight = 2", "max_draft = 4")).is_err());
+        assert!(Config::parse(&text.replace("max_in_flight = 2", "prefix_cache = 1")).is_err());
+        assert!(Config::parse(&text.replace("max_in_flight = 2", "stall_timeout_ms = 0")).is_err());
+        let alone = text.split("[[nodes]]").take(2).collect::<Vec<_>>().join("[[nodes]]");
+        assert!(Config::parse(&alone).is_err(), "no worker");
+        let streammoe = text.replace("[scheduler]", "[engine]\nkind = \"streammoe\"\nmodel_dir = \"/m\"\n[scheduler]");
+        assert!(Config::parse(&streammoe).is_ok());
     }
 
     #[test]

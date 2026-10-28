@@ -20,12 +20,17 @@
 //! The expert split (docs/expert-parallel.md) adds `Own`, `Experts`, `Partial`, `Move` and
 //! `Release`. An `Experts` frame and its `Partial` carry the step's request id and start
 //! position, and the layer in the payload; the other three use request id 0.
+//!
+//! The request split (docs/request-split.md) adds `Start` and `Done`: the controller sends a
+//! worker a whole request, the worker sends back each `Token` as it is made and a `Done` when
+//! it stops. A worker answers `Ping` with a `Pong` carrying its status report (see
+//! [`encode_status`]).
 
 use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"MSHN";
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// On a `Hidden` frame: the head returns the token sampled after every position, not just the
 /// last. Workers pass it on.
@@ -70,6 +75,12 @@ pub enum MsgType {
     Move = 12,
     /// The receiving worker no longer owns an expert; layer and expert as in `Move`, no weights.
     Release = 13,
+    /// A whole request for a worker (request split): the request id in the header, the token
+    /// limit and the prompt's token ids in the payload (see [`encode_start`]).
+    Start = 14,
+    /// A worker stopped a request (request split): the request id in the header, the tokens it
+    /// made as the position, and why in the payload (see [`encode_done`]).
+    Done = 15,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -90,6 +101,8 @@ impl TryFrom<u8> for MsgType {
             11 => MsgType::Partial,
             12 => MsgType::Move,
             13 => MsgType::Release,
+            14 => MsgType::Start,
+            15 => MsgType::Done,
             other => return Err(FrameError::UnknownType(other)),
         })
     }
@@ -417,6 +430,166 @@ pub fn decode_move(bytes: &[u8]) -> Result<(u16, u16, &[u8]), FrameError> {
     Ok((u16_at(head, 0), u16_at(head, 2), weights))
 }
 
+// Request-split payloads:
+//
+//   Start: max_new u32, count u32, token u32 × count
+//   Done:  reason u8
+//   Pong:  sections of (tag u16, len u32, len bytes); unknown tags are skipped, so a worker
+//          can report more than its controller reads
+//     tag 1, memory:   footprint u64, cap u64 (0: no cap)
+//     tag 2, requests: count u32, entry_len u16, count entries of entry_len bytes, each
+//                      request u64, decoding u8, position u32, made u32, then any later fields
+
+/// Encodes a `Start` payload: generate up to `max_new` tokens after `prompt`.
+pub fn encode_start(max_new: u32, prompt: &[u32], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(8 + 4 * prompt.len());
+    out.extend_from_slice(&max_new.to_le_bytes());
+    out.extend_from_slice(&(prompt.len() as u32).to_le_bytes());
+    for t in prompt {
+        out.extend_from_slice(&t.to_le_bytes());
+    }
+}
+
+/// Decodes a `Start` payload into `prompt`; returns the token limit.
+pub fn decode_start(bytes: &[u8], prompt: &mut Vec<u32>) -> Result<u32, FrameError> {
+    let (head, rest) = bytes.split_at_checked(8).ok_or_else(|| bad_payload("start payload too short".into()))?;
+    let n = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
+    if n == 0 || rest.len() != 4 * n {
+        return Err(bad_payload(format!("start payload of {} bytes for {n} prompt tokens", rest.len())));
+    }
+    prompt.clear();
+    prompt.extend(rest.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())));
+    Ok(u32::from_le_bytes(head[0..4].try_into().unwrap()))
+}
+
+/// Why a worker stopped a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DoneReason {
+    /// It made the token limit `Start` gave.
+    Length = 0,
+    /// The model made its end-of-sequence token, which is not sent.
+    Eos = 1,
+    /// The controller sent `Drop`, and the worker freed it.
+    Dropped = 2,
+}
+
+/// Encodes a `Done` payload.
+pub fn encode_done(reason: DoneReason, out: &mut Vec<u8>) {
+    out.clear();
+    out.push(reason as u8);
+}
+
+pub fn decode_done(bytes: &[u8]) -> Result<DoneReason, FrameError> {
+    match bytes {
+        [0] => Ok(DoneReason::Length),
+        [1] => Ok(DoneReason::Eos),
+        [2] => Ok(DoneReason::Dropped),
+        _ => Err(bad_payload(format!("done payload {bytes:?}"))),
+    }
+}
+
+/// A worker's status report, the payload of its `Pong`. New fields go in new sections (or at
+/// the end of a request entry), so older controllers keep reading the report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Status {
+    /// Physical footprint in bytes; 0 where it cannot be read.
+    pub footprint: u64,
+    /// Memory cap in bytes; 0 without one.
+    pub cap: u64,
+    pub requests: Vec<RunStatus>,
+}
+
+/// One request a worker holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunStatus {
+    pub request: u64,
+    /// Past the prompt.
+    pub decoding: bool,
+    /// Positions the engine holds.
+    pub position: u32,
+    /// Tokens made.
+    pub made: u32,
+}
+
+const STATUS_MEMORY: u16 = 1;
+const STATUS_REQUESTS: u16 = 2;
+const RUN_STATUS_LEN: usize = 17;
+
+fn write_section(tag: u16, body: impl FnOnce(&mut Vec<u8>), out: &mut Vec<u8>) {
+    out.extend_from_slice(&tag.to_le_bytes());
+    let at = out.len();
+    out.extend_from_slice(&[0; 4]);
+    body(out);
+    let len = (out.len() - at - 4) as u32;
+    out[at..at + 4].copy_from_slice(&len.to_le_bytes());
+}
+
+/// Encodes a `Pong` status report.
+pub fn encode_status(s: &Status, out: &mut Vec<u8>) {
+    out.clear();
+    write_section(
+        STATUS_MEMORY,
+        |o| {
+            o.extend_from_slice(&s.footprint.to_le_bytes());
+            o.extend_from_slice(&s.cap.to_le_bytes());
+        },
+        out,
+    );
+    write_section(
+        STATUS_REQUESTS,
+        |o| {
+            o.extend_from_slice(&(s.requests.len() as u32).to_le_bytes());
+            o.extend_from_slice(&(RUN_STATUS_LEN as u16).to_le_bytes());
+            for r in &s.requests {
+                o.extend_from_slice(&r.request.to_le_bytes());
+                o.push(r.decoding as u8);
+                o.extend_from_slice(&r.position.to_le_bytes());
+                o.extend_from_slice(&r.made.to_le_bytes());
+            }
+        },
+        out,
+    );
+}
+
+/// Decodes a `Pong` status report into `s`. Sections it does not know are skipped; an empty
+/// payload leaves `s` empty.
+pub fn decode_status(bytes: &[u8], s: &mut Status) -> Result<(), FrameError> {
+    let short = || bad_payload("status report truncated".into());
+    *s = Status::default();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (head, tail) = rest.split_at_checked(6).ok_or_else(short)?;
+        let len = u32::from_le_bytes(head[2..6].try_into().unwrap()) as usize;
+        let (body, tail) = tail.split_at_checked(len).ok_or_else(short)?;
+        rest = tail;
+        match u16_at(head, 0) {
+            STATUS_MEMORY => {
+                let b = body.get(..16).ok_or_else(short)?;
+                s.footprint = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                s.cap = u64::from_le_bytes(b[8..16].try_into().unwrap());
+            }
+            STATUS_REQUESTS => {
+                let (b, entries) = body.split_at_checked(6).ok_or_else(short)?;
+                let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+                let entry = u16_at(b, 4) as usize;
+                if entry < RUN_STATUS_LEN || entries.len() != n * entry {
+                    return Err(bad_payload(format!("{n} request entries of {entry} bytes in {}", entries.len())));
+                }
+                s.requests.extend(entries.chunks_exact(entry).map(|e| RunStatus {
+                    request: u64::from_le_bytes(e[0..8].try_into().unwrap()),
+                    decoding: e[8] != 0,
+                    position: u32::from_le_bytes(e[9..13].try_into().unwrap()),
+                    made: u32::from_le_bytes(e[13..17].try_into().unwrap()),
+                }));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn u16_at(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
 }
@@ -549,6 +722,73 @@ mod tests {
     #[test]
     fn expert_split_types_decode() {
         for t in [MsgType::Own, MsgType::Experts, MsgType::Partial, MsgType::Move, MsgType::Release] {
+            let h = Header::new(t, 3, 4, 0);
+            assert_eq!(Header::decode(&h.encode()).unwrap().msg_type, t);
+        }
+    }
+
+    #[test]
+    fn start_and_done_payloads_round_trip() {
+        let mut bytes = Vec::new();
+        let mut prompt = Vec::new();
+        encode_start(500, &[1, 2, u32::MAX], &mut bytes);
+        assert_eq!(decode_start(&bytes, &mut prompt).unwrap(), 500);
+        assert_eq!(prompt, [1, 2, u32::MAX]);
+        assert!(decode_start(&bytes[..bytes.len() - 1], &mut prompt).is_err());
+        assert!(decode_start(&bytes[..7], &mut prompt).is_err());
+        encode_start(5, &[], &mut bytes);
+        assert!(decode_start(&bytes, &mut prompt).is_err(), "empty prompt");
+        for r in [DoneReason::Length, DoneReason::Eos, DoneReason::Dropped] {
+            encode_done(r, &mut bytes);
+            assert_eq!(decode_done(&bytes).unwrap(), r);
+        }
+        assert!(decode_done(&[3]).is_err());
+        assert!(decode_done(&[]).is_err());
+    }
+
+    #[test]
+    fn status_report_round_trips_and_skips_what_it_does_not_know() {
+        let s = Status {
+            footprint: 7 << 30,
+            cap: 6 << 30,
+            requests: vec![
+                RunStatus { request: 3, decoding: false, position: 64, made: 0 },
+                RunStatus { request: u64::MAX, decoding: true, position: 212, made: 190 },
+            ],
+        };
+        let mut bytes = Vec::new();
+        encode_status(&s, &mut bytes);
+        let mut got = Status::default();
+        decode_status(&bytes, &mut got).unwrap();
+        assert_eq!(got, s);
+        // A later worker's extra section is skipped.
+        let mut newer = bytes.clone();
+        write_section(99, |o| o.extend_from_slice(&[1, 2, 3]), &mut newer);
+        decode_status(&newer, &mut got).unwrap();
+        assert_eq!(got, s);
+        // So are later fields at the end of a request entry.
+        let mut wide = Vec::new();
+        write_section(
+            STATUS_REQUESTS,
+            |o| {
+                o.extend_from_slice(&1u32.to_le_bytes());
+                o.extend_from_slice(&20u16.to_le_bytes());
+                o.extend_from_slice(&5u64.to_le_bytes());
+                o.extend_from_slice(&[1, 9, 0, 0, 0, 4, 0, 0, 0, 0xAA, 0xAA, 0xAA]);
+            },
+            &mut wide,
+        );
+        decode_status(&wide, &mut got).unwrap();
+        assert_eq!(got.requests, [RunStatus { request: 5, decoding: true, position: 9, made: 4 }]);
+        decode_status(&[], &mut got).unwrap();
+        assert_eq!(got, Status::default());
+        assert!(decode_status(&bytes[..bytes.len() - 1], &mut got).is_err());
+        assert!(decode_status(&bytes[..4], &mut got).is_err());
+    }
+
+    #[test]
+    fn request_split_types_decode() {
+        for t in [MsgType::Start, MsgType::Done] {
             let h = Header::new(t, 3, 4, 0);
             assert_eq!(Header::decode(&h.encode()).unwrap().msg_type, t);
         }

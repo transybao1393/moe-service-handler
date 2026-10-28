@@ -1,0 +1,17 @@
+# Request split on one machine over loopback, in the shape of the M4 + M1 + M4 cluster: the
+# controller runs no model and hands whole requests to the two workers.
+hidden_dim = 2048
+num_layers = 40
+split = "requests"
+
+[[nodes]]
+name = "m4"
+addr = "127.0.0.1:7111"
+
+[[nodes]]
+name = "m1"
+addr = "127.0.0.1:7112"
+
+[[nodes]]
+name = "m4b"
+addr = "127.0.0.1:7113"

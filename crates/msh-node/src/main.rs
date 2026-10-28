@@ -12,7 +12,10 @@
 //! it serves the OpenAI-compatible API. With `--prompt` (token ids) it submits K concurrent
 //! greedy generations, prints throughput and exits. `--metrics FILE` (or `[metrics] csv`)
 //! appends one row per position to a CSV.
-//! Every other node is a worker and serves until the coordinator disconnects.
+//! Every other node is a worker and serves until the coordinator disconnects. With
+//! `split = "requests"` the coordinator opens no engine and serves once at least one worker is
+//! ready (waiting up to 60 s for all); each worker opens the whole model and serves one
+//! coordinator connection after another, so a coordinator that lost it can reconnect.
 //! `[engine] kind` picks the mock (default) or streammoe, which needs a model feature at build
 //! time, e.g. `cargo build --release --features olmoe`.
 
@@ -32,7 +35,7 @@ use msh_node::{memory, stats};
 use msh_node::metrics::{Metrics, RunInfo};
 use msh_node::node::Star;
 use msh_node::engine::{Engine, MockEngine};
-use msh_node::node::{accept_controller, connect_workers, Worker};
+use msh_node::node::{accept_controller, connect_workers, RequestWorker, Worker};
 use msh_node::planner;
 use msh_node::scheduler::{self, collect};
 
@@ -100,6 +103,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     memory::check_start(&cfg, &memory::growth(&cfg, idx, http.is_some()))?;
     // Open the engine before joining the cluster, so a range that does not fit fails here (DEP-4).
     match (cfg.engine.kind, cfg.split) {
+        // The request split's controller runs no engine; each worker runs every layer.
+        (_, Split::Requests) if idx == 0 => serve_requests(&cfg, codec, &flag),
+        (EngineKind::Mock, Split::Requests) => {
+            serve_request_worker(&cfg, idx, MockEngine::new(0..cfg.num_layers, cfg.num_layers, cfg.hidden_dim))
+        }
+        (EngineKind::StreamMoe, Split::Requests) => serve_request_worker(&cfg, idx, open_streammoe(&cfg, idx)?),
         (EngineKind::Mock, Split::Layers) => {
             serve(&cfg, idx, MockEngine::new(node.layer_range(), cfg.num_layers, cfg.hidden_dim), codec, &flag)
         }
@@ -118,6 +127,8 @@ fn role(cfg: &Config, i: usize) -> String {
         (Split::Layers, _) => format!("{:?}", cfg.nodes[i].layer_range()),
         (Split::Experts, 0) => "all layers but the routed experts".into(),
         (Split::Experts, _) => "routed experts".into(),
+        (Split::Requests, 0) => "no engine: the queue and the workers".into(),
+        (Split::Requests, _) => "the whole model, whole requests".into(),
     }
 }
 
@@ -131,6 +142,7 @@ fn start_scheduler<E: Engine + 'static>(
     Ok(match cfg.split {
         Split::Layers => scheduler::spawn_with_metrics(engine, star, cfg.scheduler, metrics),
         Split::Experts => scheduler::spawn_experts(engine, star, cfg.scheduler, cfg.experts, metrics)?,
+        Split::Requests => return Err("the request split's controller runs no engine".into()),
     })
 }
 
@@ -149,7 +161,7 @@ fn plan_split(cfg: &mut Config, print: bool) -> Result<(), Box<dyn std::error::E
     let source = if cfg.is_planned() { "planner" } else { "config" };
     cfg.plan_layers(|i, r| budget(i, r).is_none_or(|b| b.fixed <= caps[i].unwrap_or(u64::MAX)))?;
     show_split(cfg, source, print, |i| {
-        budget(i, cfg.nodes[i].layer_range()).map(|b| {
+        budget(i, cfg.layers_of(i)?).map(|b| {
             format!(
                 "fixed {:.2} GiB, hot tier {:.2} of {:.2} GiB experts",
                 b.fixed as f64 / GIB,
@@ -188,6 +200,23 @@ fn show_split(cfg: &Config, source: &str, print: bool, budget: impl Fn(usize) ->
                     }
                 };
                 println!("{:<8} {what}", n.name);
+            }
+        }
+        return;
+    }
+    if cfg.split == Split::Requests {
+        let per_worker = cfg.scheduler.max_in_flight.max(1);
+        info!(workers = cfg.nodes.len() - 1, per_worker, "request split");
+        if print {
+            for (i, n) in cfg.nodes.iter().enumerate() {
+                let mut line = format!("{:<8} {}", n.name, role(cfg, i));
+                if let (true, Some(cap)) = (i > 0, n.mem_cap(&cfg.engine)) {
+                    line += &format!("  cap {:.2} GiB", cap as f64 / GIB);
+                }
+                if let Some(b) = budget(i) {
+                    line += &format!("  {b}");
+                }
+                println!("{line}");
             }
         }
         return;
@@ -241,9 +270,10 @@ fn with_spec<T>(
 fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box<dyn std::error::Error>> {
     use msh_node::streammoe_engine::StreamMoeEngine;
     let node = &cfg.nodes[idx];
+    let layers = cfg.layers_of(idx).ok_or("this node runs no layers")?;
     let t0 = Instant::now();
-    let engine = with_spec(cfg, node.layer_range(), node.mem_cap(&cfg.engine), StreamMoeEngine::open)?;
-    info!(layers = ?node.layer_range(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "streammoe opened");
+    let engine = with_spec(cfg, layers.clone(), node.mem_cap(&cfg.engine), StreamMoeEngine::open)?;
+    info!(layers = ?layers, secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "streammoe opened");
     Ok(engine)
 }
 
@@ -261,13 +291,7 @@ fn serve<'a, E: Engine + 'static>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node = &cfg.nodes[idx];
     let name = node.name.as_str();
-    let limit = node.mem_cap(&cfg.engine).map(|cap| cap + cfg.service.mem_allowance());
-    stats::STATS.footprint_limit.store(limit.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-    memory::watch(limit, Duration::from_secs(5));
-    if let Some(addr) = &node.prometheus {
-        let listener = TcpListener::bind(addr).map_err(|e| format!("bind prometheus {addr}: {e}"))?;
-        stats::serve(listener, name.to_string(), idx == 0);
-    }
+    let limit = watch_node(cfg, idx, node.mem_cap(&cfg.engine))?;
     // Workers listen for the controller; the controller connects to each of them.
     if idx > 0 {
         let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
@@ -283,9 +307,79 @@ fn serve<'a, E: Engine + 'static>(
     info!(nodes = cfg.nodes.len(), "cluster ready");
 
     let metrics = open_metrics(cfg, flag("--metrics"))?;
+    let (client, sched) = start_scheduler(cfg, engine, star, metrics)?;
     if let (Some(codec), Some(http)) = (codec, &cfg.http) {
-        return serve_http(cfg, http, codec, engine, star, metrics);
+        return serve_http(cfg, http, codec, client);
     }
+    bench(cfg, &client, flag, limit)?;
+    client.shutdown();
+    sched.join().map_err(|_| "scheduler panicked")?;
+    Ok(())
+}
+
+/// Sets the footprint limit (`cap` plus the service allowance) and its watch, and the
+/// Prometheus endpoint; returns the limit.
+fn watch_node(cfg: &Config, idx: usize, cap: Option<u64>) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let node = &cfg.nodes[idx];
+    let limit = cap.map(|cap| cap + cfg.service.mem_allowance());
+    stats::STATS.footprint_limit.store(limit.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    memory::watch(limit, Duration::from_secs(5));
+    if let Some(addr) = &node.prometheus {
+        let listener = TcpListener::bind(addr).map_err(|e| format!("bind prometheus {addr}: {e}"))?;
+        stats::serve(listener, node.name.clone(), idx == 0);
+    }
+    Ok(limit)
+}
+
+/// The request split's controller: no engine; connects to the workers in the background and
+/// serves once at least one is ready.
+fn serve_requests<'a>(
+    cfg: &Config,
+    codec: Option<Codec>,
+    flag: &dyn Fn(&str) -> Option<&'a str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // No engine, so no cap: the service allowance is the whole limit.
+    let limit = watch_node(cfg, 0, Some(0))?;
+    if flag("--metrics").is_some() || cfg.metrics.is_some() {
+        tracing::warn!("the request split writes no per-step metrics CSV");
+    }
+    let workers = cfg.nodes.len() - 1;
+    info!(role = "controller", runs = role(cfg, 0), workers, "connecting to workers");
+    let (client, sched) = msh_node::requests::spawn(cfg)?;
+    let board = client.board().expect("request split").clone();
+    let ready = board.wait_ready(workers, CONNECT_TIMEOUT);
+    if ready == 0 {
+        return Err(format!("no worker ready after {} s", CONNECT_TIMEOUT.as_secs()).into());
+    }
+    info!(ready, workers, "cluster ready");
+    if let (Some(codec), Some(http)) = (codec, &cfg.http) {
+        return serve_http(cfg, http, codec, client);
+    }
+    bench(cfg, &client, flag, limit)?;
+    client.shutdown();
+    sched.join().map_err(|_| "scheduler panicked")?;
+    Ok(())
+}
+
+/// A request-split worker: the whole model, serving one controller after another.
+fn serve_request_worker<E: Engine>(cfg: &Config, idx: usize, engine: E) -> Result<(), Box<dyn std::error::Error>> {
+    let node = &cfg.nodes[idx];
+    let cap = node.mem_cap(&cfg.engine);
+    watch_node(cfg, idx, cap)?;
+    let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
+    info!(role = "worker", runs = role(cfg, idx), listen = node.listen_addr(), "waiting for the controller");
+    let mut worker = RequestWorker::new(engine, &node.name, cfg.scheduler.prefill_chunk, cap);
+    worker.serve_forever(cfg, idx, &listener)?;
+    Ok(())
+}
+
+/// Submits `--requests` greedy generations of `--prompt` and prints throughput.
+fn bench<'a>(
+    cfg: &Config,
+    client: &scheduler::Client,
+    flag: &dyn Fn(&str) -> Option<&'a str>,
+    limit: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let prompt: Vec<u32> = flag("--prompt")
         .unwrap_or("1,2,3,4,5,6,7,8")
         .split(',')
@@ -296,7 +390,6 @@ fn serve<'a, E: Engine + 'static>(
 
     let requests: u32 = flag("--requests").unwrap_or("1").parse().map_err(|e| format!("--requests: {e}"))?;
 
-    let (client, sched) = start_scheduler(cfg, engine, star, metrics)?;
     let t0 = Instant::now();
     let rxs: Vec<_> = (0..requests).map(|_| client.submit(prompt.clone(), max_new)).collect();
     let mut total = 0;
@@ -311,8 +404,6 @@ fn serve<'a, E: Engine + 'static>(
         }
     }
     let wall = t0.elapsed().as_secs_f64();
-    client.shutdown();
-    sched.join().map_err(|_| "scheduler panicked")?;
     decode.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p50 = decode.get(decode.len() / 2).copied().unwrap_or(f64::NAN);
     println!(
@@ -329,15 +420,12 @@ fn serve<'a, E: Engine + 'static>(
 }
 
 /// Runs the scheduler behind the HTTP API until the process is stopped.
-fn serve_http<E: Engine + 'static>(
+fn serve_http(
     cfg: &Config,
     http: &HttpConfig,
     codec: Codec,
-    engine: E,
-    star: Option<Star>,
-    metrics: Option<Metrics>,
+    client: scheduler::Client,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (client, _sched) = start_scheduler(cfg, engine, star, metrics)?;
     let state = Arc::new(HttpState::new(client, codec, http.model.clone(), cfg.engine.n_ctx, memory::http_max_open(cfg)));
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -359,6 +447,11 @@ fn open_metrics(cfg: &Config, flag: Option<&str>) -> Result<Option<Metrics>, Box
         }
         Split::Experts => {
             let mut s = vec![format!("experts {}/{}:", cfg.experts.top_k, cfg.experts.count)];
+            s.extend(cfg.nodes.iter().map(|n| n.name.clone()));
+            s
+        }
+        Split::Requests => {
+            let mut s = vec!["requests:".to_string()];
             s.extend(cfg.nodes.iter().map(|n| n.name.clone()));
             s
         }

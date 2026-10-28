@@ -12,13 +12,21 @@
 //! once, and each answers on its own link: `Experts` gets back a `Partial`. A worker holds the
 //! experts `Own` and `Move` give it and no state per request, so `Drop` and `Rewind` never
 //! reach it. The same loop serves both splits; the controller decides which frames come.
+//!
+//! With the request split a worker runs [`RequestWorker`] instead: the whole model, whole
+//! requests, and a controller that may reconnect after losing the link.
 
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::TcpListener;
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use msh_net::{decode_move, decode_own, encode_move, encode_token, Connection, FrameError, MsgType, FLAG_EVERY_TOKEN};
+use msh_net::{
+    decode_move, decode_own, decode_start, encode_done, encode_move, encode_status, encode_token, Connection,
+    DoneReason, FrameError, Header, MsgType, RunStatus, Status, FLAG_EVERY_TOKEN,
+};
 
 use crate::config::Config;
 use crate::engine::{Engine, Sample, StageIn};
@@ -236,5 +244,274 @@ impl<E: Engine> Worker<E> {
         warn!(error = %e, "{what} failed");
         let msg = format!("{}: {what}: {e}", self.name);
         Ok(self.link.send(MsgType::Error, 0, 0, msg.as_bytes())?)
+    }
+}
+
+/// What the request split's worker loop hears from the controller.
+enum FromController {
+    Start(Header, Vec<u8>),
+    Drop(u64),
+    Other(Header),
+    /// The connection ended, and why.
+    Closed(String),
+}
+
+/// A request a request-split worker runs.
+struct Run {
+    /// The prompt, then every token made.
+    tokens: Vec<u32>,
+    prompt_len: usize,
+    max_new: usize,
+    /// Positions the engine holds.
+    next_pos: usize,
+    made: usize,
+}
+
+/// Request split (`split = "requests"`): a worker running every layer and the head, serving
+/// whole requests. It interleaves the requests it holds one step at a time, round-robin: a
+/// prompt chunk of up to `prefill_chunk` positions, or one decode position. It sends each
+/// token as it is made and stops a request itself, with a `Done`, at its token limit or the
+/// end-of-sequence token; on `Drop` it frees the request and answers `Done` too. An engine
+/// error fails only its request (an `Error` frame, no `Done`). A reader thread answers every
+/// `Ping` at once with a `Pong` carrying the status report, even while a long step runs: a slow
+/// step shows as a request without progress, a frozen process as a ping not answered.
+pub struct RequestWorker<E: Engine> {
+    engine: E,
+    name: String,
+    prefill_chunk: usize,
+    cap: Option<u64>,
+    hidden: Vec<f32>,
+    out: Vec<u32>,
+    frame: Vec<u8>,
+}
+
+impl<E: Engine> RequestWorker<E> {
+    /// `cap` is reported in the status; keeping to it is the engine's job.
+    pub fn new(engine: E, name: &str, prefill_chunk: usize, cap: Option<u64>) -> Self {
+        let prefill_chunk = prefill_chunk.max(1);
+        RequestWorker { engine, name: name.into(), prefill_chunk, cap, hidden: Vec::new(), out: Vec::new(), frame: Vec::new() }
+    }
+
+    pub fn into_engine(self) -> E {
+        self.engine
+    }
+
+    /// Accepts the controller on `listener` again and again, serving each connection until it
+    /// ends: a controller that lost the link reconnects here.
+    pub fn serve_forever(&mut self, cfg: &Config, idx: usize, listener: &TcpListener) -> Result<(), Error> {
+        loop {
+            match accept_controller(cfg, idx, listener.try_clone()?) {
+                Ok(link) => {
+                    info!(controller = link.peer_name(), "connected");
+                    self.serve(link)?;
+                }
+                Err(e) => warn!(error = %e, "controller not accepted"),
+            }
+        }
+    }
+
+    /// Serves one connection until it ends, then frees every request it held.
+    pub fn serve(&mut self, link: Connection) -> Result<(), Error> {
+        let (recv, send) = link.split()?;
+        let send = Arc::new(Mutex::new(send));
+        let status = Arc::new(Mutex::new(Status { cap: self.cap.unwrap_or(0), ..Default::default() }));
+        let (tx, rx) = mpsc::channel();
+        let reader = {
+            let (send, status, span) = (send.clone(), status.clone(), tracing::Span::current());
+            thread::spawn(move || span.in_scope(|| read_controller(recv, send, status, tx)))
+        };
+        let mut running: HashMap<u64, Run> = HashMap::new();
+        let mut order: VecDeque<u64> = VecDeque::new();
+        let why = 'serve: loop {
+            // Wait while idle; between steps take whatever has come in.
+            let first = if order.is_empty() {
+                match rx.recv() {
+                    Ok(m) => Some(m),
+                    Err(_) => break 'serve "reader stopped".to_string(),
+                }
+            } else {
+                None
+            };
+            for m in first.into_iter().chain(rx.try_iter()) {
+                let sent = match m {
+                    FromController::Closed(why) => break 'serve why,
+                    FromController::Start(h, payload) => self.start(h.request_id, &payload, &mut running, &mut order, &send),
+                    FromController::Drop(id) => match running.remove(&id) {
+                        Some(r) => {
+                            debug!(state = id, made = r.made, "dropped");
+                            self.engine.free(id);
+                            order.retain(|&o| o != id);
+                            self.send_done(&send, id, r.made, DoneReason::Dropped)
+                        }
+                        // Already over: its `Done` or `Error` is on the way.
+                        None => Ok(()),
+                    },
+                    FromController::Other(h) => {
+                        let msg = format!("{}: unexpected {:?} frame on the request split", self.name, h.msg_type);
+                        warn!("{msg}");
+                        lock(&send).send(MsgType::Error, h.request_id, h.position, msg.as_bytes())
+                    }
+                };
+                if let Err(e) = sent {
+                    break 'serve format!("send: {e}");
+                }
+            }
+            if let Some(id) = order.pop_front() {
+                let r = running.get_mut(&id).expect("every queued request runs");
+                match self.step(id, r, &send) {
+                    Ok(true) => order.push_back(id),
+                    Ok(false) => {
+                        running.remove(&id);
+                        self.engine.free(id);
+                    }
+                    Err(e) => break 'serve format!("send: {e}"),
+                }
+            }
+            lock(&status).requests = order
+                .iter()
+                .map(|id| {
+                    let r = &running[id];
+                    let (position, made) = (r.next_pos as u32, r.made as u32);
+                    RunStatus { request: *id, decoding: r.next_pos >= r.prompt_len, position, made }
+                })
+                .collect();
+        };
+        info!(reason = why, freed = running.len(), "controller link ended");
+        for id in running.keys() {
+            self.engine.free(*id);
+        }
+        // The reader stops once the controller closes its side too.
+        lock(&send).close_send();
+        let _ = reader.join();
+        Ok(())
+    }
+
+    fn start(
+        &mut self,
+        id: u64,
+        payload: &[u8],
+        running: &mut HashMap<u64, Run>,
+        order: &mut VecDeque<u64>,
+        send: &Mutex<Connection>,
+    ) -> std::io::Result<()> {
+        let mut prompt = Vec::new();
+        let max_new = match decode_start(payload, &mut prompt) {
+            Err(e) => Err(format!("bad start: {e}")),
+            Ok(_) if running.contains_key(&id) => Err(format!("request {id} is already running")),
+            Ok(_) if !self.engine.has_head() => Err("this worker's engine has no head".into()),
+            Ok(n) => Ok(n as usize),
+        };
+        let max_new = match max_new {
+            Ok(n) => n,
+            Err(why) => {
+                warn!(state = id, why, "start refused");
+                let msg = format!("{}: {why}", self.name);
+                return lock(send).send(MsgType::Error, id, 0, msg.as_bytes());
+            }
+        };
+        debug!(state = id, prompt = prompt.len(), max_new, "start");
+        if max_new == 0 {
+            return self.send_done(send, id, 0, DoneReason::Length);
+        }
+        let prompt_len = prompt.len();
+        running.insert(id, Run { tokens: prompt, prompt_len, max_new, next_pos: 0, made: 0 });
+        order.push_back(id);
+        Ok(())
+    }
+
+    /// Runs one step of `r`; returns whether the request goes on.
+    fn step(&mut self, id: u64, r: &mut Run, send: &Mutex<Connection>) -> std::io::Result<bool> {
+        let start = r.next_pos;
+        let end = if start < r.prompt_len { r.prompt_len.min(start + self.prefill_chunk) } else { start + 1 };
+        let t0 = Instant::now();
+        let input = StageIn::Tokens(&r.tokens[start..end]);
+        let result = self.engine.step(id, start as u32, input, Sample::Last, &mut self.hidden, &mut self.out);
+        crate::stats::STATS.compute.observe(t0.elapsed());
+        let us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        trace!(state = id, pos = start, positions = end - start, us, "step");
+        let token = match result {
+            // A prompt chunk before the last: nothing to send.
+            Ok(()) if end < r.prompt_len => {
+                r.next_pos = end;
+                return Ok(true);
+            }
+            Ok(()) => self.out.first().copied().ok_or_else(|| Error::Engine("the engine sampled no token".into())),
+            Err(e) => Err(e),
+        };
+        let token = match token {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(state = id, pos = start, error = %e, "request failed");
+                let msg = format!("{}: {e}", self.name);
+                lock(send).send(MsgType::Error, id, start as u32, msg.as_bytes())?;
+                return Ok(false);
+            }
+        };
+        r.next_pos = end;
+        if Some(token) == self.engine.eos() {
+            self.send_done(send, id, r.made, DoneReason::Eos)?;
+            return Ok(false);
+        }
+        r.tokens.push(token);
+        r.made += 1;
+        // The token's own position in the sequence.
+        encode_token(&[token], &[us], &mut self.frame);
+        lock(send).send(MsgType::Token, id, (r.tokens.len() - 1) as u32, &self.frame)?;
+        if r.made == r.max_new {
+            self.send_done(send, id, r.made, DoneReason::Length)?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn send_done(&mut self, send: &Mutex<Connection>, id: u64, made: usize, why: DoneReason) -> std::io::Result<()> {
+        encode_done(why, &mut self.frame);
+        lock(send).send(MsgType::Done, id, made as u32, &self.frame)
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The request-split worker's reader: answers pings with the status report and passes
+/// everything else on to the worker loop.
+fn read_controller(
+    mut recv: Connection,
+    send: Arc<Mutex<Connection>>,
+    status: Arc<Mutex<Status>>,
+    tx: mpsc::Sender<FromController>,
+) {
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+    loop {
+        let h = match recv.recv_frame(&mut buf) {
+            Ok(h) => h,
+            Err(FrameError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => {
+                let _ = tx.send(FromController::Closed("the controller closed the connection".into()));
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(FromController::Closed(e.to_string()));
+                return;
+            }
+        };
+        let msg = match h.msg_type {
+            MsgType::Ping => {
+                let mut s = lock(&status).clone();
+                s.footprint = crate::memory::footprint()
+                    .unwrap_or_else(|| crate::memory::LAST_FOOTPRINT.load(std::sync::atomic::Ordering::Relaxed));
+                encode_status(&s, &mut out);
+                // A broken link also fails the worker loop's next send.
+                let _ = lock(&send).send(MsgType::Pong, h.request_id, 0, &out);
+                continue;
+            }
+            MsgType::Start => FromController::Start(h, std::mem::take(&mut buf)),
+            MsgType::Drop => FromController::Drop(h.request_id),
+            _ => FromController::Other(h),
+        };
+        if tx.send(msg).is_err() {
+            return;
+        }
     }
 }

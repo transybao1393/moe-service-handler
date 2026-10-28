@@ -2,8 +2,9 @@
 //!
 //! A controller and its workers, each running a contiguous layer range, or (`split =
 //! "experts"`) the controller running everything but the routed experts and the workers
-//! owning those. The controller talks to every worker; workers never talk to each other. Its
-//! scheduler keeps several requests in flight.
+//! owning those, or (`split = "requests"`) the controller running no engine and each worker
+//! the whole model for whole requests. The controller talks to every worker; workers never talk
+//! to each other. Its scheduler keeps several requests in flight.
 
 pub mod chat;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod streammoe_engine;
 pub mod node;
 pub mod owners;
 pub mod planner;
+pub mod requests;
 pub mod scheduler;
 pub mod stats;
 

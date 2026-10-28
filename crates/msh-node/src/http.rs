@@ -3,6 +3,15 @@
 //! - `GET /v1/models`
 //! - `POST /v1/chat/completions`, with `stream: true` for server-sent events.
 //!
+//! On the request split (docs/request-split.md), worker management, all JSON:
+//!
+//! - `GET /v1/workers`: every worker's row of the table; `GET /v1/workers/{name}`: one.
+//! - `GET /v1/requests`: requests in flight and queued.
+//! - `POST /v1/workers/{name}/drain` and `/resume`: stop or restart new requests to a worker.
+//! - `POST /v1/requests/{id}/cancel`: cancel one request (`7` or `chatcmpl-7`).
+//!
+//! An unknown worker or request gets 404, and so does all of it on the other splits.
+//!
 //! Sampling is greedy; `temperature`, `top_p` and other sampling fields are accepted and
 //! ignored. A request the scheduler refuses maps to 429 (queue full) or 503 (cluster down or
 //! shutting down). Closing a streaming connection cancels the request. A completion's id is
@@ -15,7 +24,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::middleware::{self, Next};
@@ -51,6 +60,12 @@ pub fn router(state: Arc<HttpState>) -> Router {
     Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/workers", get(workers))
+        .route("/v1/workers/{name}", get(worker))
+        .route("/v1/workers/{name}/drain", post(drain))
+        .route("/v1/workers/{name}/resume", post(resume))
+        .route("/v1/requests", get(requests))
+        .route("/v1/requests/{id}/cancel", post(cancel))
         .layer(middleware::from_fn_with_state(state.clone(), limit_open))
         .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT))
         .with_state(state)
@@ -79,6 +94,68 @@ async fn models(State(s): State<Arc<HttpState>>) -> Json<Value> {
         "object": "list",
         "data": [{ "id": s.model, "object": "model", "created": 0, "owned_by": "moe-service-handler" }],
     }))
+}
+
+/// The request split's worker table, or 404 on the other splits.
+fn board(s: &HttpState) -> Result<&crate::requests::Board, Response> {
+    s.client
+        .board()
+        .map(|b| &**b)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "worker management needs split = \"requests\""))
+}
+
+fn found<T: serde::Serialize>(r: Result<T, String>) -> Response {
+    match r {
+        Ok(v) => Json(v).into_response(),
+        Err(m) => error(StatusCode::NOT_FOUND, &m),
+    }
+}
+
+async fn workers(State(s): State<Arc<HttpState>>) -> Response {
+    match board(&s) {
+        Ok(b) => Json(json!({ "ready": b.ready(), "workers": b.workers() })).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn worker(State(s): State<Arc<HttpState>>, Path(name): Path<String>) -> Response {
+    match board(&s) {
+        Ok(b) => found(b.worker(&name).ok_or_else(|| format!("no worker named {name}"))),
+        Err(r) => r,
+    }
+}
+
+async fn drain(State(s): State<Arc<HttpState>>, Path(name): Path<String>) -> Response {
+    match board(&s) {
+        Ok(b) => found(b.drain(&name)),
+        Err(r) => r,
+    }
+}
+
+async fn resume(State(s): State<Arc<HttpState>>, Path(name): Path<String>) -> Response {
+    match board(&s) {
+        Ok(b) => found(b.resume(&name)),
+        Err(r) => r,
+    }
+}
+
+async fn requests(State(s): State<Arc<HttpState>>) -> Response {
+    match board(&s) {
+        Ok(b) => Json(json!({ "requests": b.requests() })).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// Takes the request id as the logs and completions show it: `7` or `chatcmpl-7`.
+async fn cancel(State(s): State<Arc<HttpState>>, Path(id): Path<String>) -> Response {
+    let b = match board(&s) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match id.strip_prefix("chatcmpl-").unwrap_or(&id).parse::<u64>() {
+        Ok(n) => found(b.cancel(n).map(|r| json!({ "cancelled": r }))),
+        Err(_) => bad_request(&format!("bad request id {id:?}")),
+    }
 }
 
 async fn chat_completions(State(s): State<Arc<HttpState>>, Json(req): Json<ChatRequest>) -> Response {

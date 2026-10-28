@@ -4,12 +4,14 @@
 //! Every node reports its compute time per step and its memory footprint. The coordinator also
 //! reports requests by outcome, tokens, time to first token, round trip per decode step,
 //! drafts, prefix reuse and the health ping's trip through the workers. The per-step CSV (CL-10) stays the
-//! source for detailed analysis; these are for watching a running cluster.
+//! source for detailed analysis; these are for watching a running cluster. On the request split
+//! the coordinator adds per-worker series labelled `worker="NAME"` ([`render_workers`]).
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -98,6 +100,63 @@ pub static STATS: Stats = Stats {
     footprint_limit: AtomicU64::new(0),
 };
 
+/// One worker's series on the request split, labelled `worker="NAME"`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkerSeries {
+    pub name: String,
+    /// `connecting`, `ready`, `draining`, `stuck` or `down`.
+    pub state: &'static str,
+    pub running: usize,
+    pub tokens_per_s: f64,
+    /// Last health ping's round trip; `None` before the first.
+    pub ping_s: Option<f64>,
+    pub footprint: u64,
+    pub cap: u64,
+    pub done: u64,
+    pub failed: u64,
+}
+
+pub const WORKER_STATES: [&str; 5] = ["connecting", "ready", "draining", "stuck", "down"];
+
+/// The request split's workers, as its scheduler last saw them; empty on the other splits.
+pub static WORKERS: Mutex<Vec<WorkerSeries>> = Mutex::new(Vec::new());
+
+/// The per-worker series (request split) in the Prometheus text format; nothing without
+/// workers.
+pub fn render_workers(node: &str, workers: &[WorkerSeries]) -> String {
+    let mut out = String::new();
+    if workers.is_empty() {
+        return out;
+    }
+    let mut metric = |name: &str, kind: &str, help: &str, value: &dyn Fn(&WorkerSeries) -> Vec<(String, f64)>| {
+        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
+        for w in workers {
+            for (labels, v) in value(w) {
+                let _ = writeln!(out, "{name}{{node=\"{node}\",worker=\"{}\"{labels}}} {v}", w.name);
+            }
+        }
+    };
+    let one = |v: f64| vec![(String::new(), v)];
+    metric("msh_worker_state", "gauge", "1 for the worker's state, 0 for the others.", &|w| {
+        WORKER_STATES.iter().map(|s| (format!(",state=\"{s}\""), (w.state == *s) as u8 as f64)).collect()
+    });
+    metric("msh_worker_requests", "gauge", "Requests running on the worker.", &|w| one(w.running as f64));
+    metric("msh_worker_tokens_per_second", "gauge", "Tokens the worker made per second, recently.", &|w| {
+        one(w.tokens_per_s)
+    });
+    metric("msh_worker_ping_rtt_seconds", "gauge", "Last health ping's round trip to the worker.", &|w| {
+        w.ping_s.map(one).unwrap_or_default()
+    });
+    metric("msh_worker_footprint_bytes", "gauge", "The worker's footprint from its status report.", &|w| {
+        one(w.footprint as f64)
+    });
+    metric("msh_worker_cap_bytes", "gauge", "The worker's memory cap; 0 without one.", &|w| one(w.cap as f64));
+    metric("msh_worker_requests_total", "counter", "Requests the worker finished, by outcome.", &|w| {
+        vec![(",outcome=\"done\"".into(), w.done as f64), (",outcome=\"failed\"".into(), w.failed as f64)]
+    });
+    out
+}
+
 /// The Prometheus text format for this node.
 pub fn render(node: &str, coordinator: bool) -> String {
     let s = &STATS;
@@ -142,6 +201,8 @@ pub fn render(node: &str, coordinator: bool) -> String {
         metric("msh_ping_rtt_seconds", "gauge", "Last health ping's trip through every worker.", &[("", rtt)]);
         histogram(&mut out, &l, "msh_time_to_first_token_seconds", "From submission to the first token.", &s.time_to_first_token);
         histogram(&mut out, &l, "msh_decode_step_seconds", "Decode step round trip through the workers.", &s.decode_step);
+        let workers = WORKERS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        out += &render_workers(node, &workers);
     }
     histogram(&mut out, &l, "msh_compute_seconds", "This node's compute per step.", &s.compute);
     out
@@ -215,6 +276,40 @@ mod tests {
         assert!(out.contains("x_seconds_bucket{node=\"t\",le=\"10\"} 2\n"));
         assert!(out.contains("x_seconds_bucket{node=\"t\",le=\"+Inf\"} 3\n"));
         assert!(out.contains("x_seconds_count{node=\"t\"} 3\n"));
+    }
+
+    #[test]
+    fn worker_series_carry_the_worker_label() {
+        assert_eq!(render_workers("m4", &[]), "");
+        let w = |name: &str, state, ping_s| WorkerSeries {
+            name: name.into(),
+            state,
+            running: 2,
+            tokens_per_s: 11.5,
+            ping_s,
+            footprint: 7 << 30,
+            cap: 6 << 30,
+            done: 9,
+            failed: 1,
+        };
+        let out = render_workers("m4", &[w("m1", "ready", Some(0.002)), w("m4b", "stuck", None)]);
+        for line in [
+            "msh_worker_state{node=\"m4\",worker=\"m1\",state=\"ready\"} 1\n",
+            "msh_worker_state{node=\"m4\",worker=\"m1\",state=\"stuck\"} 0\n",
+            "msh_worker_state{node=\"m4\",worker=\"m4b\",state=\"stuck\"} 1\n",
+            "msh_worker_requests{node=\"m4\",worker=\"m1\"} 2\n",
+            "msh_worker_tokens_per_second{node=\"m4\",worker=\"m4b\"} 11.5\n",
+            "msh_worker_ping_rtt_seconds{node=\"m4\",worker=\"m1\"} 0.002\n",
+            "msh_worker_footprint_bytes{node=\"m4\",worker=\"m1\"} 7516192768\n",
+            "msh_worker_cap_bytes{node=\"m4\",worker=\"m1\"} 6442450944\n",
+            "msh_worker_requests_total{node=\"m4\",worker=\"m1\",outcome=\"done\"} 9\n",
+            "msh_worker_requests_total{node=\"m4\",worker=\"m4b\",outcome=\"failed\"} 1\n",
+        ] {
+            assert!(out.contains(line), "{line} missing from\n{out}");
+        }
+        // No ping back yet: no round trip to report.
+        assert!(!out.contains("msh_worker_ping_rtt_seconds{node=\"m4\",worker=\"m4b\"}"));
+        assert_eq!(out.matches("# TYPE msh_worker_state gauge").count(), 1);
     }
 
     #[test]

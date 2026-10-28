@@ -14,7 +14,8 @@ pub mod probe;
 
 pub use conn::Connection;
 pub use frame::{
-    decode_experts, decode_hidden, decode_move, decode_own, decode_partial, decode_token, encode_experts,
-    encode_hidden, encode_move, encode_own, encode_partial, encode_token, FrameError, Header, MsgType, Pick,
-    FLAG_EVERY_TOKEN, PROTOCOL_VERSION,
+    decode_done, decode_experts, decode_hidden, decode_move, decode_own, decode_partial, decode_start,
+    decode_status, decode_token, encode_done, encode_experts, encode_hidden, encode_move, encode_own,
+    encode_partial, encode_start, encode_status, encode_token, DoneReason, FrameError, Header, MsgType, Pick,
+    RunStatus, Status, FLAG_EVERY_TOKEN, PROTOCOL_VERSION,
 };

@@ -83,6 +83,19 @@ async fn completion_and_stream_produce_the_same_text() {
 }
 
 #[tokio::test]
+async fn worker_management_is_only_on_the_request_split() {
+    // Request split endpoints: tests/requests.rs.
+    let app = app(SchedulerConfig::default(), 256);
+    for (method, path) in [("GET", "/v1/workers"), ("GET", "/v1/requests"), ("POST", "/v1/workers/n1/drain"), ("POST", "/v1/requests/1/cancel")] {
+        let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(body.contains("split = \\\"requests\\\""), "{body}");
+    }
+}
+
+#[tokio::test]
 async fn refuses_requests_that_do_not_fit_the_context() {
     let app = app(SchedulerConfig::default(), 16);
     let (status, body) = post(&app, chat(100, false)).await;
