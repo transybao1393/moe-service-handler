@@ -1,6 +1,5 @@
 //! The HTTP API over a one-node mock cluster, with a tiny word-level tokenizer.
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -32,7 +31,7 @@ fn codec() -> Codec {
 fn app(sched: SchedulerConfig, n_ctx: usize) -> Router {
     let engine = MockEngine::new(0..4, 4, 64).with_vocab(VOCAB);
     let (client, _) = scheduler::spawn(engine, None, sched);
-    router(Arc::new(HttpState { client, codec: codec(), model: "mock".into(), n_ctx, next_id: AtomicU64::new(1) }))
+    router(Arc::new(HttpState { client, codec: codec(), model: "mock".into(), n_ctx }))
 }
 
 async fn post(app: &Router, body: Value) -> (StatusCode, String) {
@@ -64,6 +63,8 @@ async fn completion_and_stream_produce_the_same_text() {
     let (status, body) = post(&app, chat(12, false)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let full: Value = serde_json::from_str(&body).unwrap();
+    // The scheduler's request id, as in the coordinator's logs.
+    assert_eq!(full["id"], "chatcmpl-1");
     assert_eq!(full["usage"]["completion_tokens"], 12);
     assert_eq!(full["choices"][0]["finish_reason"], "length");
     let text = full["choices"][0]["message"]["content"].as_str().unwrap().to_string();
@@ -78,6 +79,7 @@ async fn completion_and_stream_produce_the_same_text() {
     // Word-level pieces after the first carry a leading space; the joined text is the same.
     assert_eq!(streamed.trim(), text.trim());
     assert_eq!(chunks.last().unwrap()["choices"][0]["finish_reason"], "length");
+    assert!(chunks.iter().all(|c| c["id"] == "chatcmpl-2"));
 }
 
 #[tokio::test]

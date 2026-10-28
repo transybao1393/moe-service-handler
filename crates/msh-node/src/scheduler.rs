@@ -26,6 +26,11 @@
 //! [`Client`] and receive their tokens as [`Event`]s on their own channel; dropping that channel
 //! cancels the request.
 //!
+//! Logs (NF-5): every line about a request carries `request`, the id the [`Client`] gave it,
+//! and `ring`, the id its state has on the nodes and in frames, metrics rows and worker logs.
+//! The two differ only when a request continues a parked one. Lifecycle lines are `info`,
+//! per-step lines `debug`.
+//!
 //! Health (CL-8): every `health_interval_ms` the scheduler sends a `Ping` round the ring. If it
 //! has not come back within `health_timeout_ms`, or a connection breaks, the ring is down:
 //! in-flight requests fail and new ones are rejected until the cluster is restarted. The ping
@@ -33,6 +38,7 @@
 //! prefill chunks included.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -40,6 +46,7 @@ use std::time::{Duration, Instant};
 
 use msh_net::{decode_token, encode_hidden, Connection, Header, MsgType, FLAG_EVERY_TOKEN};
 use serde::Deserialize;
+use tracing::{debug, error, info, warn};
 
 use crate::draft::{Drafter, PromptLookup};
 use crate::engine::{Engine, Sample, StageIn};
@@ -114,7 +121,7 @@ pub struct Generation {
 }
 
 enum Msg {
-    Submit { prompt: Vec<u32>, max_new: usize, events: Sender<Event> },
+    Submit { id: u64, prompt: Vec<u32>, max_new: usize, events: Sender<Event> },
     Frame(Header, Vec<u8>),
     RingDown(String),
     Shutdown,
@@ -129,6 +136,7 @@ pub struct Client {
 
 struct ClientInner {
     tx: Sender<Msg>,
+    next_id: AtomicU64,
 }
 
 impl Drop for ClientInner {
@@ -140,12 +148,19 @@ impl Drop for ClientInner {
 impl Client {
     /// Queues a request for greedy generation of up to `max_new` tokens.
     pub fn submit(&self, prompt: Vec<u32>, max_new: usize) -> Receiver<Event> {
+        self.submit_with_id(prompt, max_new).1
+    }
+
+    /// [`Client::submit`], also returning the request id used in logs. Ids count up from 1 in
+    /// submission order.
+    pub fn submit_with_id(&self, prompt: Vec<u32>, max_new: usize) -> (u64, Receiver<Event>) {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (events, rx) = mpsc::channel();
-        let msg = Msg::Submit { prompt, max_new, events: events.clone() };
+        let msg = Msg::Submit { id, prompt, max_new, events: events.clone() };
         if self.inner.tx.send(msg).is_err() {
             let _ = events.send(Event::Rejected("scheduler stopped".into()));
         }
-        rx
+        (id, rx)
     }
 
     /// Submits and waits for the whole generation.
@@ -194,14 +209,17 @@ pub fn spawn_with_metrics<E: Engine + 'static>(
     metrics: Option<Metrics>,
 ) -> (Client, JoinHandle<E>) {
     let (tx, rx) = mpsc::channel();
+    // The threads log inside the caller's span (the node's name).
+    let span = tracing::Span::current();
     let next = ring.map(|Ring { prev, next }| {
         let tx = tx.clone();
-        thread::spawn(move || read_ring(prev, tx));
+        let span = span.clone();
+        thread::spawn(move || span.in_scope(|| read_ring(prev, tx)));
         next
     });
     let mut cfg = cfg;
     if cfg.max_draft > 0 && !engine.can_speculate() {
-        eprintln!("scheduler: the engine cannot verify and rewind draft tokens; speculative decoding is off");
+        warn!("the engine cannot verify and rewind draft tokens; speculative decoding is off");
         cfg.max_draft = 0;
     }
     let drafter = PromptLookup { min_ngram: cfg.draft_min_ngram, max_ngram: cfg.draft_min_ngram.max(8) };
@@ -215,7 +233,6 @@ pub fn spawn_with_metrics<E: Engine + 'static>(
         input: Vec::new(),
         tokens: Vec::new(),
         buf: Vec::new(),
-        next_id: 1,
         waiting: VecDeque::new(),
         active: HashMap::new(),
         ready: VecDeque::new(),
@@ -229,7 +246,8 @@ pub fn spawn_with_metrics<E: Engine + 'static>(
         metrics,
         stages: Vec::new(),
     };
-    (Client { inner: Arc::new(ClientInner { tx }) }, thread::spawn(move || s.run()))
+    let client = Client { inner: Arc::new(ClientInner { tx, next_id: AtomicU64::new(1) }) };
+    (client, thread::spawn(move || span.in_scope(|| s.run())))
 }
 
 fn read_ring(mut prev: Connection, tx: Sender<Msg>) {
@@ -259,6 +277,8 @@ struct Step {
 }
 
 struct Request {
+    /// The client's id for the request; the map key is its ring id.
+    id: u64,
     /// The prompt, then every generated token.
     tokens: Vec<u32>,
     prompt_len: usize,
@@ -283,7 +303,10 @@ struct Request {
 
 /// A finished request whose state stays on every node.
 struct Parked {
+    /// Ring id.
     id: u64,
+    /// Client id of the request that left it.
+    request: u64,
     /// The positions the engines hold.
     tokens: Vec<u32>,
 }
@@ -322,7 +345,7 @@ struct Scheduler<E: Engine> {
     input: Vec<u32>,
     tokens: Vec<u32>,
     buf: Vec<u8>,
-    next_id: u64,
+    /// Keyed by client id until admitted; the ring id is chosen then.
     waiting: VecDeque<(u64, Request)>,
     active: HashMap<u64, Request>,
     ready: VecDeque<u64>,
@@ -401,12 +424,14 @@ impl<E: Engine> Scheduler<E> {
 
     fn handle(&mut self, m: Msg) {
         match m {
-            Msg::Submit { prompt, max_new, events } => self.submit(prompt, max_new, events),
+            Msg::Submit { id, prompt, max_new, events } => self.submit(id, prompt, max_new, events),
             Msg::Frame(h, payload) => self.on_frame(h, payload),
             Msg::RingDown(reason) => self.ring_down(reason),
             Msg::Shutdown => {
                 self.shutting_down = true;
+                info!(active = self.active.len(), waiting = self.waiting.len(), "shutting down");
                 for (_, r) in self.waiting.drain(..) {
+                    info!(request = r.id, "rejected: shutting down");
                     let _ = r.events.send(Event::Rejected("shutting down".into()));
                 }
                 while let Some(p) = self.parked.pop_front() {
@@ -416,7 +441,7 @@ impl<E: Engine> Scheduler<E> {
         }
     }
 
-    fn submit(&mut self, prompt: Vec<u32>, max_new: usize, events: Sender<Event>) {
+    fn submit(&mut self, id: u64, prompt: Vec<u32>, max_new: usize, events: Sender<Event>) {
         let reject = if let Some(reason) = &self.down {
             Some(format!("ring down: {reason}"))
         } else if self.shutting_down {
@@ -429,6 +454,7 @@ impl<E: Engine> Scheduler<E> {
             None
         };
         if let Some(reason) = reject {
+            warn!(request = id, prompt = prompt.len(), reason, "rejected");
             let _ = events.send(Event::Rejected(reason));
             return;
         }
@@ -436,9 +462,9 @@ impl<E: Engine> Scheduler<E> {
             let _ = events.send(Event::Done);
             return;
         }
-        let id = self.next_id;
-        self.next_id += 1;
+        debug!(request = id, prompt = prompt.len(), max_new, waiting = self.waiting.len(), "queued");
         let r = Request {
+            id,
             prompt_len: prompt.len(),
             tokens: prompt,
             max_new,
@@ -457,6 +483,7 @@ impl<E: Engine> Scheduler<E> {
     fn admit(&mut self) {
         while self.active.len() < self.cfg.max_in_flight.max(1) {
             let Some((mut id, mut r)) = self.waiting.pop_front() else { break };
+            let mut continues = None;
             r.queued = r.submitted.elapsed();
             // Continue the longest finished request this prompt extends; at least one prompt
             // token must be left to step.
@@ -470,7 +497,20 @@ impl<E: Engine> Scheduler<E> {
                 id = p.id;
                 r.next_pos = p.tokens.len();
                 r.cached = p.tokens.len();
+                continues = Some(p.request);
             }
+            // Otherwise the ring id is the client id. A continued request keeps an older
+            // client's id, which no later request can have, so ring ids never clash.
+            info!(
+                request = r.id,
+                ring = id,
+                prompt = r.prompt_len,
+                max_new = r.max_new,
+                cached = r.cached,
+                continues,
+                queued_ms = r.queued.as_millis() as u64,
+                "started"
+            );
             self.active.insert(id, r);
             self.ready.push_back(id);
         }
@@ -499,6 +539,7 @@ impl<E: Engine> Scheduler<E> {
         if let Err(e) = self.engine.step(id, start as u32, input, sample, &mut self.hidden, &mut self.tokens) {
             return self.finish(id, Event::Failed(e.to_string()));
         }
+        debug!(request = r.id, ring = id, pos = start, positions = self.input.len(), drafted = drafts.len(), "step sent");
         let coord_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
         let positions = self.input.len() as u32;
         r.next_pos += positions as usize;
@@ -588,6 +629,23 @@ impl<E: Engine> Scheduler<E> {
         };
         // Drafts the head agrees with: tokens[i] is the head's token after draft i - 1.
         let accepted = step.drafts.iter().zip(tokens).take_while(|(d, t)| d == t).count();
+        let step_us = step.started.elapsed().as_micros() as u64;
+        debug!(
+            request = r.id,
+            ring = id,
+            pos = step.start,
+            positions = step.positions,
+            kind = kind.as_str(),
+            drafted = step.drafts.len(),
+            accepted,
+            step_us,
+            stage_us = ?self.stages,
+            "step back"
+        );
+        if kind == StepKind::FirstToken {
+            let ttft = r.submitted.elapsed();
+            info!(request = r.id, ring = id, ttft_ms = ttft.as_millis() as u64, "first token");
+        }
         if let Some(m) = &mut self.metrics {
             let rec = StepRecord {
                 request: id,
@@ -595,7 +653,7 @@ impl<E: Engine> Scheduler<E> {
                 positions: step.positions,
                 kind,
                 tokens: &tokens[..=accepted],
-                step_us: step.started.elapsed().as_micros() as u64,
+                step_us,
                 stage_us: &self.stages,
                 queue_us: r.queued.as_micros() as u64,
                 in_flight,
@@ -605,7 +663,7 @@ impl<E: Engine> Scheduler<E> {
                 accepted: accepted as u32,
             };
             if let Err(e) = m.record(&rec) {
-                eprintln!("metrics: {e}; no more rows will be written");
+                error!(error = %e, "metrics: no more rows will be written");
                 self.metrics = None;
             }
         }
@@ -626,6 +684,7 @@ impl<E: Engine> Scheduler<E> {
             let ev = Event::Token { token, latency: step.started.elapsed() };
             if r.events.send(ev).is_err() {
                 // The client went away: cancel. Nobody is listening for the outcome.
+                info!(request = r.id, ring = id, generated = r.generated(), "cancelled by the client");
                 return self.finish(id, Event::Done);
             }
             if r.generated() == r.max_new {
@@ -655,7 +714,22 @@ impl<E: Engine> Scheduler<E> {
     /// request that finished well is parked instead when prefix reuse is on.
     fn finish(&mut self, id: u64, outcome: Event) {
         if let Some(Err(e)) = self.metrics.as_mut().map(Metrics::flush) {
-            eprintln!("metrics: {e}");
+            error!(error = %e, "metrics flush");
+        }
+        if let Some(r) = self.active.get(&id) {
+            let elapsed = r.submitted.elapsed();
+            let generated = r.generated();
+            match &outcome {
+                Event::Failed(e) => warn!(request = r.id, ring = id, generated, error = %e, "failed"),
+                _ => info!(
+                    request = r.id,
+                    ring = id,
+                    generated,
+                    ms = elapsed.as_millis() as u64,
+                    tok_s = (generated as f64 / elapsed.as_secs_f64() * 10.0).round() / 10.0,
+                    "done"
+                ),
+            }
         }
         self.ready.retain(|&r| r != id);
         let park = self.cfg.prefix_cache > 0
@@ -666,7 +740,8 @@ impl<E: Engine> Scheduler<E> {
             let mut r = self.active.remove(&id).unwrap();
             r.tokens.truncate(r.next_pos);
             let _ = r.events.send(outcome);
-            self.parked.push_back(Parked { id, tokens: r.tokens });
+            debug!(request = r.id, ring = id, positions = r.tokens.len(), "parked");
+            self.parked.push_back(Parked { id, request: r.id, tokens: r.tokens });
             if self.parked.len() > self.cfg.prefix_cache {
                 let oldest = self.parked.pop_front().unwrap();
                 self.evict(oldest);
@@ -692,6 +767,7 @@ impl<E: Engine> Scheduler<E> {
     /// Frees a parked request on every node. Its `Drop` comes back to no active request and is
     /// ignored; any later step for a request reusing the slot follows it on the same links.
     fn evict(&mut self, p: Parked) {
+        debug!(request = p.request, ring = p.id, "dropping parked state");
         self.engine.free(p.id);
         if let Some(next) = &mut self.next {
             if let Err(e) = next.send(MsgType::Drop, p.id, 0, &[]) {
@@ -707,8 +783,10 @@ impl<E: Engine> Scheduler<E> {
         if self.down.is_some() {
             return;
         }
+        error!(reason, active = self.active.len(), waiting = self.waiting.len(), "ring down");
         let failed = format!("ring down: {reason}");
         for (id, r) in self.active.drain() {
+            warn!(request = r.id, ring = id, generated = r.generated(), "failed: ring down");
             self.engine.free(id);
             let ev = match r.freeing {
                 Some(outcome @ Event::Done) => outcome,
@@ -717,6 +795,7 @@ impl<E: Engine> Scheduler<E> {
             let _ = r.events.send(ev);
         }
         for (_, r) in self.waiting.drain(..) {
+            warn!(request = r.id, "failed: ring down");
             let _ = r.events.send(Event::Failed(failed.clone()));
         }
         for p in self.parked.drain(..) {

@@ -5,10 +5,10 @@
 //!
 //! Sampling is greedy; `temperature`, `top_p` and other sampling fields are accepted and
 //! ignored. A request the scheduler refuses maps to 429 (queue full) or 503 (ring down or
-//! shutting down). Closing a streaming connection cancels the request.
+//! shutting down). Closing a streaming connection cancels the request. A completion's id is
+//! `chatcmpl-<request id>`, the id in the coordinator's logs.
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,7 +33,6 @@ pub struct HttpState {
     pub model: String,
     /// Context length: prompt plus completion must fit.
     pub n_ctx: usize,
-    pub next_id: AtomicU64,
 }
 
 pub fn router(state: Arc<HttpState>) -> Router {
@@ -62,32 +61,34 @@ async fn models(State(s): State<Arc<HttpState>>) -> Json<Value> {
 async fn chat_completions(State(s): State<Arc<HttpState>>, Json(req): Json<ChatRequest>) -> Response {
     let prompt = match s.codec.encode_chat(&req.messages) {
         Ok(p) if !p.is_empty() => p,
-        Ok(_) => return error(StatusCode::BAD_REQUEST, "empty prompt"),
-        Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
+        Ok(_) => return bad_request("empty prompt"),
+        Err(e) => return bad_request(&e.to_string()),
     };
     let room = s.n_ctx.saturating_sub(prompt.len());
     if room == 0 {
         let msg = format!("prompt of {} tokens fills the {}-token context", prompt.len(), s.n_ctx);
-        return error(StatusCode::BAD_REQUEST, &msg);
+        return bad_request(&msg);
     }
     let max_new = match req.max_completion_tokens.or(req.max_tokens) {
         Some(n) if n > room => {
             let msg = format!("prompt ({}) plus max_tokens ({n}) exceeds the {}-token context", prompt.len(), s.n_ctx);
-            return error(StatusCode::BAD_REQUEST, &msg);
+            return bad_request(&msg);
         }
         Some(n) => n,
         None => room,
     };
 
     let prompt_tokens = prompt.len();
-    let mut events = forward(s.client.submit(prompt, max_new));
+    let (request, rx) = s.client.submit_with_id(prompt, max_new);
+    tracing::info!(request, prompt = prompt_tokens, max_new, stream = req.stream, "chat completion");
+    let mut events = forward(rx);
     // Wait for the first event so a refused request gets a proper status, even when streaming.
     let first = match events.recv().await {
         Some(Event::Rejected(m) | Event::Failed(m)) => return error(status_for(&m), &m),
         Some(ev) => ev,
         None => return error(StatusCode::SERVICE_UNAVAILABLE, "scheduler stopped"),
     };
-    let id = format!("chatcmpl-{}", s.next_id.fetch_add(1, Ordering::Relaxed));
+    let id = format!("chatcmpl-{request}");
     if req.stream {
         stream(s, id, first, events, max_new).into_response()
     } else {
@@ -228,6 +229,11 @@ fn status_for(msg: &str) -> StatusCode {
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     }
+}
+
+fn bad_request(msg: &str) -> Response {
+    tracing::info!(error = msg, "chat completion refused");
+    error(StatusCode::BAD_REQUEST, msg)
 }
 
 fn error(status: StatusCode, msg: &str) -> Response {

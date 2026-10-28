@@ -22,11 +22,11 @@ use std::ops::Range;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use msh_node::chat::Codec;
-use msh_node::config::{expand_home, Config, EngineKind, HttpConfig};
+use msh_node::config::{expand_home, Config, EngineKind, HttpConfig, LogConfig};
+use tracing::info;
 use msh_node::http::{self, HttpState};
 use msh_node::metrics::{Metrics, RunInfo};
 use msh_node::node::Ring;
@@ -34,6 +34,26 @@ use msh_node::engine::{Engine, MockEngine};
 use msh_node::node::{join_ring, Worker};
 use msh_node::planner;
 use msh_node::scheduler::{self, collect};
+
+/// Logs to stderr (NF-5): `RUST_LOG` if set, else `[log] level`.
+fn init_logs(cfg: &LogConfig) -> Result<(), Box<dyn std::error::Error>> {
+    use tracing_subscriber::EnvFilter;
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(f) => EnvFilter::try_new(f)?,
+        Err(_) => EnvFilter::try_new(&cfg.level).map_err(|e| format!("[log] level {:?}: {e}", cfg.level))?,
+    };
+    use std::io::IsTerminal;
+    let logs = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal());
+    if cfg.json {
+        logs.json().init();
+    } else {
+        logs.init();
+    }
+    Ok(())
+}
 
 const RING_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -62,6 +82,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let path = flag("--config").ok_or(usage)?;
     let mut cfg = Config::parse(&std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?)?;
+    init_logs(&cfg.log)?;
     let print_plan = args.iter().any(|a| a == "--plan");
     plan_split(&mut cfg, print_plan)?;
     if print_plan {
@@ -69,6 +90,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let name = flag("--node").ok_or(usage)?;
     let idx = cfg.index_of(name)?;
+    // Every log line of this process, on every thread, names the node.
+    let _span = tracing::info_span!("node", node = name).entered();
     let node = &cfg.nodes[idx];
     // Open the engine before joining the ring, so a range that does not fit fails here (DEP-4).
     match cfg.engine.kind {
@@ -116,7 +139,7 @@ const GIB: f64 = (1u64 << 30) as f64;
 
 fn show_split(cfg: &Config, source: &str, print: bool, budget: impl Fn(usize) -> Option<String>) {
     let split: Vec<String> = cfg.nodes.iter().map(|n| format!("{}:{:?}", n.name, n.layer_range())).collect();
-    eprintln!("split from {source}: {}", split.join(" "));
+    info!(source, split = split.join(" "), "layer split");
     if !print {
         return;
     }
@@ -166,7 +189,7 @@ fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box
     let node = &cfg.nodes[idx];
     let t0 = Instant::now();
     let engine = with_spec(cfg, node.layer_range(), node.mem_cap(&cfg.engine), StreamMoeEngine::open)?;
-    eprintln!("{}: streammoe opened layers {:?} in {:.1} s", node.name, node.layer_range(), t0.elapsed().as_secs_f64());
+    info!(layers = ?node.layer_range(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "streammoe opened");
     Ok(engine)
 }
 
@@ -185,13 +208,13 @@ fn serve<'a, E: Engine + 'static>(
     let name = node.name.as_str();
     let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
     let role = if idx == 0 { "coordinator" } else { "worker" };
-    eprintln!("{name}: {role}, layers {:?}, listening on {}", node.layer_range(), node.listen_addr());
+    info!(role, layers = ?node.layer_range(), listen = node.listen_addr(), "listening");
     let ring = join_ring(&cfg, idx, listener, RING_TIMEOUT)?;
-    eprintln!("{name}: ring ready ({} nodes)", cfg.nodes.len());
+    info!(nodes = cfg.nodes.len(), "ring ready");
 
     if idx > 0 {
         Worker::new(engine, ring.expect("multi-node ring"), name).run()?;
-        eprintln!("{name}: coordinator disconnected, exiting");
+        info!("coordinator disconnected, exiting");
         return Ok(());
     }
 
@@ -252,12 +275,11 @@ fn serve_http<E: Engine + 'static>(
         codec,
         model: http.model.clone(),
         n_ctx: cfg.engine.n_ctx,
-        next_id: AtomicU64::new(1),
     });
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&http.listen).await.map_err(|e| format!("bind {}: {e}", http.listen))?;
-        eprintln!("{}: serving {} on http://{}/v1", cfg.nodes[0].name, http.model, http.listen);
+        info!(model = http.model, url = format!("http://{}/v1", http.listen), "serving");
         axum::serve(listener, http::router(state)).await?;
         Ok(())
     })
@@ -284,6 +306,6 @@ fn open_metrics(cfg: &Config, flag: Option<&str>) -> Result<Option<Metrics>, Box
     };
     let path = expand_home(&path);
     let m = Metrics::create(&path, &run).map_err(|e| format!("metrics {}: {e}", path.display()))?;
-    eprintln!("{}: writing metrics to {}", cfg.nodes[0].name, path.display());
+    info!(path = %path.display(), "writing metrics");
     Ok(Some(m))
 }

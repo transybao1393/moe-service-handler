@@ -37,6 +37,16 @@ pub enum StepKind {
     Decode,
 }
 
+impl StepKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StepKind::Prefill => "prefill",
+            StepKind::FirstToken => "first_token",
+            StepKind::Decode => "decode",
+        }
+    }
+}
+
 pub struct StepRecord<'a> {
     pub request: u64,
     /// First position of the step.
@@ -96,11 +106,7 @@ impl Metrics {
         let compute: u64 = r.stage_us.iter().map(|&t| t as u64).sum();
         let coord = r.stage_us.first().copied().unwrap_or(0) as u64;
         let stages: Vec<String> = r.stage_us.iter().map(u32::to_string).collect();
-        let kind = match r.kind {
-            StepKind::Prefill => "prefill",
-            StepKind::FirstToken => "first_token",
-            StepKind::Decode => "decode",
-        };
+        let kind = r.kind.as_str();
         let tokens = match r.kind {
             StepKind::Prefill => String::new(),
             _ => r.tokens.iter().map(u32::to_string).collect::<Vec<_>>().join(";"),

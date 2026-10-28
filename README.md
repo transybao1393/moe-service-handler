@@ -54,6 +54,10 @@ picks one from each node's speed and memory.
   sync. `--metrics FILE` or `[metrics] csv` writes one CSV row per step (a prompt chunk, or a
   decode step with its drafts) with that split, queue wait, requests in flight, ring round
   trip, reused and drafted/accepted positions, and run metadata (git hash, hardware, split).
+- **Logs** (NF-5): `tracing` to stderr, text or JSON lines (`[log] json`), level from
+  `[log] level` or `RUST_LOG`. Every line names the node; every line about a request carries
+  `request` (the client's id, also in `chatcmpl-<id>`) and `ring` (its id in frames, metrics
+  and worker logs). `RUST_LOG=debug` adds one line per step on every node.
 - **API:** the coordinator serves OpenAI-compatible `GET /v1/models` and
   `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
   429, a ring that is down 503.

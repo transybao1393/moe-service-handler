@@ -16,6 +16,7 @@ use msh_net::{decode_hidden, encode_hidden, encode_token, Connection, FrameError
 use crate::config::Config;
 use crate::engine::{Engine, Sample, StageIn};
 use crate::Error;
+use tracing::{debug, warn};
 
 pub struct Ring {
     /// Receives from the previous node.
@@ -116,12 +117,14 @@ impl<E: Engine> Worker<E> {
                 MsgType::Hidden => {
                     let sample = if h.flags & FLAG_EVERY_TOKEN != 0 { Sample::Every } else { Sample::Last };
                     let decoded = decode_hidden(&buf, dim, &mut hidden, &mut stages).map_err(Error::from);
-                    let result = decoded.and_then(|_| {
+                    let result = decoded.and_then(|rows| {
                         let t0 = Instant::now();
                         let input = StageIn::Hidden(&hidden);
                         let r = self.engine.step(h.request_id, h.position, input, sample, &mut hidden_out, &mut tokens);
                         // This node's compute time travels on with the positions (CL-10).
-                        stages.push(t0.elapsed().as_micros().min(u32::MAX as u128) as u32);
+                        let us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                        stages.push(us);
+                        debug!(ring = h.request_id, pos = h.position, positions = rows, us, "step");
                         r
                     });
                     let next = &mut self.ring.next;
@@ -135,6 +138,7 @@ impl<E: Engine> Worker<E> {
                             next.send_flagged(MsgType::Hidden, h.flags, h.request_id, h.position, &out)
                         }
                         Err(e) => {
+                            warn!(ring = h.request_id, pos = h.position, error = %e, "step failed");
                             let msg = format!("{}: {e}", self.name);
                             next.send(MsgType::Error, h.request_id, h.position, msg.as_bytes())
                         }
@@ -142,7 +146,9 @@ impl<E: Engine> Worker<E> {
                     sent?;
                 }
                 MsgType::Rewind => {
+                    debug!(ring = h.request_id, keep = h.position, "rewind");
                     if let Err(e) = self.engine.rewind(h.request_id, h.position) {
+                        warn!(ring = h.request_id, error = %e, "rewind failed");
                         let msg = format!("{}: {e}", self.name);
                         self.ring.next.send(MsgType::Error, h.request_id, h.position, msg.as_bytes())?;
                     }
@@ -154,6 +160,7 @@ impl<E: Engine> Worker<E> {
                 // Health ping from the coordinator: pass it on (CL-8).
                 MsgType::Ping => self.ring.next.send(MsgType::Ping, h.request_id, h.position, &buf)?,
                 MsgType::Drop => {
+                    debug!(ring = h.request_id, "free");
                     self.engine.free(h.request_id);
                     self.ring.next.send(MsgType::Drop, h.request_id, 0, &[])?;
                 }

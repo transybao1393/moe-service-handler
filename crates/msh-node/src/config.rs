@@ -56,6 +56,14 @@
 //! [metrics]
 //! csv = "results/olmoe-3node.csv"
 //! ```
+//!
+//! An optional `[log]` table sets the log (NF-5). `RUST_LOG` overrides `level`.
+//!
+//! ```toml
+//! [log]
+//! level = "info"                       # or a filter, e.g. "msh_node=debug"
+//! json = true                          # one JSON object per line instead of text
+//! ```
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -79,7 +87,23 @@ pub struct Config {
     pub http: Option<HttpConfig>,
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    #[serde(default)]
+    pub log: LogConfig,
     pub nodes: Vec<NodeConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// A `tracing` filter: a level, or per-module levels.
+    pub level: String,
+    pub json: bool,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        LogConfig { level: "info".into(), json: false }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

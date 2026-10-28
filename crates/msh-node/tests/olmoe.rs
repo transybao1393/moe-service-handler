@@ -77,6 +77,7 @@ fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
         engine: Default::default(),
         http: None,
         metrics: None,
+        log: Default::default(),
         nodes: splits
             .iter()
             .zip(&listeners)
@@ -191,7 +192,6 @@ fn next_turn_continues_the_parked_request_exactly() {
 #[test]
 #[ignore = "needs the OLMoE model on disk"]
 fn http_chat_completion_answers_with_the_reference() {
-    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
     use axum::body::Body;
@@ -203,7 +203,7 @@ fn http_chat_completion_answers_with_the_reference() {
 
     let codec = Codec::load(&model_dir().join("hf/tokenizer.json"), ChatTemplate::Olmoe).unwrap();
     let cluster = start(&[[0, 8], [8, 12], [12, 16]]);
-    let state = HttpState { client: (*cluster).clone(), codec, model: "olmoe".into(), n_ctx: 512, next_id: AtomicU64::new(1) };
+    let state = HttpState { client: (*cluster).clone(), codec, model: "olmoe".into(), n_ctx: 512 };
     let body = serde_json::json!({
         "messages": [{ "role": "user", "content": "What is the capital of France? Answer in one sentence." }],
     });

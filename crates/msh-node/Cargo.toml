@@ -22,6 +22,8 @@ axum = "0.8.9"
 tokio-stream = "0.1.19"
 serde_json = "1.0.154"
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"
