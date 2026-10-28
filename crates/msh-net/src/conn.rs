@@ -1,4 +1,4 @@
-//! Persistent TCP connection to a neighbouring node (NET-3, NET-4, NET-7).
+//! Persistent TCP connection between the controller and a worker (NET-3, NET-4, NET-7).
 
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -80,6 +80,36 @@ impl Connection {
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
+    }
+
+    /// Tells the peer this side sends no more: it reads end of stream once it has read what
+    /// was sent. Needed after [`Connection::split`], since the socket stays open while the
+    /// other half lives.
+    pub fn close_send(&mut self) {
+        let _ = self.writer.flush();
+        let _ = self.writer.get_ref().shutdown(std::net::Shutdown::Write);
+    }
+
+    /// Splits into a receiving half and a sending half over the same socket, so one thread can
+    /// read while another writes. Use each half for its own direction only: the receiving half
+    /// keeps the read buffer, the sending half the write buffer.
+    pub fn split(self) -> io::Result<(Connection, Connection)> {
+        let stream = self.reader.get_ref();
+        let recv = Connection {
+            writer: BufWriter::with_capacity(0, stream.try_clone()?),
+            reader: self.reader,
+            peer_name: self.peer_name.clone(),
+            peer_addr: self.peer_addr,
+            prefix: Vec::new(),
+        };
+        let send = Connection {
+            reader: BufReader::with_capacity(0, recv.reader.get_ref().try_clone()?),
+            writer: self.writer,
+            peer_name: self.peer_name,
+            peer_addr: self.peer_addr,
+            prefix: self.prefix,
+        };
+        Ok((recv, send))
     }
 
     /// Sends one frame and flushes it.

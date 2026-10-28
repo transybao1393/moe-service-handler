@@ -87,7 +87,7 @@ pub fn plan(
 
 /// Per-node speeds measured in a metrics CSV (`--metrics`): for every node named in the run's
 /// split, layers per millisecond of compute over its decode steps. Returns `(name, speed)`
-/// in ring order.
+/// in pipeline order.
 pub fn speeds_from_metrics(csv: &str) -> Result<Vec<(String, f64)>, String> {
     let mut lines = csv.lines();
     let header = split_csv(lines.next().ok_or("empty metrics file")?);
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn speeds_come_from_decode_rows() {
         let csv = "\
-run_id,git_hash,host,hardware,split,engine,request,pos,positions,kind,tokens,step_us,coord_us,workers_us,network_us,stage_us,queue_us,in_flight,ring_rtt_us,cached,drafted,accepted
+run_id,git_hash,host,hardware,split,engine,request,pos,positions,kind,tokens,step_us,coord_us,workers_us,network_us,stage_us,queue_us,in_flight,ping_rtt_us,cached,drafted,accepted
 1,abc,h,\"Apple M4, 16 GB\",m4:0-8 m1:8-12 m4b:12-16,mock,1,0,25,first_token,5,900,400,500,0,400;200;300,0,1,,0,0,0
 1,abc,h,\"Apple M4, 16 GB\",m4:0-8 m1:8-12 m4b:12-16,mock,1,25,1,decode,6,100,8,7,0,8;4;2,0,1,,0,0,0
 1,abc,h,\"Apple M4, 16 GB\",m4:0-8 m1:8-12 m4b:12-16,mock,1,26,1,decode,7,100,8,7,0,8;4;6,0,1,,0,0,0

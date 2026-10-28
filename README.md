@@ -1,22 +1,22 @@
 # moe-service-handler
 
 <p align="center">
-  <img src="docs/assets/dataflow-v2.svg" width="900" alt="Data flow: a client's prompt enters the m4 controller, which runs the first layers and sends hidden states to the m1 worker; m1 passes them to the m4b worker, which runs the last layers and the head and sends the token back to the controller; the controller streams it to the client. Three requests are in the ring at once.">
+  <img src="docs/assets/dataflow-v3.svg" width="900" alt="Data flow: a client's prompt enters the m4 controller, which runs the first layers and sends hidden states to the m1 worker; m1 sends its result back to the controller, which passes it to the m4b worker; m4b runs the last layers and the head and sends the token back to the controller; the controller streams it to the client. Three requests are in the cluster at once.">
 </p>
 
 Turns streammoe into a service that runs a large MoE model, Qwen3.6-35B-A3B, across three
 Mac minis: an M4 as the controller (coordinator), an M1 and a second M4. Every node holds part
-of the model, computes its share of each token and passes the result on; the coordinator
-answers the user. streammoe owns everything inside one machine (memory cap, expert streaming,
+of the model and computes its share of each token; the workers send their results back to
+the coordinator, which answers the user. streammoe owns everything inside one machine (memory cap, expert streaming,
 kernels); this repo owns everything that spans machines or requests. Full requirements:
 [`moe-service-handler-prd.md`](moe-service-handler-prd.md).
 
 ## Architecture
 
-Each node runs a contiguous layer range. Nodes form a ring over one persistent TCP connection
-per hop: hidden states flow forward, and the last node, which holds the head, samples a token
-and sends it back to the coordinator. The coordinator streams it to the client and starts the
-next step. The split in the picture (20 / 10 / 10 of Qwen3.6's 40 layers) is
+Each node runs a contiguous layer range. The controller holds one persistent TCP connection to
+each worker; workers have no connections to each other. A step goes from the controller to m1
+and back, then from the controller to m4b and back: m4b holds the head, so what it sends back
+is the sampled token. The controller streams it to the client and starts the next step. The split in the picture (20 / 10 / 10 of Qwen3.6's 40 layers) is
 [`configs/qwen36-3node.toml`](configs/qwen36-3node.toml); leave out `layers` and the planner
 picks one from each node's speed and memory.
 
@@ -24,16 +24,17 @@ picks one from each node's speed and memory.
   length) + payload. Types: `Hidden`, `Token`, `Drop`, `Rewind`, `Ping`/`Pong`, `Hello`, `Error`.
 - **f32 on the wire:** the engine works in f32, so a split pipeline stays bit-identical to
   one process. Hidden states go on the wire straight from the engine's output buffer and are
-  read straight into the next engine's input, with no encode or decode copy (NET-6).
-- **`Drop`** travels the whole ring; when it returns, every node has freed the request.
+  read straight into the next engine's input, with no encode or decode copy (NET-6). The
+  controller passes a worker's result on to the next worker unchanged, as raw bytes.
+- **`Drop`** goes through every worker; when it returns, every node has freed the request.
 - **Errors** on a worker reach the coordinator as an `Error` frame tagged with the request;
-  only that request fails and the ring stays up.
-- **Scheduler:** up to `max_in_flight` requests (default 3) step through the ring at once, so
+  only that request fails and the cluster stays up.
+- **Scheduler:** up to `max_in_flight` requests (default 3) step through the cluster at once, so
   each node works on a different request; extra requests queue up to `max_queue`, then are
   rejected. Dropping a request's event channel cancels it.
-- **Prefill in chunks:** the prompt goes round the ring `prefill_chunk` positions at a time
+- **Prefill in chunks:** the prompt goes through the workers `prefill_chunk` positions at a time
   (default 64) in one `Hidden` frame, which streammoe runs on its batched path. Up to
-  `prefill_depth` chunks (default 3) of a request are in the ring at once, so the nodes work
+  `prefill_depth` chunks (default 3) of a request are in the cluster at once, so the nodes work
   on consecutive chunks together.
 - **Speculative decoding** (`max_draft` > 0, off by default): the coordinator drafts tokens by
   prompt lookup and sends them with the real one as one step; the head returns a token per
@@ -47,23 +48,23 @@ picks one from each node's speed and memory.
   `msh-node --speeds-from run.csv` turns a previous run's metrics into `speed` values.
 - **Prefix reuse** (`prefix_cache` > 0): finished requests keep their state on every node; the
   next chat turn takes it over and prefills only the new message. Off by default.
-- **Health:** a `Ping` travels the ring every second. A broken connection, or a ping not back
-  within 5 s (a hung node), marks the ring down: in-flight requests fail and new ones are
+- **Health:** a `Ping` goes through every worker each second. A broken connection, or a ping
+  not back within 5 s (a hung node), marks the cluster down: in-flight requests fail and new ones are
   rejected until the cluster is restarted.
-- **Metrics:** each worker appends its compute time to the frame it forwards, so the
+- **Metrics:** each worker appends its compute time to the frame it sends back, so the
   coordinator splits every step into per-node compute and network/queueing without clock
   sync. `--metrics FILE` or `[metrics] csv` writes one CSV row per step (a prompt chunk, or a
-  decode step with its drafts) with that split, queue wait, requests in flight, ring round
+  decode step with its drafts) with that split, queue wait, requests in flight, ping round
   trip, reused and drafted/accepted positions, and run metadata (git hash, hardware, split).
 - **Logs** (NF-5): `tracing` to stderr, text or JSON lines (`[log] json`), level from
   `[log] level` or `RUST_LOG`. Every line names the node; every line about a request carries
-  `request` (the client's id, also in `chatcmpl-<id>`) and `ring` (its id in frames, metrics
+  `request` (the client's id, also in `chatcmpl-<id>`) and `state` (its id in frames, metrics
   and worker logs). `RUST_LOG=debug` adds one line per step on every node.
 - **Prometheus** (CL-12): `prometheus = "ADDR"` in a node's `[[nodes]]` entry serves
   `GET /metrics` on that node: footprint and its limit, and compute time per step on every
   node; on the coordinator also requests by outcome, active and waiting requests, tokens,
-  time to first token, decode-step round trip, drafts and prefix reuse, and the ring's ping
-  time. Every series carries `node="NAME"`.
+  time to first token, decode-step round trip, drafts and prefix reuse, and the ping's round
+  trip. Every series carries `node="NAME"`.
 - **Service memory** (NF-2): the service's own memory (network buffers, requests, HTTP,
   metrics) has a fixed allowance beside streammoe's cap, `[service] mem_allowance_mib`
   (default 256). A node measures its footprint before the engine opens, adds the most its
@@ -74,14 +75,14 @@ picks one from each node's speed and memory.
   67 MiB of it HTTP bodies). OLMoE on one node with a 4 GiB cap peaked at 1.16 GiB.
 - **API:** the coordinator serves OpenAI-compatible `GET /v1/models` and
   `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
-  429, a ring that is down 503.
+  429, a cluster that is down 503.
 
 ## Crates
 
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Coordinator / worker, config, planner, ring, scheduler, HTTP API, metrics, engines | Ring, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11), Prometheus (CL-12), logs (NF-5), service memory allowance (NF-2); runs real streammoe (tested on OLMoE) |
+| `msh-node` | binary | Controller / worker, config, planner, star links, scheduler, HTTP API, metrics, engines | Controller-to-worker links, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11), Prometheus (CL-12), logs (NF-5), service memory allowance (NF-2); runs real streammoe (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
 The engine sits behind an `Engine` trait shaped like streammoe's `eval_request`: tokens or
@@ -97,7 +98,7 @@ and `free`. Two implementations:
   streammoe comes from [transybao1393/streamoe](https://github.com/transybao1393/streamoe),
   pinned to a commit in `crates/msh-node/Cargo.toml` (0.2.0-beta.1).
 
-Each node opens streammoe for its own role in the ring:
+Each node opens streammoe for its own role in the cluster:
 
 - **No checkpoints:** a stage never snapshots, and under a cap each checkpoint would take a
   full state's memory from the expert hot tier.
@@ -123,7 +124,7 @@ token for token.
 ```bash
 cargo test --release
 
-# three nodes on one machine over loopback (start the coordinator last)
+# three nodes on one machine over loopback (the coordinator waits up to 60 s for the workers)
 B=target/release/msh-node
 $B --config configs/local-3node.toml --node m4b &
 $B --config configs/local-3node.toml --node m1 &
@@ -182,7 +183,7 @@ tokens):
 | | Hot tier (m4) | Prefill on m4 | Decode |
 | --- | --- | --- | --- |
 | streammoe defaults | 0.31 GiB | 2.7 s | 42–44 tok/s |
-| Opened for the ring (no checkpoints, 64-token scratch) | 1.45 GiB | 1.5 s | 51 tok/s |
+| Opened for the cluster (no checkpoints, 64-token scratch) | 1.45 GiB | 1.5 s | 51 tok/s |
 
 ## License
 

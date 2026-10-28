@@ -2,7 +2,7 @@
 //!
 //! Each request gets a slot in streammoe's request pool, admitted at its first position and
 //! released on `free`. The pool is sized from the scheduler's `max_in_flight`; the coordinator
-//! admits a new request only after the previous one's `Drop` has gone round the ring, so no
+//! admits a new request only after the previous one's `Drop` has gone through the workers, so no
 //! node's pool overflows. Sampling is greedy on the node holding the head.
 //!
 //! A prompt chunk goes to streammoe as one call, which takes its batched prefill path.

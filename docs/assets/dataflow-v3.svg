@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 500" width="900" role="img" aria-labelledby="t d">
+<title id="t">moe-service-handler data flow</title>
+<desc id="d">A client sends a prompt to the m4 controller. The controller runs the first layers and sends hidden states to the m1 worker; m1 runs its layers and sends the result back to the controller, which sends it to the m4b worker; m4b runs the last layers and the head, and sends the sampled token back to the controller, which streams it to the client. The workers never talk to each other. Three requests are in the cluster at once.</desc>
+<style>
+  .bg { fill: #ffffff; }
+  .node { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.5; }
+  .ctl { fill: #eff6ff; stroke: #64748b; stroke-width: 1.5; }
+  .client { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 1.5; }
+  .wire { fill: none; stroke: #94a3b8; stroke-width: 2; }
+  .back { fill: none; stroke: #94a3b8; stroke-width: 2; stroke-dasharray: 6 4; }
+  .h { font: 600 14px ui-sans-serif, -apple-system, "Segoe UI", sans-serif; fill: #0f172a; }
+  .s { font: 12px ui-sans-serif, -apple-system, "Segoe UI", sans-serif; fill: #475569; }
+  .m { font: 11px ui-monospace, "SF Mono", Menlo, monospace; fill: #64748b; }
+  .arrow { fill: #94a3b8; }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #0d1117; }
+    .node { fill: #161b22; stroke: #484f58; }
+    .ctl { fill: #172033; stroke: #6e7681; }
+    .client { fill: #1c2128; stroke: #484f58; }
+    .wire, .back { stroke: #6e7681; }
+    .arrow { fill: #6e7681; }
+    .h { fill: #e6edf3; }
+    .s { fill: #9da7b3; }
+    .m { fill: #8b949e; }
+  }
+</style>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="bg" width="900" height="500" rx="12"/>
+<text class="s" x="20" y="32">The controller sends each step to a worker, gets the result back, and sends it to the next worker; each node runs its own layers.</text>
+<text class="s" x="20" y="52">Three requests in the cluster at once, so every node stays busy:</text>
+<circle cx="392" cy="48" r="6" fill="#3b82f6"/><text class="s" x="402" y="52">request 1</text>
+<circle cx="472" cy="48" r="6" fill="#10b981"/><text class="s" x="482" y="52">request 2</text>
+<circle cx="552" cy="48" r="6" fill="#f59e0b"/><text class="s" x="562" y="52">request 3</text>
+<rect class="client" x="80" y="100" width="110" height="100" rx="12"/>
+<text class="h" x="135" y="142" text-anchor="middle">client</text>
+<text class="s" x="135" y="160" text-anchor="middle">OpenAI API</text>
+<rect class="ctl" x="345" y="80" width="210" height="140" rx="12"/>
+<rect x="345" y="80" width="210" height="140" rx="12" fill="#3b82f6" fill-opacity="0.16" stroke="#3b82f6" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.0;0.15" dur="4.5s" begin="0s" repeatCount="indefinite"/></rect>
+<rect x="345" y="80" width="210" height="140" rx="12" fill="#10b981" fill-opacity="0.16" stroke="#10b981" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.0;0.15" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></rect>
+<rect x="345" y="80" width="210" height="140" rx="12" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.0;0.15" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></rect>
+<text class="h" x="450" y="110" text-anchor="middle">m4 · controller</text>
+<text class="s" x="450" y="130" text-anchor="middle">Mac mini M4</text>
+<text class="s" x="450" y="152" text-anchor="middle">HTTP · scheduler · drafts</text>
+<text class="m" x="450" y="202" text-anchor="middle">embed + layers 0–19</text>
+<rect class="node" x="110" y="320" width="250" height="120" rx="12"/>
+<rect x="110" y="320" width="250" height="120" rx="12" fill="#3b82f6" fill-opacity="0.16" stroke="#3b82f6" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.23;0.38" dur="4.5s" begin="0s" repeatCount="indefinite"/></rect>
+<rect x="110" y="320" width="250" height="120" rx="12" fill="#10b981" fill-opacity="0.16" stroke="#10b981" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.23;0.38" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></rect>
+<rect x="110" y="320" width="250" height="120" rx="12" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.23;0.38" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></rect>
+<text class="h" x="235" y="352" text-anchor="middle">m1 · worker</text>
+<text class="s" x="235" y="372" text-anchor="middle">Mac mini M1</text>
+<text class="m" x="235" y="418" text-anchor="middle">layers 20–29</text>
+<rect class="node" x="540" y="320" width="250" height="120" rx="12"/>
+<rect x="540" y="320" width="250" height="120" rx="12" fill="#3b82f6" fill-opacity="0.16" stroke="#3b82f6" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.56;0.76" dur="4.5s" begin="0s" repeatCount="indefinite"/></rect>
+<rect x="540" y="320" width="250" height="120" rx="12" fill="#10b981" fill-opacity="0.16" stroke="#10b981" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.56;0.76" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></rect>
+<rect x="540" y="320" width="250" height="120" rx="12" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.56;0.76" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></rect>
+<text class="h" x="665" y="352" text-anchor="middle">m4b · worker</text>
+<text class="s" x="665" y="372" text-anchor="middle">Mac mini M4</text>
+<text class="m" x="665" y="418" text-anchor="middle">layers 30–39 + head</text>
+<path class="wire" d="M190,130 L341,130" marker-end="url(#a)"/><text class="m" x="267" y="120" text-anchor="middle">prompt</text>
+<path class="wire" d="M345,180 L190,180" marker-end="url(#a)"/><text class="m" x="267" y="198" text-anchor="middle">stream</text>
+<path class="wire" d="M375,220 L245,320" marker-end="url(#a)"/>
+<text class="m" x="296" y="266" text-anchor="end">Hidden · f32</text>
+<path class="back" d="M285,320 L415,220" marker-end="url(#a)"/>
+<text class="m" x="384" y="252">result · f32</text>
+<path class="wire" d="M485,220 L615,320" marker-end="url(#a)"/>
+<text class="m" x="560" y="288" text-anchor="end">Hidden · f32</text>
+<path class="back" d="M655,320 L525,220" marker-end="url(#a)"/>
+<text class="m" x="600" y="262">Token · u32</text>
+<circle r="6" fill="#3b82f6" opacity="0"><animateMotion path="M375,220 L245,320" keyPoints="0;0;1;1" keyTimes="0;0.15;0.23;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.15;0.23" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#3b82f6" opacity="0"><animateMotion path="M285,320 L415,220" keyPoints="0;0;1;1" keyTimes="0;0.38;0.46;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.38;0.46" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#3b82f6" opacity="0"><animateMotion path="M485,220 L615,320" keyPoints="0;0;1;1" keyTimes="0;0.48;0.56;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.48;0.56" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#3b82f6" opacity="0"><animateMotion path="M655,320 L525,220" keyPoints="0;0;1;1" keyTimes="0;0.76;0.86;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.76;0.86" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
+<circle r="5" fill="#3b82f6" opacity="0"><animateMotion path="M345,180 L190,180" keyPoints="0;0;1;1" keyTimes="0;0.001;0.1;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.001;0.1" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#10b981" opacity="0"><animateMotion path="M375,220 L245,320" keyPoints="0;0;1;1" keyTimes="0;0.15;0.23;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.15;0.23" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#10b981" opacity="0"><animateMotion path="M285,320 L415,220" keyPoints="0;0;1;1" keyTimes="0;0.38;0.46;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.38;0.46" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#10b981" opacity="0"><animateMotion path="M485,220 L615,320" keyPoints="0;0;1;1" keyTimes="0;0.48;0.56;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.48;0.56" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#10b981" opacity="0"><animateMotion path="M655,320 L525,220" keyPoints="0;0;1;1" keyTimes="0;0.76;0.86;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.76;0.86" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
+<circle r="5" fill="#10b981" opacity="0"><animateMotion path="M345,180 L190,180" keyPoints="0;0;1;1" keyTimes="0;0.001;0.1;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.001;0.1" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#f59e0b" opacity="0"><animateMotion path="M375,220 L245,320" keyPoints="0;0;1;1" keyTimes="0;0.15;0.23;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.15;0.23" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#f59e0b" opacity="0"><animateMotion path="M285,320 L415,220" keyPoints="0;0;1;1" keyTimes="0;0.38;0.46;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.38;0.46" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#f59e0b" opacity="0"><animateMotion path="M485,220 L615,320" keyPoints="0;0;1;1" keyTimes="0;0.48;0.56;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.48;0.56" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#f59e0b" opacity="0"><animateMotion path="M655,320 L525,220" keyPoints="0;0;1;1" keyTimes="0;0.76;0.86;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.76;0.86" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
+<circle r="5" fill="#f59e0b" opacity="0"><animateMotion path="M345,180 L190,180" keyPoints="0;0;1;1" keyTimes="0;0.001;0.1;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.001;0.1" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
+<text class="s" x="20" y="480">One persistent TCP connection from the controller to each worker; the workers never talk to each other. Drop, Rewind and Ping take the same path.</text>
+</svg>

@@ -11,7 +11,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 const HEADER: &str = "run_id,git_hash,host,hardware,split,engine,request,pos,positions,kind,tokens,\
-                      step_us,coord_us,workers_us,network_us,stage_us,queue_us,in_flight,ring_rtt_us,\
+                      step_us,coord_us,workers_us,network_us,stage_us,queue_us,in_flight,ping_rtt_us,\
                       cached,drafted,accepted";
 
 /// Describes the run; repeated on every row.
@@ -57,14 +57,14 @@ pub struct StepRecord<'a> {
     /// Tokens the step produced: one, or with draft tokens the accepted ones and the next.
     pub tokens: &'a [u32],
     pub step_us: u64,
-    /// Compute time per node in ring order, coordinator first.
+    /// Compute time per node in pipeline order, coordinator first.
     pub stage_us: &'a [u32],
     /// Time the request waited for an in-flight slot.
     pub queue_us: u64,
     /// Requests in flight when the step finished.
     pub in_flight: usize,
-    /// Last health ping's trip round the ring (NET-5), if one has completed.
-    pub ring_rtt_us: Option<u64>,
+    /// Last health ping's trip through every worker (NET-5), if one has completed.
+    pub ping_rtt_us: Option<u64>,
     /// Prompt positions the request took over from a finished one (prefix reuse).
     pub cached: u32,
     /// Draft tokens the step carried, and how many the head confirmed.
@@ -124,7 +124,7 @@ impl Metrics {
             stages.join(";"),
             r.queue_us,
             r.in_flight,
-            r.ring_rtt_us.map(|t| t.to_string()).unwrap_or_default(),
+            r.ping_rtt_us.map(|t| t.to_string()).unwrap_or_default(),
             r.cached,
             r.drafted,
             r.accepted,
@@ -172,7 +172,7 @@ mod tests {
             stage_us,
             queue_us: 5,
             in_flight: 2,
-            ring_rtt_us: Some(300),
+            ping_rtt_us: Some(300),
             cached: 0,
             drafted: 3,
             accepted: 1,

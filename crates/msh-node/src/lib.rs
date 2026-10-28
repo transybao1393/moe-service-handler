@@ -1,7 +1,8 @@
 //! `msh-node`: coordinator and worker roles for moe-service-handler.
 //!
-//! A ring of nodes, each running a contiguous layer range, with the coordinator's scheduler
-//! keeping several requests in flight. Planner and HTTP come later in M2.
+//! A controller and its workers, each running a contiguous layer range. The controller talks to
+//! every worker; workers never talk to each other. Its scheduler keeps several requests in
+//! flight.
 
 pub mod chat;
 pub mod config;
@@ -27,9 +28,9 @@ pub enum Error {
     Net(FrameError),
     Engine(String),
     Protocol(String),
-    /// A request failed after being admitted (engine error on some node, ring down).
+    /// A request failed after being admitted (engine error on some node, cluster down).
     Failed(String),
-    /// The scheduler did not admit the request (queue full, ring down, ...).
+    /// The scheduler did not admit the request (queue full, cluster down, ...).
     Rejected(String),
 }
 

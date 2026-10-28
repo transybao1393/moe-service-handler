@@ -49,8 +49,8 @@ pub enum MsgType {
     Hello = 6,
     /// Fatal error; payload is a UTF-8 message.
     Error = 7,
-    /// Keep only the first `position` positions of a request (rejected draft tokens). Travels
-    /// the ring like `Drop`; no payload.
+    /// Keep only the first `position` positions of a request (rejected draft tokens). Goes through
+    /// every worker like `Drop`; no payload.
     Rewind = 8,
 }
 
@@ -192,7 +192,7 @@ pub fn read_frame<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Header, F
 }
 
 // Hidden and Token payloads carry the compute time of every stage the positions have passed
-// through, in microseconds, in ring order. The coordinator splits a step's wall time into
+// through, in microseconds, in pipeline order. The coordinator splits a step's wall time into
 // per-node compute and the rest (network and queueing) from durations alone, so the nodes'
 // clocks need not agree.
 //

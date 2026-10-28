@@ -1,4 +1,4 @@
-//! The real engine on OLMoE-1B-7B: one node against a three-node ring over loopback, checked
+//! The real engine on OLMoE-1B-7B: one node against a controller and two workers over loopback, checked
 //! against streammoe's MLX reference continuation.
 //!
 //! Needs the converted model at `$HOME/models/olmoe-1b-7b` (or `MSH_OLMOE_DIR`), so it is
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use msh_node::config::{expand_home, Config, NodeConfig, PrefetchGuess};
 use msh_node::streammoe_engine::{OpenSpec, StreamMoeEngine};
-use msh_node::node::{join_ring, Worker};
+use msh_node::node::{accept_controller, connect_workers, Worker};
 use msh_node::scheduler::{self, collect, Client, SchedulerConfig};
 
 /// "What is the capital of France? Answer in one sentence." in OLMoE's chat template.
@@ -33,7 +33,7 @@ fn model_dir() -> PathBuf {
 }
 
 /// streammoe's cap is checked against the whole process's footprint, so it only holds with one
-/// context per process, as in a real deployment. A ring of threads runs uncapped.
+/// context per process, as in a real deployment. A cluster of threads runs uncapped.
 fn open(layers: std::ops::Range<u32>, max_requests: usize, mem_cap: Option<u64>) -> StreamMoeEngine {
     let dir = model_dir();
     StreamMoeEngine::open(&OpenSpec { n_ctx: 512, mem_cap, max_requests, ..OpenSpec::new(&dir, layers) })
@@ -101,13 +101,14 @@ fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
         let (i, cfg) = (k + 1, cfg.clone());
         let engine = open(cfg.nodes[i].layer_range(), sched.engine_slots(), cap);
         threads.push(thread::spawn(move || {
-            let ring = join_ring(&cfg, i, l, Duration::from_secs(30)).unwrap().unwrap();
-            Worker::new(engine, ring, &cfg.nodes[i].name).run().unwrap();
+            let link = accept_controller(&cfg, i, l).unwrap();
+            Worker::new(engine, link, &cfg.nodes[i].name).run().unwrap();
         }));
     }
     let engine = open(cfg.nodes[0].layer_range(), sched.engine_slots(), cap);
-    let ring = join_ring(&cfg, 0, coord_listener, Duration::from_secs(30)).unwrap();
-    let (client, coordinator) = scheduler::spawn(engine, ring, sched);
+    drop(coord_listener);
+    let star = connect_workers(&cfg, Duration::from_secs(30)).unwrap();
+    let (client, coordinator) = scheduler::spawn(engine, star, sched);
     threads.push(thread::spawn(move || drop(coordinator.join())));
     Cluster { client: Some(client), threads }
 }
@@ -124,8 +125,8 @@ fn one_node_matches_mlx_reference() {
 
 #[test]
 #[ignore = "needs the OLMoE model on disk"]
-fn three_node_ring_matches_mlx_reference_with_requests_in_flight() {
-    // The 25-token prompt in chunks of 8, 8, 8 and 1, pipelined round the ring.
+fn three_node_cluster_matches_mlx_reference_with_requests_in_flight() {
+    // The 25-token prompt in chunks of 8, 8, 8 and 1, pipelined through the workers.
     let sched = SchedulerConfig { prefill_chunk: 8, ..Default::default() };
     let client = start_with(&[[0, 8], [8, 12], [12, 16]], sched);
     // Three at once: each request's state must stay separate on every node.

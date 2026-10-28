@@ -6,7 +6,8 @@ use msh_net::MsgType;
 use msh_node::config::{Config, NodeConfig};
 use msh_node::engine::MockEngine;
 use msh_node::metrics::{Metrics, RunInfo};
-use msh_node::node::{join_ring, Ring, Worker};
+use msh_net::Connection;
+use msh_node::node::{accept_controller, connect_workers, Worker};
 use msh_node::scheduler::{self, collect, Client, Event, SchedulerConfig};
 use msh_node::Error;
 
@@ -86,13 +87,15 @@ impl Cluster {
                 let i = k + 1;
                 let (cfg, engine) = (cfg.clone(), engine(i));
                 thread::spawn(move || {
-                    let ring = join_ring(&cfg, i, l, Duration::from_secs(5)).unwrap().unwrap();
-                    Worker::new(engine, ring, &cfg.nodes[i].name).run().unwrap()
+                    let link = accept_controller(&cfg, i, l).unwrap();
+                    Worker::new(engine, link, &cfg.nodes[i].name).run().unwrap()
                 })
             })
             .collect();
-        let ring = join_ring(&cfg, 0, coord_listener, Duration::from_secs(5)).unwrap();
-        let (client, coordinator) = scheduler::spawn_with_metrics(engine(0), ring, cfg.scheduler, metrics);
+        // The controller connects out; it listens on nothing.
+        drop(coord_listener);
+        let star = connect_workers(&cfg, Duration::from_secs(5)).unwrap();
+        let (client, coordinator) = scheduler::spawn_with_metrics(engine(0), star, cfg.scheduler, metrics);
         Cluster { client, coordinator, workers }
     }
 
@@ -143,7 +146,7 @@ fn concurrent_requests_match_their_sequential_results() {
 
 #[test]
 fn pipelined_prefill_chunks_match_position_by_position() {
-    // Prompts of 1 to 37 positions in chunks of 4, three chunks of a request in the ring at
+    // Prompts of 1 to 37 positions in chunks of 4, three chunks of a request in the cluster at
     // once, alongside other requests' chunks and decode steps.
     let prompts: Vec<Vec<u32>> =
         [37, 1, 4, 9, 23].iter().enumerate().map(|(i, &n)| (0..n).map(|k| 7 * k + 1000 * i as u32).collect()).collect();
@@ -189,7 +192,7 @@ fn dropping_the_receiver_cancels_and_frees_the_request() {
         assert!(matches!(rx.recv().unwrap(), Event::Token { .. }));
     }
     drop(rx);
-    // The ring keeps serving, and the cancelled request is freed everywhere.
+    // The cluster keeps serving, and the cancelled request is freed everywhere.
     assert_eq!(c.client.generate(prompt(1), 4).unwrap().tokens, reference(&[prompt(1)], 4)[0]);
     c.stop_and_check_freed();
 }
@@ -201,8 +204,8 @@ fn rejects_empty_prompts() {
     c.stop_and_check_freed();
 }
 
-/// A two-node ring whose second node runs `fake` instead of a real worker.
-fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Ring) + Send + 'static) -> Client {
+/// A controller and one worker that runs `fake` instead of a real worker loop.
+fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Connection) + Send + 'static) -> Client {
     let (l0, l1) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
     let node = |name: &str, l: &TcpListener, layers| NodeConfig {
         name: name.into(),
@@ -225,37 +228,38 @@ fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Ring) + Send + 'st
         nodes: vec![node("n0", &l0, [0, 20]), node("n1", &l1, [20, 40])],
     };
     let worker_cfg = cfg.clone();
-    thread::spawn(move || fake(join_ring(&worker_cfg, 1, l1, Duration::from_secs(5)).unwrap().unwrap()));
-    let ring = join_ring(&cfg, 0, l0, Duration::from_secs(5)).unwrap();
-    scheduler::spawn(MockEngine::new(0..20, 40, DIM), ring, sched).0
+    thread::spawn(move || fake(accept_controller(&worker_cfg, 1, l1).unwrap()));
+    drop(l0);
+    let star = connect_workers(&cfg, Duration::from_secs(5)).unwrap();
+    scheduler::spawn(MockEngine::new(0..20, 40, DIM), star, sched).0
 }
 
 /// Reads frames until the first hidden state.
-fn wait_for_hidden(ring: &mut Ring) {
+fn wait_for_hidden(link: &mut Connection) {
     let mut buf = Vec::new();
-    while ring.prev.recv_frame(&mut buf).unwrap().msg_type != MsgType::Hidden {}
+    while link.recv_frame(&mut buf).unwrap().msg_type != MsgType::Hidden {}
 }
 
 #[test]
 fn crashed_worker_fails_requests_and_stops_accepting_work() {
-    let client = with_fake_worker(SchedulerConfig::default(), |mut ring| {
-        wait_for_hidden(&mut ring);
-        // Returning drops both connections, as a crashed process would.
+    let client = with_fake_worker(SchedulerConfig::default(), |mut link| {
+        wait_for_hidden(&mut link);
+        // Returning drops the connection, as a crashed process would.
     });
     let err = client.generate(prompt(0), 8).unwrap_err().to_string();
-    assert!(err.contains("ring down"), "{err}");
+    assert!(err.contains("cluster down"), "{err}");
     let err = client.generate(prompt(1), 8).unwrap_err();
-    assert!(matches!(&err, Error::Rejected(m) if m.contains("ring down")), "{err}");
+    assert!(matches!(&err, Error::Rejected(m) if m.contains("cluster down")), "{err}");
 }
 
 #[test]
 fn hung_worker_is_detected_by_health_ping() {
     let sched = SchedulerConfig { health_interval_ms: 20, health_timeout_ms: 200, ..Default::default() };
-    let client = with_fake_worker(sched, |mut ring| {
-        wait_for_hidden(&mut ring);
-        // Hang with the connections still open, as a frozen machine would.
+    let client = with_fake_worker(sched, |mut link| {
+        wait_for_hidden(&mut link);
+        // Hang with the connection still open, as a frozen machine would.
         thread::sleep(Duration::from_secs(3));
-        drop(ring);
+        drop(link);
     });
     let t0 = Instant::now();
     let err = client.generate(prompt(0), 8).unwrap_err().to_string();
@@ -276,7 +280,7 @@ fn frequent_health_pings_do_not_disturb_generation() {
 
 #[test]
 fn metrics_has_a_row_per_step_with_every_node_timed() {
-    let dir = std::env::temp_dir().join(format!("msh-ring-metrics-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("msh-cluster-metrics-{}", std::process::id()));
     let path = dir.join("run.csv");
     let run = RunInfo {
         run_id: 1,
@@ -367,7 +371,7 @@ fn drafting_stops_at_max_tokens() {
     c.stop_and_check_freed();
 }
 
-/// Runs `turns` one after another on a three-node ring and returns each one's tokens and the
+/// Runs `turns` one after another on a three-node cluster and returns each one's tokens and the
 /// positions it reused (the `cached` column of its first row).
 fn chat_turns(sched: SchedulerConfig, vocab: u32, turns: &[(Vec<u32>, usize)]) -> Vec<(Vec<u32>, u32)> {
     static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

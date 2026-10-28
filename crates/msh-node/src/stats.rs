@@ -3,7 +3,7 @@
 //!
 //! Every node reports its compute time per step and its memory footprint. The coordinator also
 //! reports requests by outcome, tokens, time to first token, round trip per decode step,
-//! drafts, prefix reuse and the ring's health-ping time. The per-step CSV (CL-10) stays the
+//! drafts, prefix reuse and the health ping's trip through the workers. The per-step CSV (CL-10) stays the
 //! source for detailed analysis; these are for watching a running cluster.
 
 use std::fmt::Write as _;
@@ -73,8 +73,8 @@ pub struct Stats {
     pub decode_step: Histogram,
     /// This node's own compute per step.
     pub compute: Histogram,
-    /// Last health ping's trip round the ring, in microseconds.
-    pub ring_rtt_us: AtomicU64,
+    /// Last health ping's trip through every worker, in microseconds.
+    pub ping_rtt_us: AtomicU64,
     /// Bytes: cap + allowance, or 0 without a cap.
     pub footprint_limit: AtomicU64,
 }
@@ -94,7 +94,7 @@ pub static STATS: Stats = Stats {
     time_to_first_token: Histogram::new(),
     decode_step: Histogram::new(),
     compute: Histogram::new(),
-    ring_rtt_us: AtomicU64::new(0),
+    ping_rtt_us: AtomicU64::new(0),
     footprint_limit: AtomicU64::new(0),
 };
 
@@ -128,7 +128,7 @@ pub fn render(node: &str, coordinator: bool) -> String {
             ("state=\"active\"", s.requests_active.load(Relaxed) as f64),
             ("state=\"waiting\"", s.requests_waiting.load(Relaxed) as f64),
         ];
-        metric("msh_requests", "gauge", "Requests in the ring and waiting for a slot.", &states);
+        metric("msh_requests", "gauge", "Requests in the cluster and waiting for a slot.", &states);
         for (name, help, c) in [
             ("msh_tokens_generated_total", "Tokens sent to clients.", &s.tokens_generated),
             ("msh_prompt_positions_total", "Prompt positions prefilled.", &s.prompt_positions),
@@ -138,10 +138,10 @@ pub fn render(node: &str, coordinator: bool) -> String {
         ] {
             metric(name, "counter", help, &[("", c.get() as f64)]);
         }
-        let rtt = s.ring_rtt_us.load(Relaxed) as f64 / 1e6;
-        metric("msh_ring_rtt_seconds", "gauge", "Last health ping's trip round the ring.", &[("", rtt)]);
+        let rtt = s.ping_rtt_us.load(Relaxed) as f64 / 1e6;
+        metric("msh_ping_rtt_seconds", "gauge", "Last health ping's trip through every worker.", &[("", rtt)]);
         histogram(&mut out, &l, "msh_time_to_first_token_seconds", "From submission to the first token.", &s.time_to_first_token);
-        histogram(&mut out, &l, "msh_decode_step_seconds", "Decode step round trip through the ring.", &s.decode_step);
+        histogram(&mut out, &l, "msh_decode_step_seconds", "Decode step round trip through the workers.", &s.decode_step);
     }
     histogram(&mut out, &l, "msh_compute_seconds", "This node's compute per step.", &s.compute);
     out

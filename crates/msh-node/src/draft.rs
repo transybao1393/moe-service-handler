@@ -1,6 +1,6 @@
 //! Draft tokens for speculative decoding. The coordinator guesses the next few tokens, sends
-//! them round the ring with the real one as a single step, and keeps the guesses the head
-//! confirms: k guesses cost one ring trip instead of k.
+//! them through the workers with the real one as a single step, and keeps the guesses the head
+//! confirms: k guesses cost one trip through the workers instead of k.
 //!
 //! [`PromptLookup`] needs no model: text often repeats what came before (code, quotes, edits of
 //! the prompt), so the tokens that followed an earlier occurrence of the latest n-gram are a

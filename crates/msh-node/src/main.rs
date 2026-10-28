@@ -30,9 +30,9 @@ use tracing::info;
 use msh_node::http::{self, HttpState};
 use msh_node::{memory, stats};
 use msh_node::metrics::{Metrics, RunInfo};
-use msh_node::node::Ring;
+use msh_node::node::Star;
 use msh_node::engine::{Engine, MockEngine};
-use msh_node::node::{join_ring, Worker};
+use msh_node::node::{accept_controller, connect_workers, Worker};
 use msh_node::planner;
 use msh_node::scheduler::{self, collect};
 
@@ -56,7 +56,7 @@ fn init_logs(cfg: &LogConfig) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-const RING_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn main() -> ExitCode {
     match run() {
@@ -98,7 +98,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let http = cfg.http.as_ref().filter(|_| idx == 0 && flag("--prompt").is_none());
     let codec = http.map(|h| Codec::load(&expand_home(&h.tokenizer), h.chat_template)).transpose()?;
     memory::check_start(&cfg, &memory::growth(&cfg, idx, http.is_some()))?;
-    // Open the engine before joining the ring, so a range that does not fit fails here (DEP-4).
+    // Open the engine before joining the cluster, so a range that does not fit fails here (DEP-4).
     match cfg.engine.kind {
         EngineKind::Mock => {
             serve(&cfg, idx, MockEngine::new(node.layer_range(), cfg.num_layers, cfg.hidden_dim), codec, &flag)
@@ -222,21 +222,23 @@ fn serve<'a, E: Engine + 'static>(
         let listener = TcpListener::bind(addr).map_err(|e| format!("bind prometheus {addr}: {e}"))?;
         stats::serve(listener, name.to_string(), idx == 0);
     }
-    let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
-    let role = if idx == 0 { "coordinator" } else { "worker" };
-    info!(role, layers = ?node.layer_range(), listen = node.listen_addr(), "listening");
-    let ring = join_ring(&cfg, idx, listener, RING_TIMEOUT)?;
-    info!(nodes = cfg.nodes.len(), "ring ready");
-
+    // Workers listen for the controller; the controller connects to each of them.
     if idx > 0 {
-        Worker::new(engine, ring.expect("multi-node ring"), name).run()?;
-        info!("coordinator disconnected, exiting");
+        let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
+        info!(role = "worker", layers = ?node.layer_range(), listen = node.listen_addr(), "waiting for the controller");
+        let link = accept_controller(cfg, idx, listener)?;
+        info!(controller = link.peer_name(), "connected");
+        Worker::new(engine, link, name).run()?;
+        info!("controller disconnected, exiting");
         return Ok(());
     }
+    info!(role = "controller", layers = ?node.layer_range(), workers = cfg.nodes.len() - 1, "connecting to workers");
+    let star = connect_workers(cfg, CONNECT_TIMEOUT)?;
+    info!(nodes = cfg.nodes.len(), "cluster ready");
 
     let metrics = open_metrics(cfg, flag("--metrics"))?;
     if let (Some(codec), Some(http)) = (codec, &cfg.http) {
-        return serve_http(cfg, http, codec, engine, ring, metrics);
+        return serve_http(cfg, http, codec, engine, star, metrics);
     }
     let prompt: Vec<u32> = flag("--prompt")
         .unwrap_or("1,2,3,4,5,6,7,8")
@@ -248,7 +250,7 @@ fn serve<'a, E: Engine + 'static>(
 
     let requests: u32 = flag("--requests").unwrap_or("1").parse().map_err(|e| format!("--requests: {e}"))?;
 
-    let (client, sched) = scheduler::spawn_with_metrics(engine, ring, cfg.scheduler, metrics);
+    let (client, sched) = scheduler::spawn_with_metrics(engine, star, cfg.scheduler, metrics);
     let t0 = Instant::now();
     let rxs: Vec<_> = (0..requests).map(|_| client.submit(prompt.clone(), max_new)).collect();
     let mut total = 0;
@@ -286,10 +288,10 @@ fn serve_http<E: Engine + 'static>(
     http: &HttpConfig,
     codec: Codec,
     engine: E,
-    ring: Option<Ring>,
+    star: Option<Star>,
     metrics: Option<Metrics>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (client, _sched) = scheduler::spawn_with_metrics(engine, ring, cfg.scheduler, metrics);
+    let (client, _sched) = scheduler::spawn_with_metrics(engine, star, cfg.scheduler, metrics);
     let state = Arc::new(HttpState::new(client, codec, http.model.clone(), cfg.engine.n_ctx, memory::http_max_open(cfg)));
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {

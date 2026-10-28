@@ -4,7 +4,7 @@
 //! - `POST /v1/chat/completions`, with `stream: true` for server-sent events.
 //!
 //! Sampling is greedy; `temperature`, `top_p` and other sampling fields are accepted and
-//! ignored. A request the scheduler refuses maps to 429 (queue full) or 503 (ring down or
+//! ignored. A request the scheduler refuses maps to 429 (queue full) or 503 (cluster down or
 //! shutting down). Closing a streaming connection cancels the request. A completion's id is
 //! `chatcmpl-<request id>`, the id in the coordinator's logs.
 //!
@@ -245,7 +245,7 @@ fn finish_reason(generated: usize, max_new: usize) -> &'static str {
 fn status_for(msg: &str) -> StatusCode {
     if msg.starts_with("queue full") {
         StatusCode::TOO_MANY_REQUESTS
-    } else if msg.contains("ring down") || msg.contains("shutting down") || msg.contains("scheduler stopped") {
+    } else if msg.contains("cluster down") || msg.contains("shutting down") || msg.contains("scheduler stopped") {
         StatusCode::SERVICE_UNAVAILABLE
     } else if msg.starts_with("empty prompt") {
         StatusCode::BAD_REQUEST

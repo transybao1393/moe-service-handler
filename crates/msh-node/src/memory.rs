@@ -64,12 +64,16 @@ pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
     // A step brings a prompt chunk, or a token and its drafts.
     let positions = s.prefill_chunk.max(1).max(1 + s.max_draft) as u64;
     let mut b = Budget::default();
-    if cfg.nodes.len() > 1 {
-        b.items.push(("connections", 2 * 2 * msh_net::conn::BUFFER_BYTES as u64));
+    let workers = cfg.nodes.len() as u64 - 1;
+    // A read and a write buffer per connection: one to each worker on the controller, one to
+    // the controller on a worker.
+    let links = if idx == 0 { workers } else { 1 };
+    if workers > 0 {
+        b.items.push(("connections", links * 2 * msh_net::conn::BUFFER_BYTES as u64));
     }
     if idx == 0 {
-        // The step's output, sent straight from it.
-        b.items.push(("frames", positions * row));
+        // The step's output, sent straight from it, and each worker's result passed on.
+        b.items.push(("frames", (1 + workers) * positions * row));
         // Every admitted, queued or parked request holds up to n_ctx token ids.
         let held = (s.max_in_flight.max(1) + s.max_queue + s.prefix_cache) as u64;
         b.items.push(("requests", held * cfg.engine.n_ctx as u64 * 4));
@@ -80,7 +84,7 @@ pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
             b.items.push(("metrics", 64 << 10));
         }
     } else {
-        // The hidden state read straight off the wire, and the step's output sent on.
+        // The hidden state read straight off the wire, and the step's output sent back.
         b.items.push(("frames", 2 * positions * row));
     }
     b
@@ -168,11 +172,13 @@ mod tests {
         .unwrap();
         let coord = growth(&cfg, 0, true);
         let item = |b: &Budget, n: &str| b.items.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
-        assert_eq!(item(&coord, "frames"), Some(64 * 2048 * 4));
+        // Its own output and the one worker's result passed on.
+        assert_eq!(item(&coord, "frames"), Some(2 * 64 * 2048 * 4));
         assert_eq!(item(&coord, "requests"), Some(8 * 2048 * 4));
         assert_eq!(item(&coord, "http bodies"), Some(8 << 20));
-        assert_eq!(item(&coord, "connections"), Some(1 << 20));
+        assert_eq!(item(&coord, "connections"), Some(512 << 10));
         let worker = growth(&cfg, 1, false);
+        assert_eq!(item(&worker, "connections"), Some(512 << 10));
         assert_eq!(item(&worker, "frames"), Some(2 * 64 * 2048 * 4));
         assert_eq!(item(&worker, "requests"), None);
     }

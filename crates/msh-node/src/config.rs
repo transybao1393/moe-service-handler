@@ -4,17 +4,20 @@
 //! hidden_dim = 2048
 //! num_layers = 40
 //!
-//! [[nodes]]                # first node = coordinator, runs the embedding
+//! [[nodes]]                # first node = controller (coordinator), runs the embedding
 //! name = "m4"
 //! addr = "192.168.1.10:7100"
 //! layers = [0, 20]         # half-open layer range
 //! prometheus = "0.0.0.0:9100"  # optional: GET /metrics on this node (CL-12)
 //!
-//! [[nodes]]                # last node runs the head and returns tokens to the first
+//! [[nodes]]                # a worker; the last one runs the head and returns the tokens
 //! name = "m1a"
 //! addr = "192.168.1.11:7100"
 //! layers = [20, 40]
 //! ```
+//!
+//! The controller connects to every worker's `addr`; workers never connect to each other. A
+//! step goes to the first worker, back to the controller, on to the next worker, and so on.
 //!
 //! `layers` (a half-open range) goes on every node or on none. Without it, every node plans
 //! the same split (CL-3) from each node's optional `speed` (default 1) and, under streammoe,
@@ -243,7 +246,7 @@ pub enum KvFormat {
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub name: String,
-    /// Address the other nodes connect to.
+    /// A worker's address, where the controller connects. Unused on the controller.
     pub addr: String,
     /// Address to bind; defaults to `addr`. Use `0.0.0.0:PORT` to listen on every interface.
     pub listen: Option<String>,
