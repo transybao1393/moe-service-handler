@@ -42,6 +42,8 @@ flowchart LR
   position, matching drafts are kept, and `Rewind` drops the rest on every node. Output equals
   plain greedy decoding. Works with the mock engine; streammoe needs per-position logits and
   rewind on a layer range first. See [`docs/speed.md`](docs/speed.md).
+- **Prefix reuse** (`prefix_cache` > 0): finished requests keep their state on every node; the
+  next chat turn takes it over and prefills only the new message.
 - **Health:** a `Ping` travels the ring every second. A broken connection, or a ping not back
   within 5 s (a hung node), marks the ring down: in-flight requests fail and new ones are
   rejected until the cluster is restarted.

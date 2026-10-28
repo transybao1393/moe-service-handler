@@ -15,6 +15,11 @@
 //! the head's next token, and sends `Rewind` round the ring for the rest. Rewind and the next
 //! step follow each other on the same FIFO links, so rejecting costs no extra round trip.
 //!
+//! Prefix reuse (`prefix_cache` > 0): a finished request's state stays on every node. A new
+//! prompt that extends it (the next turn of a chat) takes over its request id and prefills only
+//! the new tokens. The least recently finished is dropped round the ring when more than
+//! `prefix_cache` are kept; engines need `max_in_flight + prefix_cache` request slots.
+//!
 //! Two threads. The scheduler thread owns the engine and the connection to the next node; it
 //! steps ready requests in FIFO order. A reader thread owns the connection from the previous
 //! node and turns every frame into a message for the scheduler. Clients submit through a
@@ -62,6 +67,15 @@ pub struct SchedulerConfig {
     pub max_draft: usize,
     /// Shortest repeat of the latest tokens that prompt lookup drafts from.
     pub draft_min_ngram: usize,
+    /// Finished requests whose state stays on every node for a prompt that extends them.
+    pub prefix_cache: usize,
+}
+
+impl SchedulerConfig {
+    /// Request slots each node's engine needs.
+    pub fn engine_slots(&self) -> usize {
+        self.max_in_flight.max(1) + self.prefix_cache
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -75,6 +89,7 @@ impl Default for SchedulerConfig {
             prefill_depth: 3,
             max_draft: 0,
             draft_min_ngram: 3,
+            prefix_cache: 0,
         }
     }
 }
@@ -210,6 +225,7 @@ pub fn spawn_with_metrics<E: Engine + 'static>(
         ping_seq: 0,
         next_ping_at: Instant::now(),
         ring_rtt: None,
+        parked: VecDeque::new(),
         metrics,
         stages: Vec::new(),
     };
@@ -258,6 +274,18 @@ struct Request {
     queued: Duration,
     /// `Drop` sent; this outcome is reported when it comes back round the ring.
     freeing: Option<Event>,
+    /// Positions taken over from a finished request (prefix reuse).
+    cached: usize,
+    /// Whether the engines hold exactly `tokens[..next_pos]`, so the request can be parked
+    /// when it finishes; not so while a verify step's drafts are still being accepted.
+    parkable: bool,
+}
+
+/// A finished request whose state stays on every node.
+struct Parked {
+    id: u64,
+    /// The positions the engines hold.
+    tokens: Vec<u32>,
 }
 
 impl Request {
@@ -307,6 +335,8 @@ struct Scheduler<E: Engine> {
     next_ping_at: Instant,
     /// Last health ping's trip round the ring (NET-5).
     ring_rtt: Option<Duration>,
+    /// Least recently finished first.
+    parked: VecDeque<Parked>,
     metrics: Option<Metrics>,
     /// Scratch for the stage times of a returning token.
     stages: Vec<u32>,
@@ -379,6 +409,9 @@ impl<E: Engine> Scheduler<E> {
                 for (_, r) in self.waiting.drain(..) {
                     let _ = r.events.send(Event::Rejected("shutting down".into()));
                 }
+                while let Some(p) = self.parked.pop_front() {
+                    self.evict(p);
+                }
             }
         }
     }
@@ -415,14 +448,29 @@ impl<E: Engine> Scheduler<E> {
             submitted: Instant::now(),
             queued: Duration::ZERO,
             freeing: None,
+            cached: 0,
+            parkable: true,
         };
         self.waiting.push_back((id, r));
     }
 
     fn admit(&mut self) {
         while self.active.len() < self.cfg.max_in_flight.max(1) {
-            let Some((id, mut r)) = self.waiting.pop_front() else { break };
+            let Some((mut id, mut r)) = self.waiting.pop_front() else { break };
             r.queued = r.submitted.elapsed();
+            // Continue the longest finished request this prompt extends; at least one prompt
+            // token must be left to step.
+            let reuse = (0..self.parked.len())
+                .filter(|&i| {
+                    let held = &self.parked[i].tokens;
+                    held.len() < r.prompt_len && r.tokens.starts_with(held)
+                })
+                .max_by_key(|&i| self.parked[i].tokens.len());
+            if let Some(p) = reuse.and_then(|i| self.parked.remove(i)) {
+                id = p.id;
+                r.next_pos = p.tokens.len();
+                r.cached = p.tokens.len();
+            }
             self.active.insert(id, r);
             self.ready.push_back(id);
         }
@@ -552,6 +600,7 @@ impl<E: Engine> Scheduler<E> {
                 queue_us: r.queued.as_micros() as u64,
                 in_flight,
                 ring_rtt_us: self.ring_rtt.map(|d| d.as_micros() as u64),
+                cached: r.cached as u32,
                 drafted: step.drafts.len() as u32,
                 accepted: accepted as u32,
             };
@@ -567,6 +616,8 @@ impl<E: Engine> Scheduler<E> {
             }
             return;
         }
+        // Finishing before the rewind below would leave rejected drafts in the engines.
+        r.parkable = step.drafts.is_empty();
         for &token in &tokens[..=accepted] {
             if Some(token) == eos {
                 return self.finish(id, Event::Done);
@@ -582,6 +633,7 @@ impl<E: Engine> Scheduler<E> {
             }
         }
         // Positions up to the last accepted draft stay; the rest go on every node.
+        r.parkable = true;
         r.next_pos = end - (step.drafts.len() - accepted);
         if accepted < step.drafts.len() {
             let keep = r.next_pos as u32;
@@ -599,13 +651,29 @@ impl<E: Engine> Scheduler<E> {
     }
 
     /// Frees the request on this node and, for a ring, sends `Drop` round it; the outcome is
-    /// reported once `Drop` returns, so a finished request is freed on every node (CL-9).
+    /// reported once `Drop` returns, so a finished request is freed on every node (CL-9). A
+    /// request that finished well is parked instead when prefix reuse is on.
     fn finish(&mut self, id: u64, outcome: Event) {
-        self.engine.free(id);
         if let Some(Err(e)) = self.metrics.as_mut().map(Metrics::flush) {
             eprintln!("metrics: {e}");
         }
         self.ready.retain(|&r| r != id);
+        let park = self.cfg.prefix_cache > 0
+            && !self.shutting_down
+            && outcome == Event::Done
+            && self.active.get(&id).is_some_and(|r| r.parkable && r.in_flight.is_empty() && r.next_pos > 0);
+        if park {
+            let mut r = self.active.remove(&id).unwrap();
+            r.tokens.truncate(r.next_pos);
+            let _ = r.events.send(outcome);
+            self.parked.push_back(Parked { id, tokens: r.tokens });
+            if self.parked.len() > self.cfg.prefix_cache {
+                let oldest = self.parked.pop_front().unwrap();
+                self.evict(oldest);
+            }
+            return;
+        }
+        self.engine.free(id);
         let Some(next) = &mut self.next else {
             if let Some(r) = self.active.remove(&id) {
                 let _ = r.events.send(outcome);
@@ -618,6 +686,18 @@ impl<E: Engine> Scheduler<E> {
         }
         if let Some(r) = self.active.get_mut(&id) {
             r.freeing = Some(outcome);
+        }
+    }
+
+    /// Frees a parked request on every node. Its `Drop` comes back to no active request and is
+    /// ignored; any later step for a request reusing the slot follows it on the same links.
+    fn evict(&mut self, p: Parked) {
+        self.engine.free(p.id);
+        if let Some(next) = &mut self.next {
+            if let Err(e) = next.send(MsgType::Drop, p.id, 0, &[]) {
+                let reason = format!("send to {}: {e}", next.peer_name());
+                self.ring_down(reason);
+            }
         }
     }
 
@@ -638,6 +718,9 @@ impl<E: Engine> Scheduler<E> {
         }
         for (_, r) in self.waiting.drain(..) {
             let _ = r.events.send(Event::Failed(failed.clone()));
+        }
+        for p in self.parked.drain(..) {
+            self.engine.free(p.id);
         }
         self.ready.clear();
         self.next = None;

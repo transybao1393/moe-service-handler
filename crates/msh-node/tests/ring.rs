@@ -294,7 +294,7 @@ fn metrics_has_a_row_per_step_with_every_node_timed() {
     assert_eq!(rows.len(), 2 * 8);
     for r in &rows {
         let (kind, step, coord, workers, network, stages) = (r[9], r[11], r[12], r[13], r[14], r[15]);
-        assert_eq!((r[19], r[20]), ("0", "0"), "no drafting by default");
+        assert_eq!((r[19], r[20], r[21]), ("0", "0", "0"), "no reuse or drafting by default");
         assert_eq!(stages.split(';').count(), 3, "every node reports a time: {r:?}");
         let step: u64 = step.parse().unwrap();
         let total = coord.parse::<u64>().unwrap() + workers.parse::<u64>().unwrap() + network.parse::<u64>().unwrap();
@@ -337,7 +337,7 @@ fn speculative_decoding_matches_plain_decoding() {
         let text = std::fs::read_to_string(&path).unwrap();
         let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split(',').collect()).collect();
         let sum = |col: usize| rows.iter().map(|r| r[col].parse::<u32>().unwrap()).sum::<u32>();
-        let (drafted, accepted) = (sum(19), sum(20));
+        let (drafted, accepted) = (sum(20), sum(21));
         let decode_steps = rows.iter().filter(|r| r[9] == "decode").count();
         assert!(accepted > 0 && accepted < drafted, "drafted {drafted}, accepted {accepted}");
         // Every accepted draft is a token that needed no step of its own.
@@ -357,4 +357,72 @@ fn drafting_stops_at_max_tokens() {
     let c = Cluster::start_full(THREE, sched, None, None, vocab);
     assert_eq!(c.client.generate(p, 5).unwrap().tokens, want[0]);
     c.stop_and_check_freed();
+}
+
+/// Runs `turns` one after another on a three-node ring and returns each one's tokens and the
+/// positions it reused (the `cached` column of its first row).
+fn chat_turns(sched: SchedulerConfig, vocab: u32, turns: &[(Vec<u32>, usize)]) -> Vec<(Vec<u32>, u32)> {
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("msh-prefix-{}-{n}", std::process::id()));
+    let path = dir.join("run.csv");
+    let _ = std::fs::remove_file(&path);
+    let run = RunInfo {
+        run_id: 1,
+        git_hash: "test".into(),
+        host: "h".into(),
+        hardware: "hw".into(),
+        split: "3 nodes".into(),
+        engine: "mock".into(),
+    };
+    let c = Cluster::start_full(THREE, sched, None, Some(Metrics::create(&path, &run).unwrap()), vocab);
+    let tokens: Vec<Vec<u32>> = turns.iter().map(|(p, n)| c.client.generate(p.clone(), *n).unwrap().tokens).collect();
+    c.stop_and_check_freed();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split(',').collect()).collect();
+    // Requests run one at a time, and a reused one keeps the request id, so a turn starts at a
+    // prompt step that follows a decode step.
+    let mut cached = Vec::new();
+    let mut decoding = true;
+    for r in &rows {
+        if r[9] != "decode" && decoding {
+            cached.push(r[19].parse().unwrap());
+        }
+        decoding = r[9] == "decode";
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    tokens.into_iter().zip(cached).collect()
+}
+
+#[test]
+fn next_chat_turn_reuses_the_previous_one() {
+    for (max_draft, vocab) in [(0, VOCAB), (4, 6)] {
+        let p1: Vec<u32> = (0..12).map(|k| k % 5).collect();
+        let g1 = reference_with_vocab(&[p1.clone()], 10, vocab).remove(0);
+        // The next turn: the conversation so far plus a new message.
+        let p2: Vec<u32> = [&p1[..], &g1[..], &[4, 3, 2, 1, 0]].concat();
+        let other: Vec<u32> = (0..9).map(|k| (k + 2) % 5).collect();
+        let want = reference_with_vocab(&[p2.clone(), other.clone()], 10, vocab);
+
+        let sched = SchedulerConfig { prefix_cache: 2, max_draft, draft_min_ngram: 2, ..Default::default() };
+        let got = chat_turns(sched, vocab, &[(p1.clone(), 10), (p2, 10), (other, 10)]);
+        assert_eq!(got[0].0, g1);
+        assert_eq!((&got[1].0, &got[2].0), (&want[0], &want[1]), "max_draft {max_draft}");
+        // Turn 2 skips turn 1's prompt and all but its last token, which was never fed.
+        assert_eq!(got[1].1, (p1.len() + g1.len() - 1) as u32, "max_draft {max_draft}");
+        assert_eq!((got[0].1, got[2].1), (0, 0), "nothing to reuse");
+    }
+}
+
+#[test]
+fn oldest_parked_request_is_dropped_everywhere() {
+    // One slot kept: the second conversation evicts the first, so its next turn starts over.
+    let a: Vec<u32> = (0..8).collect();
+    let b: Vec<u32> = (20..28).collect();
+    let ga = reference(&[a.clone()], 4).remove(0);
+    let a2: Vec<u32> = [&a[..], &ga[..], &[99]].concat();
+    let want = reference(&[a2.clone()], 4).remove(0);
+    let sched = SchedulerConfig { prefix_cache: 1, ..Default::default() };
+    let got = chat_turns(sched, VOCAB, &[(a, 4), (b, 4), (a2, 4)]);
+    assert_eq!(got[2], (want, 0));
 }

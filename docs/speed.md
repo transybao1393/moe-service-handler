@@ -29,7 +29,7 @@ Then each node's own step gets faster: expert streaming, prefetch and a balanced
 | Chunked, pipelined prefill | Time to first token (5.6 → 1.4 s on 400 tokens, OLMoE) | scheduler, engine | Done |
 | Speculative decoding, prompt lookup | Several tokens per ring trip when text repeats | scheduler, `draft.rs`, protocol | Cluster side done; streammoe API needed |
 | MTP drafting | Drafts for any text, not just repeats | head node + `Drafter` | Needs MTP weights and streammoe support |
-| Prefix reuse across chat turns | No re-prefill of the conversation so far | scheduler | Next, in this repo |
+| Prefix reuse across chat turns | No re-prefill of the conversation so far | scheduler | Done (`prefix_cache`) |
 | Batched decode per node | Several requests' tokens in one pass on each node | engine | streammoe API needed |
 | Cross-node expert prefetch | Next node starts its SSD reads before the hidden state arrives | protocol, engine | streammoe API needed |
 | Streaming settings per node | Fewer SSD stalls: prefetch guesses, packed 3-bit experts, fast disk tier | `[engine]` | Partly passed through |
@@ -62,6 +62,19 @@ verify pass is disk-bound: the drafts route to experts that are not in RAM. The 
 come out differently, because the hops are paid once per trip instead of once per token,
 and three nodes' RAM holds more experts. That has to be measured on the Mac minis before it
 is turned on by default.
+
+## Prefix reuse
+
+With `prefix_cache = N`, the last N finished requests keep their state on every node. A new
+prompt that starts with everything such a request evaluated, plus at least one more token,
+takes over its request id and prefills only the rest. In a chat, the next turn's prompt is
+the conversation so far, so only the new message is prefilled. The oldest parked request is
+dropped round the ring when more than N are kept.
+
+Each parked request holds a request slot of KV memory on every node, so engines open with
+`max_in_flight + prefix_cache` slots. A request that ends in the middle of a verify step is
+not parked, because its engines still hold rejected drafts. The metrics' `cached` column
+shows the positions each request reused.
 
 ## MTP
 

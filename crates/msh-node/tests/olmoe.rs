@@ -95,13 +95,13 @@ fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
     let mut threads = Vec::new();
     for (k, l) in listeners.enumerate() {
         let (i, cfg) = (k + 1, cfg.clone());
-        let engine = open(cfg.nodes[i].layer_range(), sched.max_in_flight, cap);
+        let engine = open(cfg.nodes[i].layer_range(), sched.engine_slots(), cap);
         threads.push(thread::spawn(move || {
             let ring = join_ring(&cfg, i, l, Duration::from_secs(30)).unwrap().unwrap();
             Worker::new(engine, ring, &cfg.nodes[i].name).run().unwrap();
         }));
     }
-    let engine = open(cfg.nodes[0].layer_range(), sched.max_in_flight, cap);
+    let engine = open(cfg.nodes[0].layer_range(), sched.engine_slots(), cap);
     let ring = join_ring(&cfg, 0, coord_listener, Duration::from_secs(30)).unwrap();
     let (client, coordinator) = scheduler::spawn(engine, ring, sched);
     threads.push(thread::spawn(move || drop(coordinator.join())));
@@ -134,6 +134,17 @@ fn three_node_ring_matches_mlx_reference_with_requests_in_flight() {
     for rx in rxs {
         assert_eq!(collect(rx).unwrap().tokens, REF);
     }
+}
+
+#[test]
+#[ignore = "needs the OLMoE model on disk"]
+fn next_turn_continues_the_parked_request_exactly() {
+    // Turn 1 is the reference question; turn 2 extends the conversation with more tokens.
+    let p2: Vec<u32> = [PROMPT, REF, &[50279, 187], &PROMPT[1..]].concat();
+    let fresh = start(&[[0, 16]]).generate(p2.clone(), 16).unwrap().tokens;
+    let client = start_with(&[[0, 16]], SchedulerConfig { prefix_cache: 1, ..Default::default() });
+    assert_eq!(client.generate(PROMPT.to_vec(), 32).unwrap().tokens, REF);
+    assert_eq!(client.generate(p2, 16).unwrap().tokens, fresh);
 }
 
 #[test]

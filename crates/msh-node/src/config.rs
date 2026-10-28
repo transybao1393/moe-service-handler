@@ -17,7 +17,8 @@
 //!
 //! A single node with `layers = [0, 40]` is mode A. An optional `[scheduler]` table sets
 //! `max_in_flight` (default 3), `max_queue` (64), `health_interval_ms` (1000),
-//! `health_timeout_ms` (5000), `prefill_chunk` (64) and `prefill_depth` (3).
+//! `health_timeout_ms` (5000), `prefill_chunk` (64), `prefill_depth` (3), `max_draft` (0:
+//! no speculative decoding), `draft_min_ngram` (3) and `prefix_cache` (0: no prefix reuse).
 //!
 //! An optional `[engine]` table picks the engine (default: the mock):
 //!

@@ -66,7 +66,7 @@ fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box
         layers: node.layer_range(),
         n_ctx: cfg.engine.n_ctx,
         mem_cap: node.mem_cap(&cfg.engine),
-        max_requests: cfg.scheduler.max_in_flight,
+        max_requests: cfg.scheduler.engine_slots(),
         prefill_chunk: cfg.scheduler.prefill_chunk,
         kv_format: cfg.engine.kv_format,
         attn_threads: cfg.engine.attn_threads,

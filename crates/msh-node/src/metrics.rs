@@ -12,7 +12,7 @@ use std::path::Path;
 
 const HEADER: &str = "run_id,git_hash,host,hardware,split,engine,request,pos,positions,kind,tokens,\
                       step_us,coord_us,workers_us,network_us,stage_us,queue_us,in_flight,ring_rtt_us,\
-                      drafted,accepted";
+                      cached,drafted,accepted";
 
 /// Describes the run; repeated on every row.
 pub struct RunInfo {
@@ -55,6 +55,8 @@ pub struct StepRecord<'a> {
     pub in_flight: usize,
     /// Last health ping's trip round the ring (NET-5), if one has completed.
     pub ring_rtt_us: Option<u64>,
+    /// Prompt positions the request took over from a finished one (prefix reuse).
+    pub cached: u32,
     /// Draft tokens the step carried, and how many the head confirmed.
     pub drafted: u32,
     pub accepted: u32,
@@ -105,7 +107,7 @@ impl Metrics {
         };
         writeln!(
             self.out,
-            "{},{},{},{},{kind},{tokens},{},{coord},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{kind},{tokens},{},{coord},{},{},{},{},{},{},{},{},{}",
             self.run,
             r.request,
             r.pos,
@@ -117,6 +119,7 @@ impl Metrics {
             r.queue_us,
             r.in_flight,
             r.ring_rtt_us.map(|t| t.to_string()).unwrap_or_default(),
+            r.cached,
             r.drafted,
             r.accepted,
         )
@@ -164,6 +167,7 @@ mod tests {
             queue_us: 5,
             in_flight: 2,
             ring_rtt_us: Some(300),
+            cached: 0,
             drafted: 3,
             accepted: 1,
         };
@@ -178,7 +182,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], HEADER);
-        assert_eq!(lines[1], "7,abc,h,\"Apple M4, 16 GB\",m4:0-8 m1a:8-16,mock,1,3,1,prefill,,1000,400,350,250,400;350,5,2,300,3,1");
+        assert_eq!(lines[1], "7,abc,h,\"Apple M4, 16 GB\",m4:0-8 m1a:8-16,mock,1,3,1,prefill,,1000,400,350,250,400;350,5,2,300,0,3,1");
         assert!(lines[2].contains(",decode,42;43,"));
         std::fs::remove_dir_all(dir).unwrap();
     }
