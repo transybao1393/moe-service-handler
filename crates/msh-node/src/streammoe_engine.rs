@@ -13,7 +13,7 @@ use std::path::Path;
 use streammoe::{Ctx, OpenConfig, ReqId, StageInput, StageOutput};
 
 use crate::config::KvFormat;
-use crate::engine::{Engine, StageIn};
+use crate::engine::{Engine, Sample, StageIn};
 use crate::Error;
 
 /// How to open one node's context.
@@ -112,18 +112,29 @@ impl Engine for StreamMoeEngine {
         Some(self.ctx.eos() as u32)
     }
 
+    fn has_head(&self) -> bool {
+        self.ctx.has_head()
+    }
+
     fn step(
         &mut self,
         req: u64,
         start_pos: u32,
         input: StageIn<'_>,
+        sample: Sample,
         hidden_out: &mut Vec<f32>,
-    ) -> Result<Option<u32>, Error> {
+        tokens: &mut Vec<u32>,
+    ) -> Result<(), Error> {
         let engine_err = |e: streammoe::Error| Error::Engine(format!("request {req} position {start_pos}: {e}"));
         let dim = self.hidden_dim();
         let n = input.len(dim);
         if n == 0 {
             return Err(Error::Engine(format!("request {req}: no positions")));
+        }
+        let head = self.ctx.has_head();
+        if head && sample == Sample::Every && n > 1 {
+            // On a layer range streammoe returns the last position's logits only.
+            return Err(Error::Engine(format!("request {req}: streammoe cannot sample every position")));
         }
         if !self.admitted.contains(&req) {
             if start_pos != 0 {
@@ -140,14 +151,18 @@ impl Engine for StreamMoeEngine {
             }
             StageIn::Hidden(h) => StageInput::Hidden(h),
         };
-        let out = if self.ctx.has_head() {
+        let out = if head {
             StageOutput::Logits(&mut self.logits)
         } else {
             hidden_out.resize(n * dim, 0.0);
             StageOutput::Hidden(hidden_out)
         };
         self.ctx.eval_request(ReqId(req), input, start_pos as usize, out).map_err(engine_err)?;
-        Ok(self.ctx.has_head().then(|| argmax(&self.logits)))
+        tokens.clear();
+        if head {
+            tokens.push(argmax(&self.logits));
+        }
+        Ok(())
     }
 
     fn free(&mut self, req: u64) {

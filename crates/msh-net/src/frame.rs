@@ -7,20 +7,26 @@
 //! | 0      | 4    | magic `b"MSHN"`               |
 //! | 4      | 2    | protocol version              |
 //! | 6      | 1    | message type                  |
-//! | 7      | 1    | flags (reserved, must be 0)   |
+//! | 7      | 1    | flags (see [`FLAG_EVERY_TOKEN`]) |
 //! | 8      | 8    | request id                    |
 //! | 16     | 4    | position (first, for a chunk) |
 //! | 20     | 4    | payload length in bytes       |
 //!
 //! A `Hidden` frame carries one or more consecutive positions starting at `position` (a
 //! prefill chunk); the matching `Token` frame repeats that start position and holds the token
-//! sampled after the chunk's last position.
+//! sampled after the chunk's last position, or with [`FLAG_EVERY_TOKEN`] one token per position
+//! (verifying draft tokens in speculative decoding).
 
 use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"MSHN";
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
+
+/// On a `Hidden` frame: the head returns the token sampled after every position, not just the
+/// last. Workers pass it on.
+pub const FLAG_EVERY_TOKEN: u8 = 1;
+const KNOWN_FLAGS: u8 = FLAG_EVERY_TOKEN;
 pub const HEADER_LEN: usize = 24;
 /// Upper bound on a payload; guards against a corrupt length field allocating gigabytes.
 /// 64 MiB covers an 8k-token f32 prefill chunk (8192 × 2048 × 4 = 64 MiB).
@@ -33,7 +39,7 @@ pub enum MsgType {
     /// [`encode_hidden`]). f32 rather than BF16 because the engine works in f32 and a split
     /// pipeline must match a single process exactly (NF-1).
     Hidden = 1,
-    /// Sampled token id (u32), then stage times (see [`encode_token`]).
+    /// Sampled token ids, then stage times (see [`encode_token`]).
     Token = 2,
     /// Free all state for a request on the receiving node.
     Drop = 3,
@@ -43,6 +49,9 @@ pub enum MsgType {
     Hello = 6,
     /// Fatal error; payload is a UTF-8 message.
     Error = 7,
+    /// Keep only the first `position` positions of a request (rejected draft tokens). Travels
+    /// the ring like `Drop`; no payload.
+    Rewind = 8,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -57,6 +66,7 @@ impl TryFrom<u8> for MsgType {
             5 => MsgType::Pong,
             6 => MsgType::Hello,
             7 => MsgType::Error,
+            8 => MsgType::Rewind,
             other => return Err(FrameError::UnknownType(other)),
         })
     }
@@ -66,6 +76,7 @@ impl TryFrom<u8> for MsgType {
 pub struct Header {
     pub version: u16,
     pub msg_type: MsgType,
+    pub flags: u8,
     pub request_id: u64,
     pub position: u32,
     pub payload_len: u32,
@@ -76,10 +87,16 @@ impl Header {
         Header {
             version: PROTOCOL_VERSION,
             msg_type,
+            flags: 0,
             request_id,
             position,
             payload_len: payload_len as u32,
         }
+    }
+
+    pub fn with_flags(mut self, flags: u8) -> Self {
+        self.flags = flags;
+        self
     }
 
     pub fn encode(&self) -> [u8; HEADER_LEN] {
@@ -87,7 +104,7 @@ impl Header {
         b[0..4].copy_from_slice(&MAGIC);
         b[4..6].copy_from_slice(&self.version.to_le_bytes());
         b[6] = self.msg_type as u8;
-        b[7] = 0;
+        b[7] = self.flags;
         b[8..16].copy_from_slice(&self.request_id.to_le_bytes());
         b[16..20].copy_from_slice(&self.position.to_le_bytes());
         b[20..24].copy_from_slice(&self.payload_len.to_le_bytes());
@@ -99,7 +116,7 @@ impl Header {
         if b[0..4] != MAGIC {
             return Err(FrameError::BadMagic([b[0], b[1], b[2], b[3]]));
         }
-        if b[7] != 0 {
+        if b[7] & !KNOWN_FLAGS != 0 {
             return Err(FrameError::BadFlags(b[7]));
         }
         let payload_len = u32::from_le_bytes(b[20..24].try_into().unwrap());
@@ -109,6 +126,7 @@ impl Header {
         Ok(Header {
             version: u16::from_le_bytes(b[4..6].try_into().unwrap()),
             msg_type: MsgType::try_from(b[6])?,
+            flags: b[7],
             request_id: u64::from_le_bytes(b[8..16].try_into().unwrap()),
             position: u32::from_le_bytes(b[16..20].try_into().unwrap()),
             payload_len,
@@ -179,7 +197,7 @@ pub fn read_frame<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Header, F
 // clocks need not agree.
 //
 //   Hidden: stage_count u16, stage_us u32 × stage_count, f32 × (positions × hidden_dim)
-//   Token:  token u32, stage_count u16, stage_us u32 × stage_count
+//   Token:  token_count u16, token u32 × token_count, stage_count u16, stage_us u32 × stage_count
 
 /// Encodes a hidden-state payload.
 pub fn encode_hidden(stage_us: &[u32], values: &[f32], out: &mut Vec<u8>) {
@@ -209,20 +227,31 @@ pub fn decode_hidden(
     Ok(rest.len() / row)
 }
 
-/// Encodes a token payload.
-pub fn encode_token(token: u32, stage_us: &[u32], out: &mut Vec<u8>) {
+/// Encodes a token payload: one token, or one per position of a verify step.
+pub fn encode_token(tokens: &[u32], stage_us: &[u32], out: &mut Vec<u8>) {
     out.clear();
-    out.extend_from_slice(&token.to_le_bytes());
+    out.extend_from_slice(&(tokens.len() as u16).to_le_bytes());
+    for t in tokens {
+        out.extend_from_slice(&t.to_le_bytes());
+    }
     write_stages(stage_us, out);
 }
 
-/// Decodes a token payload, filling `stage_us`.
-pub fn decode_token(bytes: &[u8], stage_us: &mut Vec<u32>) -> Result<u32, FrameError> {
-    let (token, rest) = bytes.split_at_checked(4).ok_or_else(|| bad_payload("token payload too short".into()))?;
+/// Decodes a token payload into `tokens` and `stage_us`.
+pub fn decode_token(bytes: &[u8], tokens: &mut Vec<u32>, stage_us: &mut Vec<u32>) -> Result<(), FrameError> {
+    let short = || bad_payload("token payload too short".into());
+    let (n, rest) = bytes.split_at_checked(2).ok_or_else(short)?;
+    let n = u16::from_le_bytes(n.try_into().unwrap()) as usize;
+    let (ids, rest) = rest.split_at_checked(4 * n).ok_or_else(short)?;
+    if n == 0 {
+        return Err(bad_payload("token payload without tokens".into()));
+    }
     if !read_stages(rest, stage_us)?.is_empty() {
         return Err(bad_payload("trailing bytes after token stage times".into()));
     }
-    Ok(u32::from_le_bytes(token.try_into().unwrap()))
+    tokens.clear();
+    tokens.extend(ids.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())));
+    Ok(())
 }
 
 fn write_stages(stage_us: &[u32], out: &mut Vec<u8>) {
@@ -270,18 +299,24 @@ mod tests {
     #[test]
     fn token_payload_round_trip() {
         let mut bytes = Vec::new();
-        encode_token(50_279, &[7, 8, 9], &mut bytes);
-        let mut stages = Vec::new();
-        assert_eq!(decode_token(&bytes, &mut stages).unwrap(), 50_279);
-        assert_eq!(stages, [7, 8, 9]);
-        assert!(decode_token(&bytes[..5], &mut stages).is_err());
+        let (mut tokens, mut stages) = (Vec::new(), Vec::new());
+        for want in [&[50_279][..], &[1, 2, 3, 4]] {
+            encode_token(want, &[7, 8, 9], &mut bytes);
+            decode_token(&bytes, &mut tokens, &mut stages).unwrap();
+            assert_eq!((&tokens[..], &stages[..]), (want, &[7, 8, 9][..]));
+        }
+        assert!(decode_token(&bytes[..5], &mut tokens, &mut stages).is_err());
         bytes.push(0);
-        assert!(decode_token(&bytes, &mut stages).is_err());
+        assert!(decode_token(&bytes, &mut tokens, &mut stages).is_err());
+        encode_token(&[], &[], &mut bytes);
+        assert!(decode_token(&bytes, &mut tokens, &mut stages).is_err());
     }
 
     #[test]
     fn header_round_trip() {
         let h = Header::new(MsgType::Hidden, 0xDEAD_BEEF_0123_4567, 42, 4096);
+        assert_eq!(Header::decode(&h.encode()).unwrap(), h);
+        let h = h.with_flags(FLAG_EVERY_TOKEN);
         assert_eq!(Header::decode(&h.encode()).unwrap(), h);
     }
 
@@ -309,6 +344,10 @@ mod tests {
         let mut b = Header::new(MsgType::Ping, 0, 0, 0).encode();
         b[20..24].copy_from_slice(&(MAX_PAYLOAD as u32 + 1).to_le_bytes());
         assert!(matches!(Header::decode(&b), Err(FrameError::TooLarge(_))));
+
+        let mut b = Header::new(MsgType::Ping, 0, 0, 0).encode();
+        b[7] = 0x80;
+        assert!(matches!(Header::decode(&b), Err(FrameError::BadFlags(0x80))));
     }
 
     #[test]

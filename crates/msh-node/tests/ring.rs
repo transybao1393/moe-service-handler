@@ -12,6 +12,8 @@ use msh_node::Error;
 
 const DIM: usize = 2048;
 const THREE: &[[u32; 2]] = &[[0, 20], [20, 30], [30, 40]];
+/// The mock's default vocabulary: generated text practically never repeats.
+const VOCAB: u32 = 151_936;
 
 fn prompt(i: u32) -> Vec<u32> {
     (0..5).map(|k| 11 * (k + 1) + 100 * i).collect()
@@ -31,7 +33,7 @@ impl Cluster {
     /// Starts every node on loopback threads. With `fail = Some((node, req))`, that node's
     /// engine fails every step of request `req`.
     fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig, fail: Option<(usize, u64)>) -> Cluster {
-        Cluster::start_full(splits, sched, fail, None)
+        Cluster::start_full(splits, sched, fail, None, VOCAB)
     }
 
     fn start_full(
@@ -39,6 +41,7 @@ impl Cluster {
         sched: SchedulerConfig,
         fail: Option<(usize, u64)>,
         metrics: Option<Metrics>,
+        vocab: u32,
     ) -> Cluster {
         let listeners: Vec<TcpListener> =
             splits.iter().map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
@@ -65,7 +68,7 @@ impl Cluster {
         cfg.validate().unwrap();
 
         let engine = |i: usize| {
-            let e = MockEngine::new(cfg.nodes[i].layer_range(), 40, DIM);
+            let e = MockEngine::new(cfg.nodes[i].layer_range(), 40, DIM).with_vocab(vocab);
             match fail {
                 Some((node, req)) if node == i => e.failing_on(req),
                 _ => e,
@@ -101,8 +104,12 @@ impl Cluster {
 
 /// Reference output: one node, all 40 layers, one request at a time, one position per step.
 fn reference(prompts: &[Vec<u32>], max_new: usize) -> Vec<Vec<u32>> {
+    reference_with_vocab(prompts, max_new, VOCAB)
+}
+
+fn reference_with_vocab(prompts: &[Vec<u32>], max_new: usize, vocab: u32) -> Vec<Vec<u32>> {
     let sched = SchedulerConfig { prefill_chunk: 1, ..Default::default() };
-    let c = Cluster::start_with(&[[0, 40]], sched, None);
+    let c = Cluster::start_full(&[[0, 40]], sched, None, None, vocab);
     prompts.iter().map(|p| c.client.generate(p.clone(), max_new).unwrap().tokens).collect()
 }
 
@@ -273,7 +280,7 @@ fn metrics_has_a_row_per_step_with_every_node_timed() {
     };
     let metrics = Metrics::create(&path, &run).unwrap();
     let sched = SchedulerConfig { prefill_chunk: 2, ..Default::default() };
-    let c = Cluster::start_full(THREE, sched, None, Some(metrics));
+    let c = Cluster::start_full(THREE, sched, None, Some(metrics), VOCAB);
     let rxs: Vec<_> = (0..2).map(|i| c.client.submit(prompt(i), 6)).collect();
     for rx in rxs {
         collect(rx).unwrap();
@@ -287,6 +294,7 @@ fn metrics_has_a_row_per_step_with_every_node_timed() {
     assert_eq!(rows.len(), 2 * 8);
     for r in &rows {
         let (kind, step, coord, workers, network, stages) = (r[9], r[11], r[12], r[13], r[14], r[15]);
+        assert_eq!((r[19], r[20]), ("0", "0"), "no drafting by default");
         assert_eq!(stages.split(';').count(), 3, "every node reports a time: {r:?}");
         let step: u64 = step.parse().unwrap();
         let total = coord.parse::<u64>().unwrap() + workers.parse::<u64>().unwrap() + network.parse::<u64>().unwrap();
@@ -298,4 +306,55 @@ fn metrics_has_a_row_per_step_with_every_node_timed() {
     let positions = |k| rows.iter().filter(|r| r[9] == k).map(|r| r[8].parse::<u32>().unwrap()).sum::<u32>();
     assert_eq!((positions("prefill"), positions("first_token")), (8, 2));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn speculative_decoding_matches_plain_decoding() {
+    // Six token ids make the text repeat, so prompt lookup drafts often and the head both
+    // confirms and rejects drafts.
+    let vocab = 6;
+    let prompts: Vec<Vec<u32>> = (0..4).map(|i| (0..20).map(|k| (k * (i + 1)) % 5).collect()).collect();
+    let want = reference_with_vocab(&prompts, 60, vocab);
+    for splits in [THREE, &[[0, 40]][..]] {
+        let dir = std::env::temp_dir().join(format!("msh-spec-{}-{}", std::process::id(), splits.len()));
+        let path = dir.join("run.csv");
+        let metrics = Metrics::create(&path, &RunInfo {
+            run_id: 1,
+            git_hash: "test".into(),
+            host: "h".into(),
+            hardware: "hw".into(),
+            split: format!("{} nodes", splits.len()),
+            engine: "mock".into(),
+        })
+        .unwrap();
+        let sched = SchedulerConfig { max_draft: 4, draft_min_ngram: 2, ..Default::default() };
+        let c = Cluster::start_full(splits, sched, None, Some(metrics), vocab);
+        let rxs: Vec<_> = prompts.iter().map(|p| c.client.submit(p.clone(), 60)).collect();
+        let got: Vec<_> = rxs.into_iter().map(|rx| collect(rx).unwrap().tokens).collect();
+        assert_eq!(got, want, "splits {splits:?}");
+        c.stop_and_check_freed();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split(',').collect()).collect();
+        let sum = |col: usize| rows.iter().map(|r| r[col].parse::<u32>().unwrap()).sum::<u32>();
+        let (drafted, accepted) = (sum(19), sum(20));
+        let decode_steps = rows.iter().filter(|r| r[9] == "decode").count();
+        assert!(accepted > 0 && accepted < drafted, "drafted {drafted}, accepted {accepted}");
+        // Every accepted draft is a token that needed no step of its own.
+        assert_eq!(decode_steps as u32 + accepted, 4 * 59, "splits {splits:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn drafting_stops_at_max_tokens() {
+    // A prompt that repeats exactly: drafts are long and right, and must not run past
+    // max_new.
+    let vocab = 6;
+    let p: Vec<u32> = (0..30).map(|k| k % 3).collect();
+    let want = reference_with_vocab(&[p.clone()], 5, vocab);
+    let sched = SchedulerConfig { max_draft: 4, draft_min_ngram: 2, ..Default::default() };
+    let c = Cluster::start_full(THREE, sched, None, None, vocab);
+    assert_eq!(c.client.generate(p, 5).unwrap().tokens, want[0]);
+    c.stop_and_check_freed();
 }

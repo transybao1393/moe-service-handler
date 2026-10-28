@@ -5,6 +5,7 @@
 
 pub mod chat;
 pub mod config;
+pub mod draft;
 pub mod engine;
 pub mod http;
 pub mod metrics;

@@ -9,6 +9,12 @@
 //! runs chunk 2 while the workers run chunk 1. Every link is FIFO, so chunks reach each node in
 //! order. Only the last chunk's token is used; it is the first generated token.
 //!
+//! Speculative decoding (`max_draft` > 0, engines that can rewind): a decode step carries the
+//! next token plus up to `max_draft` drafted guesses, and the head samples after every
+//! position. The coordinator keeps the guesses that match the head's tokens, emits those and
+//! the head's next token, and sends `Rewind` round the ring for the rest. Rewind and the next
+//! step follow each other on the same FIFO links, so rejecting costs no extra round trip.
+//!
 //! Two threads. The scheduler thread owns the engine and the connection to the next node; it
 //! steps ready requests in FIFO order. A reader thread owns the connection from the previous
 //! node and turns every frame into a message for the scheduler. Clients submit through a
@@ -27,10 +33,11 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use msh_net::{decode_token, encode_hidden, Connection, Header, MsgType};
+use msh_net::{decode_token, encode_hidden, Connection, Header, MsgType, FLAG_EVERY_TOKEN};
 use serde::Deserialize;
 
-use crate::engine::{Engine, StageIn};
+use crate::draft::{Drafter, PromptLookup};
+use crate::engine::{Engine, Sample, StageIn};
 use crate::metrics::{Metrics, StepKind, StepRecord};
 use crate::node::Ring;
 use crate::Error;
@@ -51,6 +58,10 @@ pub struct SchedulerConfig {
     pub prefill_chunk: usize,
     /// Prefill chunks of one request in the ring at once.
     pub prefill_depth: usize,
+    /// Draft tokens per decode step (speculative decoding); 0 turns it off.
+    pub max_draft: usize,
+    /// Shortest repeat of the latest tokens that prompt lookup drafts from.
+    pub draft_min_ngram: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -62,6 +73,8 @@ impl Default for SchedulerConfig {
             health_timeout_ms: 5000,
             prefill_chunk: 64,
             prefill_depth: 3,
+            max_draft: 0,
+            draft_min_ngram: 3,
         }
     }
 }
@@ -171,12 +184,21 @@ pub fn spawn_with_metrics<E: Engine + 'static>(
         thread::spawn(move || read_ring(prev, tx));
         next
     });
+    let mut cfg = cfg;
+    if cfg.max_draft > 0 && !engine.can_speculate() {
+        eprintln!("scheduler: the engine cannot verify and rewind draft tokens; speculative decoding is off");
+        cfg.max_draft = 0;
+    }
+    let drafter = PromptLookup { min_ngram: cfg.draft_min_ngram, max_ngram: cfg.draft_min_ngram.max(8) };
     let s = Scheduler {
         engine,
         next,
         cfg,
         rx,
+        drafter: Box::new(drafter),
         hidden: Vec::new(),
+        input: Vec::new(),
+        tokens: Vec::new(),
         buf: Vec::new(),
         next_id: 1,
         waiting: VecDeque::new(),
@@ -215,17 +237,19 @@ fn read_ring(mut prev: Connection, tx: Sender<Msg>) {
 struct Step {
     start: u32,
     positions: u32,
+    /// Draft tokens after the real one; the head samples every position when there are any.
+    drafts: Vec<u32>,
     started: Instant,
 }
 
 struct Request {
-    prompt: Vec<u32>,
+    /// The prompt, then every generated token.
+    tokens: Vec<u32>,
+    prompt_len: usize,
     max_new: usize,
-    /// Position of the next step on the coordinator.
+    /// Position of the next step on the coordinator. While decoding, `tokens[next_pos]` is the
+    /// last generated token, the next step's input.
     next_pos: usize,
-    /// The last generated token: the input of the next decode step.
-    last: u32,
-    generated: usize,
     events: Sender<Event>,
     /// Oldest first.
     in_flight: VecDeque<Step>,
@@ -237,11 +261,15 @@ struct Request {
 }
 
 impl Request {
+    fn generated(&self) -> usize {
+        self.tokens.len() - self.prompt_len
+    }
+
     /// Whether the coordinator can run this request's next step now.
     fn can_step(&self, cfg: &SchedulerConfig) -> bool {
         if self.freeing.is_some() {
             false
-        } else if self.next_pos < self.prompt.len() {
+        } else if self.next_pos < self.prompt_len {
             self.in_flight.len() < cfg.prefill_depth.max(1)
         } else {
             self.in_flight.is_empty()
@@ -260,7 +288,11 @@ struct Scheduler<E: Engine> {
     next: Option<Connection>,
     cfg: SchedulerConfig,
     rx: Receiver<Msg>,
+    drafter: Box<dyn Drafter>,
     hidden: Vec<f32>,
+    /// Scratch for a step's input tokens and the head's output tokens.
+    input: Vec<u32>,
+    tokens: Vec<u32>,
     buf: Vec<u8>,
     next_id: u64,
     waiting: VecDeque<(u64, Request)>,
@@ -374,11 +406,10 @@ impl<E: Engine> Scheduler<E> {
         let id = self.next_id;
         self.next_id += 1;
         let r = Request {
-            prompt,
+            prompt_len: prompt.len(),
+            tokens: prompt,
             max_new,
             next_pos: 0,
-            last: 0,
-            generated: 0,
             events,
             in_flight: VecDeque::new(),
             submitted: Instant::now(),
@@ -397,39 +428,52 @@ impl<E: Engine> Scheduler<E> {
         }
     }
 
-    /// Runs the coordinator's part of the request's next step (a prompt chunk or one decode
-    /// position) and sends it on (or, with one node, finishes it).
+    /// Runs the coordinator's part of the request's next step (a prompt chunk, or a decode
+    /// position with any draft tokens) and sends it on (or, with one node, finishes it).
     fn step(&mut self, id: u64) {
         let Some(r) = self.active.get_mut(&id).filter(|r| r.can_step(&self.cfg)) else { return };
         let started = Instant::now();
         let start = r.next_pos;
-        let tokens = match r.prompt.get(start..) {
-            Some(rest) if !rest.is_empty() => &rest[..rest.len().min(self.cfg.prefill_chunk.max(1))],
-            _ => std::slice::from_ref(&r.last),
-        };
-        let positions = tokens.len() as u32;
-        let token = match self.engine.step(id, start as u32, StageIn::Tokens(tokens), &mut self.hidden) {
-            Ok(token) => token,
-            Err(e) => return self.finish(id, Event::Failed(e.to_string())),
-        };
+        let mut drafts = Vec::new();
+        self.input.clear();
+        if start < r.prompt_len {
+            let end = r.prompt_len.min(start + self.cfg.prefill_chunk.max(1));
+            self.input.extend_from_slice(&r.tokens[start..end]);
+        } else {
+            self.input.push(r.tokens[start]);
+            // Never draft past the last token the request may still produce.
+            let room = r.max_new - r.generated() - 1;
+            self.drafter.draft(&r.tokens, self.cfg.max_draft.min(room), &mut drafts);
+            self.input.extend_from_slice(&drafts);
+        }
+        let sample = if drafts.is_empty() { Sample::Last } else { Sample::Every };
+        let input = StageIn::Tokens(&self.input);
+        if let Err(e) = self.engine.step(id, start as u32, input, sample, &mut self.hidden, &mut self.tokens) {
+            return self.finish(id, Event::Failed(e.to_string()));
+        }
         let coord_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        let positions = self.input.len() as u32;
         r.next_pos += positions as usize;
-        r.in_flight.push_back(Step { start: start as u32, positions, started });
-        let next = match (token, &mut self.next) {
+        r.in_flight.push_back(Step { start: start as u32, positions, drafts, started });
+        let next = match (self.engine.has_head(), &mut self.next) {
             // One node holds every layer and the head.
-            (Some(token), None) => {
+            (true, None) => {
                 self.stages.clear();
                 self.stages.push(coord_us);
-                return self.on_token(id, start as u32, token);
+                let tokens = std::mem::take(&mut self.tokens);
+                self.on_tokens(id, start as u32, &tokens);
+                self.tokens = tokens;
+                return;
             }
-            (None, Some(next)) => next,
-            (Some(_), Some(_)) | (None, None) => {
+            (false, Some(next)) => next,
+            (true, Some(_)) | (false, None) => {
                 let msg = "coordinator stage does not match the ring (head on the wrong node)";
                 return self.finish(id, Event::Failed(msg.into()));
             }
         };
         encode_hidden(&[coord_us], &self.hidden, &mut self.buf);
-        if let Err(e) = next.send(MsgType::Hidden, id, start as u32, &self.buf) {
+        let flags = if sample == Sample::Every { FLAG_EVERY_TOKEN } else { 0 };
+        if let Err(e) = next.send_flagged(MsgType::Hidden, flags, id, start as u32, &self.buf) {
             let reason = format!("send to {}: {e}", next.peer_name());
             return self.ring_down(reason);
         }
@@ -443,8 +487,12 @@ impl<E: Engine> Scheduler<E> {
         let id = h.request_id;
         let in_flight = self.active.get(&id).is_some_and(|r| r.freeing.is_none() && !r.in_flight.is_empty());
         match h.msg_type {
-            MsgType::Token if in_flight => match decode_token(&payload, &mut self.stages) {
-                Ok(token) => self.on_token(id, h.position, token),
+            MsgType::Token if in_flight => match decode_token(&payload, &mut self.tokens, &mut self.stages) {
+                Ok(()) => {
+                    let tokens = std::mem::take(&mut self.tokens);
+                    self.on_tokens(id, h.position, &tokens);
+                    self.tokens = tokens;
+                }
                 Err(e) => self.finish(id, Event::Failed(format!("bad token frame: {e}"))),
             },
             MsgType::Error if in_flight => {
@@ -462,15 +510,16 @@ impl<E: Engine> Scheduler<E> {
                     let _ = r.events.send(outcome);
                 }
             }
-            // Frames for requests that already failed are expected and harmless.
-            MsgType::Token | MsgType::Error => {}
+            // Frames for requests that already failed are expected and harmless; a `Rewind`
+            // back from the ring needs nothing more.
+            MsgType::Token | MsgType::Error | MsgType::Rewind => {}
             other => self.ring_down(format!("unexpected {other:?} frame from the ring")),
         }
     }
 
-    /// Handles the token produced by the step starting at `start`; `self.stages` holds the
+    /// Handles the head's tokens for the step starting at `start`; `self.stages` holds the
     /// step's per-node times.
-    fn on_token(&mut self, id: u64, start: u32, token: u32) {
+    fn on_tokens(&mut self, id: u64, start: u32, tokens: &[u32]) {
         let eos = self.engine.eos();
         let in_flight = self.active.len();
         let Some(r) = self.active.get_mut(&id) else { return };
@@ -478,24 +527,33 @@ impl<E: Engine> Scheduler<E> {
             let msg = format!("unexpected token for position {start}");
             return self.finish(id, Event::Failed(msg));
         };
+        let want = if step.drafts.is_empty() { 1 } else { step.positions as usize };
+        if tokens.len() != want {
+            let msg = format!("{} tokens for a step that samples {want}", tokens.len());
+            return self.finish(id, Event::Failed(msg));
+        }
         let end = (step.start + step.positions) as usize;
         let kind = match end {
-            n if n < r.prompt.len() => StepKind::Prefill,
-            n if n == r.prompt.len() => StepKind::FirstToken,
+            n if n < r.prompt_len => StepKind::Prefill,
+            n if n == r.prompt_len => StepKind::FirstToken,
             _ => StepKind::Decode,
         };
+        // Drafts the head agrees with: tokens[i] is the head's token after draft i - 1.
+        let accepted = step.drafts.iter().zip(tokens).take_while(|(d, t)| d == t).count();
         if let Some(m) = &mut self.metrics {
             let rec = StepRecord {
                 request: id,
                 pos: step.start,
                 positions: step.positions,
                 kind,
-                token,
+                tokens: &tokens[..=accepted],
                 step_us: step.started.elapsed().as_micros() as u64,
                 stage_us: &self.stages,
                 queue_us: r.queued.as_micros() as u64,
                 in_flight,
                 ring_rtt_us: self.ring_rtt.map(|d| d.as_micros() as u64),
+                drafted: step.drafts.len() as u32,
+                accepted: accepted as u32,
             };
             if let Err(e) = m.record(&rec) {
                 eprintln!("metrics: {e}; no more rows will be written");
@@ -509,19 +567,34 @@ impl<E: Engine> Scheduler<E> {
             }
             return;
         }
-        if Some(token) == eos {
-            return self.finish(id, Event::Done);
+        for &token in &tokens[..=accepted] {
+            if Some(token) == eos {
+                return self.finish(id, Event::Done);
+            }
+            r.tokens.push(token);
+            let ev = Event::Token { token, latency: step.started.elapsed() };
+            if r.events.send(ev).is_err() {
+                // The client went away: cancel. Nobody is listening for the outcome.
+                return self.finish(id, Event::Done);
+            }
+            if r.generated() == r.max_new {
+                return self.finish(id, Event::Done);
+            }
         }
-        r.generated += 1;
-        let ev = Event::Token { token, latency: step.started.elapsed() };
-        if r.events.send(ev).is_err() {
-            // The client went away: cancel. Nobody is listening for the outcome.
-            return self.finish(id, Event::Done);
+        // Positions up to the last accepted draft stay; the rest go on every node.
+        r.next_pos = end - (step.drafts.len() - accepted);
+        if accepted < step.drafts.len() {
+            let keep = r.next_pos as u32;
+            if let Err(e) = self.engine.rewind(id, keep) {
+                return self.finish(id, Event::Failed(e.to_string()));
+            }
+            if let Some(next) = &mut self.next {
+                if let Err(e) = next.send(MsgType::Rewind, id, keep, &[]) {
+                    let reason = format!("send to {}: {e}", next.peer_name());
+                    return self.ring_down(reason);
+                }
+            }
         }
-        if r.generated == r.max_new {
-            return self.finish(id, Event::Done);
-        }
-        r.last = token;
         push_ready(&mut self.ready, id);
     }
 

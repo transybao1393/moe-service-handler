@@ -2,18 +2,19 @@
 //!
 //! Nodes form a ring in config order: node i sends hidden states to node i+1, and the last
 //! node sends sampled token ids back to node 0, the coordinator. `Drop` travels the whole ring,
-//! so when it returns to the coordinator every node has freed the request (CL-9). An engine
-//! error on a worker travels on to the coordinator as an `Error` frame; the ring stays up.
+//! so when it returns to the coordinator every node has freed the request (CL-9); `Rewind`
+//! (rejected draft tokens) travels the same way. An engine error on a worker travels on to the
+//! coordinator as an `Error` frame; the ring stays up.
 
 use std::io::ErrorKind;
 use std::net::TcpListener;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use msh_net::{decode_hidden, encode_hidden, encode_token, Connection, FrameError, MsgType};
+use msh_net::{decode_hidden, encode_hidden, encode_token, Connection, FrameError, MsgType, FLAG_EVERY_TOKEN};
 
 use crate::config::Config;
-use crate::engine::{Engine, StageIn};
+use crate::engine::{Engine, Sample, StageIn};
 use crate::Error;
 
 pub struct Ring {
@@ -101,6 +102,7 @@ impl<E: Engine> Worker<E> {
         let dim = self.engine.hidden_dim();
         let mut hidden = Vec::new();
         let mut hidden_out = Vec::new();
+        let mut tokens = Vec::new();
         let mut buf = Vec::new();
         let mut out = Vec::new();
         let mut stages = Vec::new();
@@ -112,29 +114,39 @@ impl<E: Engine> Worker<E> {
             };
             match h.msg_type {
                 MsgType::Hidden => {
+                    let sample = if h.flags & FLAG_EVERY_TOKEN != 0 { Sample::Every } else { Sample::Last };
                     let decoded = decode_hidden(&buf, dim, &mut hidden, &mut stages).map_err(Error::from);
                     let result = decoded.and_then(|_| {
                         let t0 = Instant::now();
-                        let r = self.engine.step(h.request_id, h.position, StageIn::Hidden(&hidden), &mut hidden_out);
+                        let input = StageIn::Hidden(&hidden);
+                        let r = self.engine.step(h.request_id, h.position, input, sample, &mut hidden_out, &mut tokens);
                         // This node's compute time travels on with the positions (CL-10).
                         stages.push(t0.elapsed().as_micros().min(u32::MAX as u128) as u32);
                         r
                     });
+                    let next = &mut self.ring.next;
                     let sent = match result {
-                        Ok(Some(token)) => {
-                            encode_token(token, &stages, &mut out);
-                            self.ring.next.send(MsgType::Token, h.request_id, h.position, &out)
+                        Ok(()) if self.engine.has_head() => {
+                            encode_token(&tokens, &stages, &mut out);
+                            next.send(MsgType::Token, h.request_id, h.position, &out)
                         }
-                        Ok(None) => {
+                        Ok(()) => {
                             encode_hidden(&stages, &hidden_out, &mut out);
-                            self.ring.next.send(MsgType::Hidden, h.request_id, h.position, &out)
+                            next.send_flagged(MsgType::Hidden, h.flags, h.request_id, h.position, &out)
                         }
                         Err(e) => {
                             let msg = format!("{}: {e}", self.name);
-                            self.ring.next.send(MsgType::Error, h.request_id, h.position, msg.as_bytes())
+                            next.send(MsgType::Error, h.request_id, h.position, msg.as_bytes())
                         }
                     };
                     sent?;
+                }
+                MsgType::Rewind => {
+                    if let Err(e) = self.engine.rewind(h.request_id, h.position) {
+                        let msg = format!("{}: {e}", self.name);
+                        self.ring.next.send(MsgType::Error, h.request_id, h.position, msg.as_bytes())?;
+                    }
+                    self.ring.next.send(MsgType::Rewind, h.request_id, h.position, &[])?;
                 }
                 // An upstream failure: pass it on unchanged so the coordinator learns which
                 // request failed.

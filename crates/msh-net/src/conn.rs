@@ -81,7 +81,19 @@ impl Connection {
         position: u32,
         payload: &[u8],
     ) -> io::Result<()> {
-        let h = Header::new(msg_type, request_id, position, payload.len());
+        self.send_flagged(msg_type, 0, request_id, position, payload)
+    }
+
+    /// [`Connection::send`] with header flags.
+    pub fn send_flagged(
+        &mut self,
+        msg_type: MsgType,
+        flags: u8,
+        request_id: u64,
+        position: u32,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let h = Header::new(msg_type, request_id, position, payload.len()).with_flags(flags);
         write_frame(&mut self.writer, &h, payload)?;
         self.writer.flush()
     }

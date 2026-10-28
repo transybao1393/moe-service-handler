@@ -10,5 +10,6 @@ pub mod probe;
 
 pub use conn::Connection;
 pub use frame::{
-    decode_hidden, decode_token, encode_hidden, encode_token, FrameError, Header, MsgType, PROTOCOL_VERSION,
+    decode_hidden, decode_token, encode_hidden, encode_token, FrameError, Header, MsgType, FLAG_EVERY_TOKEN,
+    PROTOCOL_VERSION,
 };

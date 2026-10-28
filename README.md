@@ -24,7 +24,7 @@ flowchart LR
 ```
 
 - **Frames:** 24-byte little-endian header (magic, version, type, request id, position,
-  length) + payload. Types: `Hidden`, `Token`, `Drop`, `Ping`/`Pong`, `Hello`, `Error`.
+  length) + payload. Types: `Hidden`, `Token`, `Drop`, `Rewind`, `Ping`/`Pong`, `Hello`, `Error`.
 - **f32 on the wire:** the engine works in f32, so a split pipeline stays bit-identical to
   one process.
 - **`Drop`** travels the whole ring; when it returns, every node has freed the request.
@@ -37,6 +37,11 @@ flowchart LR
   (default 64) in one `Hidden` frame, which streammoe runs on its batched path. Up to
   `prefill_depth` chunks (default 3) of a request are in the ring at once, so the nodes work
   on consecutive chunks together.
+- **Speculative decoding** (`max_draft` > 0, off by default): the coordinator drafts tokens by
+  prompt lookup and sends them with the real one as one step; the head returns a token per
+  position, matching drafts are kept, and `Rewind` drops the rest on every node. Output equals
+  plain greedy decoding. Works with the mock engine; streammoe needs per-position logits and
+  rewind on a layer range first. See [`docs/speed.md`](docs/speed.md).
 - **Health:** a `Ping` travels the ring every second. A broken connection, or a ping not back
   within 5 s (a hung node), marks the ring down: in-flight requests fail and new ones are
   rejected until the cluster is restarted.
