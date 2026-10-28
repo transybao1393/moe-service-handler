@@ -15,7 +15,9 @@
 //! layers = [20, 40]
 //! ```
 //!
-//! A single node with `layers = [0, 40]` is mode A. An optional `[scheduler]` table sets
+//! `layers` (a half-open range) goes on every node or on none. Without it, every node plans
+//! the same split (CL-3) from each node's optional `speed` (default 1) and, under streammoe,
+//! its memory cap. A single node runs the whole model. An optional `[scheduler]` table sets
 //! `max_in_flight` (default 3), `max_queue` (64), `health_interval_ms` (1000),
 //! `health_timeout_ms` (5000), `prefill_chunk` (64), `prefill_depth` (3), `max_draft` (0:
 //! no speculative decoding), `draft_min_ngram` (3) and `prefix_cache` (0: no prefix reuse).
@@ -196,14 +198,21 @@ pub struct NodeConfig {
     pub addr: String,
     /// Address to bind; defaults to `addr`. Use `0.0.0.0:PORT` to listen on every interface.
     pub listen: Option<String>,
-    pub layers: [u32; 2],
+    /// Half-open layer range. Set on every node for a manual split (CL-4), or on none to let
+    /// the planner choose (CL-3).
+    pub layers: Option<[u32; 2]>,
+    /// Relative speed for the planner (layers per unit of time; default 1). See
+    /// `msh-node --speeds-from`.
+    pub speed: Option<f64>,
     /// Overrides `engine.mem_cap_gib` on this node.
     pub mem_cap_gib: Option<f64>,
 }
 
 impl NodeConfig {
+    /// The node's layers. Panics before the split is planned ([`Config::plan_layers`]).
     pub fn layer_range(&self) -> Range<u32> {
-        self.layers[0]..self.layers[1]
+        let [a, b] = self.layers.expect("layer split not planned");
+        a..b
     }
 
     pub fn listen_addr(&self) -> &str {
@@ -227,28 +236,62 @@ impl Config {
         Ok(cfg)
     }
 
-    /// The layer ranges must cover `0..num_layers` contiguously, in node order.
+    /// A manual split must cover `0..num_layers` contiguously, in node order.
     pub fn validate(&self) -> Result<(), Error> {
         let bad = |m: String| Err(Error::Config(m));
         if self.nodes.is_empty() {
             return bad("no nodes".into());
         }
-        let mut next = 0;
         for (i, n) in self.nodes.iter().enumerate() {
             if self.nodes[..i].iter().any(|m| m.name == n.name) {
                 return bad(format!("duplicate node name {}", n.name));
             }
-            let [lo, hi] = n.layers;
-            if lo != next || hi <= lo {
-                return bad(format!("node {}: layers [{lo}, {hi}) must start at {next} and be non-empty", n.name));
+            if n.speed.is_some_and(|s| !(s > 0.0 && s.is_finite())) {
+                return bad(format!("node {}: speed must be positive", n.name));
             }
-            next = hi;
         }
-        if next != self.num_layers {
-            return bad(format!("layer ranges end at {next}, model has {}", self.num_layers));
+        match self.nodes.iter().filter(|n| n.layers.is_some()).count() {
+            0 if self.nodes.len() > self.num_layers as usize => {
+                return bad(format!("{} nodes for {} layers", self.nodes.len(), self.num_layers));
+            }
+            0 => {}
+            k if k == self.nodes.len() => {
+                let mut next = 0;
+                for n in &self.nodes {
+                    let [lo, hi] = n.layers.unwrap();
+                    if lo != next || hi <= lo {
+                        let m = format!("node {}: layers [{lo}, {hi}) must start at {next} and be non-empty", n.name);
+                        return bad(m);
+                    }
+                    next = hi;
+                }
+                if next != self.num_layers {
+                    return bad(format!("layer ranges end at {next}, model has {}", self.num_layers));
+                }
+            }
+            _ => return bad("set layers on every node (manual split) or on none (planned)".into()),
         }
         if self.engine.kind == EngineKind::StreamMoe && self.engine.model_dir.is_empty() {
             return bad("engine.model_dir is required for kind = \"streammoe\"".into());
+        }
+        Ok(())
+    }
+
+    /// Whether the config leaves the split to the planner.
+    pub fn is_planned(&self) -> bool {
+        self.nodes.iter().all(|n| n.layers.is_none())
+    }
+
+    /// Fills in every node's layers with the planner's split (CL-3) unless the config gives
+    /// them (CL-4). `fits(i, range)` says whether node `i` can hold `range`.
+    pub fn plan_layers(&mut self, fits: impl Fn(usize, Range<u32>) -> bool) -> Result<(), Error> {
+        if !self.is_planned() {
+            return Ok(());
+        }
+        let speeds: Vec<f64> = self.nodes.iter().map(|n| n.speed.unwrap_or(1.0)).collect();
+        let ranges = crate::planner::plan(self.num_layers, &speeds, fits).map_err(Error::Config)?;
+        for (n, r) in self.nodes.iter_mut().zip(ranges) {
+            n.layers = Some([r.start, r.end]);
         }
         Ok(())
     }
@@ -282,6 +325,32 @@ mod tests {
         addr = "10.0.0.3:7100"
         layers = [30, 40]
     "#;
+
+    #[test]
+    fn planner_fills_in_a_missing_split() {
+        let text = THREE
+            .replace("layers = [0, 20]", "speed = 2.0")
+            .replace("layers = [20, 30]", "")
+            .replace("layers = [30, 40]", "speed = 2.0");
+        let mut c = Config::parse(&text).unwrap();
+        assert!(c.is_planned());
+        c.plan_layers(|_, _| true).unwrap();
+        let split: Vec<_> = c.nodes.iter().map(|n| n.layer_range()).collect();
+        assert_eq!(split, [0..16, 16..24, 24..40]);
+        // A manual split is kept as it is.
+        let mut manual = Config::parse(THREE).unwrap();
+        manual.plan_layers(|_, _| false).unwrap();
+        assert_eq!(manual.nodes[1].layer_range(), 20..30);
+        // Nothing fits: refuse to start.
+        let mut c = Config::parse(&text).unwrap();
+        assert!(c.plan_layers(|_, r| r.len() < 10).is_err());
+    }
+
+    #[test]
+    fn split_is_manual_on_every_node_or_none() {
+        assert!(Config::parse(&THREE.replace("layers = [20, 30]", "")).is_err());
+        assert!(Config::parse(&THREE.replace("layers = [0, 20]", "layers = [0, 20]\nspeed = 0.0")).is_err());
+    }
 
     #[test]
     fn parses_three_node_split() {

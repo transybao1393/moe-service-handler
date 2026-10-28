@@ -33,7 +33,20 @@ Then each node's own step gets faster: expert streaming, prefetch and a balanced
 | Batched decode per node | Several requests' tokens in one pass on each node | engine | streammoe API needed |
 | Cross-node expert prefetch | Next node starts its SSD reads before the hidden state arrives | protocol, engine | streammoe API needed |
 | Streaming settings per node | Fewer SSD stalls: prefetch guesses, packed 3-bit experts, fast disk tier | `[engine]` | Passed through; streammoe defaults kept until measured |
-| Planner (CL-3) | Layers split by each node's memory and speed, so no node holds the ring back | coordinator | To do |
+| Planner (CL-3) | Layers split by each node's memory and speed, so no node holds the ring back | `planner.rs`, every node | Done; speeds from config or `--speeds-from` |
+
+## Planner
+
+Every node runs the same planner on the same config, so they agree on the split without
+talking. It picks the split whose slowest node (layers ÷ `speed`) is fastest, then the most
+even one, and gives ties to later nodes. Under streammoe a node may only take a range whose
+fixed memory (weights, KV, scratch, buffers) fits its `mem_cap_gib`; what is left of the cap
+is its expert hot tier, which `--plan` prints. A range that only just fits leaves a tiny hot
+tier and streams nearly every expert from SSD, so check `--plan` before a run.
+
+`speed` defaults to 1. After a run with `--metrics`, `--speeds-from` gives each node's
+measured layers per millisecond, scaled so the slowest is 1. Those speeds were measured with
+that run's split and hot tiers, so re-plan and re-measure once or twice.
 
 ## Speculative decoding in the ring
 

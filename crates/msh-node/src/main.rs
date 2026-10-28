@@ -1,5 +1,12 @@
 //! msh-node --config FILE --node NAME [--prompt 1,2,3] [--max-tokens N] [--requests K]
 //!          [--metrics FILE]
+//! msh-node --config FILE --plan
+//! msh-node --speeds-from METRICS.csv
+//!
+//! Without `layers` on the nodes, every node plans the same split from the config (CL-3):
+//! node speeds, and under `[engine] kind = "streammoe"` each node's memory cap. `--plan` prints
+//! the split (and each node's memory budget) and exits. `--speeds-from` prints each node's
+//! measured speed from a previous run's metrics, to copy into the config's `speed` entries.
 //!
 //! The first node in the config is the coordinator. With an `[http]` table and no `--prompt`,
 //! it serves the OpenAI-compatible API. With `--prompt` (token ids) it submits K concurrent
@@ -10,6 +17,8 @@
 //! time, e.g. `cargo build --release --features olmoe`.
 
 use std::net::TcpListener;
+#[cfg(feature = "streammoe")]
+use std::ops::Range;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -23,6 +32,7 @@ use msh_node::metrics::{Metrics, RunInfo};
 use msh_node::node::Ring;
 use msh_node::engine::{Engine, MockEngine};
 use msh_node::node::{join_ring, Worker};
+use msh_node::planner;
 use msh_node::scheduler::{self, collect};
 
 const RING_TIMEOUT: Duration = Duration::from_secs(60);
@@ -41,11 +51,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).map(String::as_str);
     let usage = "usage: msh-node --config FILE --node NAME [--prompt 1,2,3] [--max-tokens N] [--requests K] \
-                 [--metrics FILE]";
+                 [--metrics FILE]\n       msh-node --config FILE --plan\n       msh-node --speeds-from METRICS.csv";
+    if let Some(csv) = flag("--speeds-from") {
+        let speeds = planner::speeds_from_metrics(&std::fs::read_to_string(csv).map_err(|e| format!("{csv}: {e}"))?)?;
+        let slowest = speeds.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
+        for (name, speed) in speeds {
+            println!("{name}: speed = {:.2}  ({speed:.3} layers/ms)", speed / slowest);
+        }
+        return Ok(());
+    }
     let path = flag("--config").ok_or(usage)?;
+    let mut cfg = Config::parse(&std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?)?;
+    let print_plan = args.iter().any(|a| a == "--plan");
+    plan_split(&mut cfg, print_plan)?;
+    if print_plan {
+        return Ok(());
+    }
     let name = flag("--node").ok_or(usage)?;
-
-    let cfg = Config::parse(&std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?)?;
     let idx = cfg.index_of(name)?;
     let node = &cfg.nodes[idx];
     // Open the engine before joining the ring, so a range that does not fit fails here (DEP-4).
@@ -55,18 +77,77 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Plans the split unless the config gives it, logs it, and with `print` shows it on stdout.
 #[cfg(feature = "streammoe")]
-fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box<dyn std::error::Error>> {
-    use msh_node::streammoe_engine::{OpenSpec, StreamMoeEngine};
-    let node = &cfg.nodes[idx];
+fn plan_split(cfg: &mut Config, print: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use msh_node::streammoe_engine::Budgeter;
+    let caps: Vec<Option<u64>> = cfg.nodes.iter().map(|n| n.mem_cap(&cfg.engine)).collect();
+    let budgeter = match cfg.engine.kind {
+        EngineKind::StreamMoe if caps.iter().any(Option::is_some) => {
+            Some(with_spec(cfg, 0..cfg.num_layers, None, Budgeter::new)?)
+        }
+        _ => None,
+    };
+    let budget = |i: usize, r: Range<u32>| Some(budgeter.as_ref()?.budget(r, caps[i]?));
+    let source = if cfg.is_planned() { "planner" } else { "config" };
+    cfg.plan_layers(|i, r| budget(i, r).is_none_or(|b| b.fixed <= caps[i].unwrap_or(u64::MAX)))?;
+    show_split(cfg, source, print, |i| {
+        budget(i, cfg.nodes[i].layer_range()).map(|b| {
+            format!(
+                "fixed {:.2} GiB, hot tier {:.2} of {:.2} GiB experts",
+                b.fixed as f64 / GIB,
+                b.hot_tier as f64 / GIB,
+                b.range_experts as f64 / GIB
+            )
+        })
+    });
+    Ok(())
+}
+
+#[cfg(not(feature = "streammoe"))]
+fn plan_split(cfg: &mut Config, print: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let source = if cfg.is_planned() { "planner" } else { "config" };
+    cfg.plan_layers(|_, _| true)?;
+    show_split(cfg, source, print, |_| None);
+    Ok(())
+}
+
+const GIB: f64 = (1u64 << 30) as f64;
+
+fn show_split(cfg: &Config, source: &str, print: bool, budget: impl Fn(usize) -> Option<String>) {
+    let split: Vec<String> = cfg.nodes.iter().map(|n| format!("{}:{:?}", n.name, n.layer_range())).collect();
+    eprintln!("split from {source}: {}", split.join(" "));
+    if !print {
+        return;
+    }
+    for (i, n) in cfg.nodes.iter().enumerate() {
+        let r = n.layer_range();
+        let mut line = format!("{:<8} layers {:>3}..{:<3} ({:>2})  speed {:.2}", n.name, r.start, r.end, r.len(), n.speed.unwrap_or(1.0));
+        if let Some(cap) = n.mem_cap(&cfg.engine) {
+            line += &format!("  cap {:.2} GiB", cap as f64 / GIB);
+        }
+        if let Some(b) = budget(i) {
+            line += &format!("  {b}");
+        }
+        println!("{line}");
+    }
+}
+
+/// Calls `f` with the open settings for `layers` on this config.
+#[cfg(feature = "streammoe")]
+fn with_spec<T>(
+    cfg: &Config,
+    layers: Range<u32>,
+    mem_cap: Option<u64>,
+    f: impl FnOnce(&msh_node::streammoe_engine::OpenSpec) -> T,
+) -> T {
     let model_dir = expand_home(&cfg.engine.model_dir);
     let fast_experts_dir = cfg.engine.fast_experts_dir.as_deref().map(expand_home);
-    let t0 = Instant::now();
-    let engine = StreamMoeEngine::open(&OpenSpec {
+    f(&msh_node::streammoe_engine::OpenSpec {
         model_dir: &model_dir,
-        layers: node.layer_range(),
+        layers,
         n_ctx: cfg.engine.n_ctx,
-        mem_cap: node.mem_cap(&cfg.engine),
+        mem_cap,
         max_requests: cfg.scheduler.engine_slots(),
         prefill_chunk: cfg.scheduler.prefill_chunk,
         kv_format: cfg.engine.kv_format,
@@ -76,7 +157,15 @@ fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box
         prefetch_guess: cfg.engine.prefetch_guess,
         prefetch_experts: cfg.engine.prefetch_experts,
         fast_experts_dir: fast_experts_dir.as_deref(),
-    })?;
+    })
+}
+
+#[cfg(feature = "streammoe")]
+fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box<dyn std::error::Error>> {
+    use msh_node::streammoe_engine::StreamMoeEngine;
+    let node = &cfg.nodes[idx];
+    let t0 = Instant::now();
+    let engine = with_spec(cfg, node.layer_range(), node.mem_cap(&cfg.engine), StreamMoeEngine::open)?;
     eprintln!("{}: streammoe opened layers {:?} in {:.1} s", node.name, node.layer_range(), t0.elapsed().as_secs_f64());
     Ok(engine)
 }
@@ -180,7 +269,7 @@ fn open_metrics(cfg: &Config, flag: Option<&str>) -> Result<Option<Metrics>, Box
         return Ok(None);
     };
     let split: Vec<String> =
-        cfg.nodes.iter().map(|n| format!("{}:{}-{}", n.name, n.layers[0], n.layers[1])).collect();
+        cfg.nodes.iter().map(|n| format!("{}:{}-{}", n.name, n.layer_range().start, n.layer_range().end)).collect();
     let engine = match cfg.engine.kind {
         EngineKind::Mock => "mock".to_string(),
         EngineKind::StreamMoe => format!("streammoe {}", cfg.engine.model_dir),

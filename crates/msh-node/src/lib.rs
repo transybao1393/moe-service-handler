@@ -12,6 +12,7 @@ pub mod metrics;
 #[cfg(feature = "streammoe")]
 pub mod streammoe_engine;
 pub mod node;
+pub mod planner;
 pub mod scheduler;
 
 use std::fmt;

@@ -42,6 +42,11 @@ flowchart LR
   position, matching drafts are kept, and `Rewind` drops the rest on every node. Output equals
   plain greedy decoding. Works with the mock engine; streammoe needs per-position logits and
   rewind on a layer range first. See [`docs/speed.md`](docs/speed.md).
+- **Layer split:** give every node `layers = [a, b]`, or none and let every node plan the
+  same split from the config (CL-3): the slowest node's time (its layers ÷ its `speed`) as
+  small as possible, then as even as possible, within each node's memory cap under streammoe.
+  `msh-node --config FILE --plan` prints the split and each node's memory budget;
+  `msh-node --speeds-from run.csv` turns a previous run's metrics into `speed` values.
 - **Prefix reuse** (`prefix_cache` > 0): finished requests keep their state on every node; the
   next chat turn takes it over and prefills only the new message.
 - **Health:** a `Ping` travels the ring every second. A broken connection, or a ping not back

@@ -60,7 +60,8 @@ impl Cluster {
                     name: format!("n{i}"),
                     addr: l.local_addr().unwrap().to_string(),
                     listen: None,
-                    layers: *layers,
+                    layers: Some(*layers),
+                    speed: None,
                     mem_cap_gib: None,
                 })
                 .collect(),
@@ -204,7 +205,8 @@ fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Ring) + Send + 'st
         name: name.into(),
         addr: l.local_addr().unwrap().to_string(),
         listen: None,
-        layers,
+        layers: Some(layers),
+        speed: None,
         mem_cap_gib: None,
     };
     let cfg = Config {

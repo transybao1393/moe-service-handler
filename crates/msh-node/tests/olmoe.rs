@@ -85,7 +85,8 @@ fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
                 name: format!("n{i}"),
                 addr: l.local_addr().unwrap().to_string(),
                 listen: None,
-                layers: *layers,
+                layers: Some(*layers),
+                speed: None,
                 mem_cap_gib: None,
             })
             .collect(),
@@ -134,6 +135,22 @@ fn three_node_ring_matches_mlx_reference_with_requests_in_flight() {
     for rx in rxs {
         assert_eq!(collect(rx).unwrap().tokens, REF);
     }
+}
+
+#[test]
+#[ignore = "needs the OLMoE model on disk"]
+fn planner_memory_estimate_matches_the_open() {
+    // The planner's estimate for a node must agree with what streammoe's open accepts.
+    use msh_node::streammoe_engine::Budgeter;
+    let dir = model_dir();
+    let spec = |mem_cap| OpenSpec { n_ctx: 512, mem_cap, max_requests: 3, ..OpenSpec::new(&dir, 0..8) };
+    let est = Budgeter::new(&spec(None)).unwrap().budget(0..8, 8 << 30);
+    assert_eq!(est.hot_tier, est.range_experts, "an 8 GiB cap holds every expert of 8 layers");
+    let below = est.fixed - (64 << 20);
+    assert!(StreamMoeEngine::open(&spec(Some(below))).is_err(), "opened under the estimate");
+    let above = est.fixed + (256 << 20);
+    let engine = StreamMoeEngine::open(&spec(Some(above)));
+    assert!(engine.is_ok(), "estimate {} B, open at {above} B: {:?}", est.fixed, engine.err());
 }
 
 #[test]
