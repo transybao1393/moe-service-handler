@@ -40,15 +40,43 @@ streammoe has to change.
 ## The flow
 
 1. A prompt comes in to the controller, which tokenizes it.
-2. The controller picks a worker: a ready one with the fewest requests running (then the
+2. The controller looks it up in its answer cache (below). On a hit it streams the kept answer
+   itself, and no worker is used.
+3. Otherwise the controller picks a worker: a ready one with the fewest requests running (then the
    faster recent tokens per second) and sends `Start`: the request id, the prompt's token ids
    and the token limit.
-3. The worker prefills and decodes, sending each `Token` as it is made.
-4. The controller streams each token to the client. The worker ends the request itself at the
+4. The worker prefills and decodes, sending each `Token` as it is made.
+5. The controller streams each token to the client. The worker ends the request itself at the
    token limit or an end-of-sequence token and sends `Done`; the controller sends `Drop` only
    to end one early (cancel, stall, client gone), and the slot stays taken until the worker's
-   `Done` comes back.
-5. Both workers do this at the same time, each for its own requests.
+   `Done` comes back. An answer that ended at the token limit or end of sequence goes into
+   the cache.
+6. Both workers do this at the same time, each for its own requests.
+
+## Answer cache (on the controller)
+
+Each part keeps its own cache, and none is shared: the workers' KV caches stay inside
+streammoe; the controller has an answer cache in its own RAM, inside the service allowance.
+
+- **Where:** in the request board, looked up after the prompt is tokenized and before it is
+  queued, and filled when a worker's `Done` comes back with reason length or end of sequence
+  (not a dropped or failed request).
+- **Key:** the prompt's tokens (a keyed 128-bit hash and the length), `max_new`, and a hash of
+  the model, its engine settings and the chat template. Sampling is greedy, so the same key
+  gets the same answer.
+- **Modes** (`[cache] mode`): `"exact"` (default) answers only the same key; `"similar"` then
+  also looks for the nearest earlier prompt with the same model and `max_new`, and answers
+  from it at cosine `similar_threshold` (0.98) or above; `"off"`.
+- **Prompt vectors:** the controller runs no model, so a vector is made from the tokens:
+  token 1-, 2- and 3-grams hashed with a sign into 256 coordinates, normalised. It measures
+  similar wording, not similar meaning.
+- **TurboQuant:** each vector is kept as a TurboQuant code, `bits` (default 4) per coordinate:
+  a seeded random rotation, then a fixed Lloyd-Max codebook per coordinate. Cosines are
+  estimated on the codes directly. Exact mode keeps no codes.
+- **Limits:** `max_entries` (10 000) and `max_mib` (32); past either, the least recently used go.
+- **Seen from outside:** `GET /v1/cache` (entries, bytes, hits and misses by kind, limits),
+  `POST /v1/cache/clear`, `msh_cache_*` series; a hit shows in `/v1/requests` as phase `cached`
+  on worker `controller`, with the kind, similarity and the worker that made the answer.
 
 ## Worker management
 
@@ -160,6 +188,13 @@ values, not measured on the Mac minis; `msh-probe serve` / `run` measures each l
 | Wi-Fi | 0.2–1 Gb/s, varies | 1–10 ms, spikes | all | avoid: spikes look like stuck workers |
 | RDMA over Thunderbolt 5 | ~80 Gb/s | a few µs | needs Thunderbolt 5 on both ends; the M1 and base M4 lack it | not possible here |
 
+**On the link** (built): one persistent TCP connection per worker, used both ways. A message
+over `[net] max_chunk_kib` (64) goes in chunks; one writer thread per link sends small frames
+(pings, tokens, `Start`, `Drop`) between the chunks of a big one. TCP keep-alive is on. A lost
+worker is reconnected in the background, waiting `reconnect_min_ms` (500) doubling up to
+`reconnect_max_ms` (10 000), with some randomness; a worker that hears nothing for
+`health_timeout_ms` drops the link and waits for the controller again.
+
 **Protocol:**
 
 | Protocol | Overhead | Fit |
@@ -186,7 +221,11 @@ Beside `Hello`, `Ping`/`Pong`, `Token`, `Drop`, `Error`:
 | `Done` = 15 | worker → controller | request id, position = tokens made; one byte: `0` length, `1` end of sequence, `2` dropped |
 | `Pong` | worker → controller | the status report: tagged sections (`tag u16, len u32, bytes`), unknown tags skipped. Tag 1 memory (footprint, cap); tag 2 requests (count, entry length, then per request id, decoding, position, tokens made). New fields go at the end of an entry or in a new tag |
 
-Protocol version 6.
+A message in chunks is several frames with the same type, request id and position: all but
+the last carry the `more` flag (`0x80`), and the first starts with the whole payload length
+(u32). Chunks of different requests may interleave; a request's own never do.
+
+Protocol version 7.
 
 ## What stays and what changes
 
@@ -196,7 +235,8 @@ Protocol version 6.
 - **Not in this mode yet:** speculative decoding and prefix reuse (config validation refuses
   them), the per-step metrics CSV, and routing a chat's next turn to the worker that holds it.
 - **New:** `split = "requests"`, the worker table and its endpoints, per-request progress,
-  stuck and lost handling per worker, reconnect, drain.
+  stuck and lost handling per worker, reconnect, drain, the controller's answer cache, chunked
+  links.
 - **Next, with streammoe as it is:** decode several requests on a worker in one batch
   (`eval_requests`) and speculative decoding on the worker (`eval_tokens`). Both work on the
   whole model today.

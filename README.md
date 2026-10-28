@@ -1,7 +1,7 @@
 # moe-service-handler
 
 <p align="center">
-  <img src="docs/assets/dataflow-requests.svg" width="900" alt="Data flow, request split: two prompts come in to the m4 controller, which runs no model; it gives request A to the m1 worker and request B to the m4b worker at the same time; each worker runs streammoe on the whole model from its own SSD and sends every token back as it is made, and the controller streams it to the client. Every second a ping goes out and each worker's status comes back. The controller's worker table shows each worker's state and what it is doing; a worker that hangs is marked stuck, with what it was on, and gets no new work. The workers never talk to each other.">
+  <img src="docs/assets/dataflow-requests-v2.svg" width="900" alt="Data flow, request split: two prompts come in to the m4 controller, which runs no model; it gives request A to the m1 worker and request B to the m4b worker at the same time; each worker runs streammoe on the whole model from its own SSD and sends every token back as it is made, and the controller streams it to the client. Every second a ping goes out and each worker's status comes back. The controller's worker table shows each worker's state and what it is doing. A third prompt that asks the first one again is answered from the controller's own cache, with no worker. A worker that hangs is marked stuck, with what it was on, and gets no new work. The workers never talk to each other.">
 </p>
 
 Turns streammoe into a service that runs a large MoE model, Qwen3.6-35B-A3B, across three
@@ -24,12 +24,13 @@ management. Each worker runs streammoe on the whole model from its own SSD, as s
 built to run. For each request:
 
 1. The prompt comes in to the controller, which tokenizes it.
-2. The controller gives it to the ready worker with the fewest requests running (`Start`);
+2. If the controller has answered it before, its own cache answers it, with no worker (below).
+3. Otherwise the controller gives it to the ready worker with the fewest requests running (`Start`);
    both workers work at the same time, each on its own requests.
-3. The worker prefills and decodes, sending each `Token` as it is made; the controller
+4. The worker prefills and decodes, sending each `Token` as it is made; the controller
    streams it to the client.
-4. The worker ends the request at the token limit or the end of text (`Done`); the controller
-   sends `Drop` only to end one early.
+5. The worker ends the request at the token limit or the end of text (`Done`); the controller
+   sends `Drop` only to end one early. A finished answer goes into the controller's cache.
 
 One answer runs at one Mac's speed; two workers serve two requests at once. At a 9 GiB cap a
 worker holds 3.1 GiB of weights, KV and buffers plus a 5.9 GiB hot tier of the 16.9 GiB of
@@ -50,6 +51,17 @@ experts (from `--plan`); the rest streams from its SSD.
 - **Endpoints:** `GET /v1/workers`, `GET /v1/workers/{name}`, `GET /v1/requests`,
   `POST /v1/workers/{name}/drain` and `/resume`, `POST /v1/requests/{id}/cancel`; per-worker
   Prometheus series (`worker="NAME"`) and a log line per state change.
+- **Answer cache** (`[cache]`, on the controller only): prompts it has answered, kept in its own
+  RAM and never shared; the workers keep their own KV caches inside streammoe. The key is the
+  prompt's tokens, `max_new`, and the model, engine settings and chat template; sampling is
+  greedy, so the same key gets the same answer. `mode = "exact"` (default) answers only the
+  same prompt; `"similar"` also answers a prompt worded almost the same, with a prompt vector
+  (hashed token 1- to 3-grams, so similar wording, not similar meaning) at cosine
+  `similar_threshold` (0.98) or above; `"off"` turns it off. The vectors are kept as
+  TurboQuant codes (`bits`, default 4: a random rotation, then a fixed codebook per
+  coordinate) and compared on the codes. Past `max_entries` (10 000) or `max_mib` (32), the
+  least recently used go first. `GET /v1/cache` (entries, hits, misses), `POST /v1/cache/clear`,
+  `msh_cache_*` series; a hit shows in `/v1/requests` as phase `cached` on worker `controller`.
 - **Next (designed, not built):** the controller decides and commands: routing a chat's next
   turn to the worker that holds it, per-worker load limits, reopening or restarting a stuck
   worker, and tuning streammoe's open settings one worker at a time.
@@ -71,10 +83,17 @@ stays on the mock.
 The notes below cover all three; those about hidden states, chunked prefill, speculative
 decoding and prefix reuse apply to the layer split.
 
+- **Links:** one persistent TCP connection per worker, used both ways. A message bigger than
+  `[net] max_chunk_kib` (64) goes in chunks, and one writer thread per link puts small frames
+  (pings, tokens, `Start`, `Drop`) between the chunks of big ones, so a big message never holds
+  up the rest. On loopback, a ping behind a 512 KiB hidden state came back in 20 µs (p50)
+  instead of 59 µs. TCP keep-alive is on.
 - **Frames:** 24-byte little-endian header (magic, version, type, request id, position,
   length) + payload. Types: `Hidden`, `Token`, `Drop`, `Rewind`, `Ping`/`Pong`, `Hello`, `Error`;
   for the request split also `Start`, `Done` and a status report in `Pong`; for the expert
-  split `Experts`, `Partial`, `Own`, `Move`, `Release` (protocol version 6).
+  split `Experts`, `Partial`, `Own`, `Move`, `Release`. A message in chunks is several frames
+  with the same type and request id: all but the last carry a `more` flag, and the first
+  starts with the whole length (protocol version 7).
 - **f32 on the wire:** the engine works in f32, so a split pipeline stays bit-identical to
   one process. Hidden states go on the wire straight from the engine's output buffer and are
   read straight into the next engine's input, with no encode or decode copy (NET-6). The
@@ -101,10 +120,14 @@ decoding and prefix reuse apply to the layer split.
   `msh-node --speeds-from run.csv` turns a previous run's metrics into `speed` values.
 - **Prefix reuse** (`prefix_cache` > 0): finished requests keep their state on every node; the
   next chat turn takes it over and prefills only the new message. Off by default.
-- **Health:** a `Ping` goes to every worker each second. In the request split a broken or hung
-  worker is taken out of service on its own (above). In the layer and expert splits every node
-  is needed for every token, so a broken connection or a ping not back within 5 s marks the
-  cluster down: in-flight requests fail and new ones are rejected until it is restarted.
+- **Health and reconnect:** a `Ping` goes to every worker each second. A lost worker is
+  reconnected in the background, waiting `[net] reconnect_min_ms` (500) doubling up to
+  `reconnect_max_ms` (10 000), with some randomness. A worker that hears nothing for
+  `health_timeout_ms` drops the link and waits for the controller again; it never exits. In the
+  request split a broken or hung worker is taken out of service on its own (above). In the
+  layer and expert splits every node is needed for every token, so a lost worker fails the
+  requests in flight and new ones get 503 until every worker is back; then the cluster serves
+  again on its own (`msh_cluster_up`).
 - **Metrics:** each worker appends its compute time to the frame it sends back, so the
   coordinator splits every step into per-node compute and network/queueing without clock
   sync. `--metrics FILE` or `[metrics] csv` writes one CSV row per step (a prompt chunk, or a
@@ -127,17 +150,20 @@ decoding and prefix reuse apply to the layer split.
   the scheduler can hold get 429 before their body is read. Measured at start: a worker
   needs ~5 MiB; the coordinator with Qwen3.6's tokenizer ~140 MiB at worst (69 MiB at start,
   67 MiB of it HTTP bodies). OLMoE on one node with a 4 GiB cap peaked at 1.16 GiB.
+- **KV format on the workers** (`[engine] kv_format`): `f32` (default), `f16`, `turbo4`,
+  `turbo3`, passed to streammoe as it is. Not set in any config: on OLMoE the turbo formats
+  change greedy output within a few tokens. `--plan` shows the KV size for each.
 - **API:** the coordinator serves OpenAI-compatible `GET /v1/models` and
   `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
   429, a cluster that is down 503. In the request split the controller also serves the worker
-  management endpoints above.
+  management and cache endpoints above.
 
 ## Crates
 
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
-| `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Controller / worker, config, planner, star links, scheduler, HTTP API, metrics, engines | Request split with worker management (tested on OLMoE: 2 workers, whole model each), controller-to-worker links, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11), Prometheus (CL-12), logs (NF-5), service memory allowance (NF-2); runs real streammoe (tested on OLMoE) |
+| `msh-net` | library + `msh-probe` | Frames, chunked two-way connections, latency probe | M0 done; chunking and keep-alive |
+| `msh-node` | binary | Controller / worker, config, planner, star links, scheduler, HTTP API, metrics, engines | Request split with worker management (tested on OLMoE: 2 workers, whole model each), the controller's answer cache with TurboQuant prompt vectors, controller-to-worker links with reconnect, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11), Prometheus (CL-12), logs (NF-5), service memory allowance (NF-2); runs real streammoe (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
 The engine sits behind an `Engine` trait shaped like streammoe's `eval_request`: tokens or
@@ -190,6 +216,7 @@ $B --config configs/local-requests.toml --node m4 --max-tokens 500 --requests 4
 #   start m1 and m4b, then m4, with configs/olmoe-requests.toml, then:
 curl localhost:8080/v1/workers
 curl localhost:8080/v1/requests
+curl localhost:8080/v1/cache          # the controller's answer cache: entries, hits, misses
 
 # layer split, three nodes on one machine (the controller waits up to 60 s for the workers)
 $B --config configs/local-3node.toml --node m4b &
