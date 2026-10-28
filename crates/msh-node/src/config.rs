@@ -57,6 +57,9 @@
 //! csv = "results/olmoe-3node.csv"
 //! ```
 //!
+//! An optional `[service]` table sets `mem_allowance_mib` (default 256): memory for the
+//! service itself (network buffers, requests, HTTP, metrics), beside the engine's cap (NF-2).
+//!
 //! An optional `[log]` table sets the log (NF-5). `RUST_LOG` overrides `level`.
 //!
 //! ```toml
@@ -89,7 +92,28 @@ pub struct Config {
     pub metrics: Option<MetricsConfig>,
     #[serde(default)]
     pub log: LogConfig,
+    #[serde(default)]
+    pub service: ServiceConfig,
     pub nodes: Vec<NodeConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServiceConfig {
+    /// Memory for the service itself, beside streammoe's cap (NF-2).
+    pub mem_allowance_mib: f64,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        ServiceConfig { mem_allowance_mib: 256.0 }
+    }
+}
+
+impl ServiceConfig {
+    pub fn mem_allowance(&self) -> u64 {
+        (self.mem_allowance_mib * (1u64 << 20) as f64) as u64
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -263,6 +287,9 @@ impl Config {
     /// A manual split must cover `0..num_layers` contiguously, in node order.
     pub fn validate(&self) -> Result<(), Error> {
         let bad = |m: String| Err(Error::Config(m));
+        if !(self.service.mem_allowance_mib > 0.0 && self.service.mem_allowance_mib.is_finite()) {
+            return bad("service.mem_allowance_mib must be positive".into());
+        }
         if self.nodes.is_empty() {
             return bad("no nodes".into());
         }

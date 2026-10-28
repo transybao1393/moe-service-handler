@@ -7,23 +7,28 @@
 //! ignored. A request the scheduler refuses maps to 429 (queue full) or 503 (ring down or
 //! shutting down). Closing a streaming connection cancels the request. A completion's id is
 //! `chatcmpl-<request id>`, the id in the coordinator's logs.
+//!
+//! Memory stays bounded (NF-2): bodies over [`HTTP_BODY_LIMIT`] get 413, and at most
+//! `max_open` requests are read and set up at once; more get 429 before their body is read.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::chat::{Codec, Detokenizer, Message};
+use crate::memory::HTTP_BODY_LIMIT;
 use crate::scheduler::{Client, Event};
 
 pub struct HttpState {
@@ -33,13 +38,31 @@ pub struct HttpState {
     pub model: String,
     /// Context length: prompt plus completion must fit.
     pub n_ctx: usize,
+    open: Semaphore,
+}
+
+impl HttpState {
+    pub fn new(client: Client, codec: Codec, model: String, n_ctx: usize, max_open: usize) -> Self {
+        HttpState { client, codec, model, n_ctx, open: Semaphore::new(max_open) }
+    }
 }
 
 pub fn router(state: Arc<HttpState>) -> Router {
     Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .layer(middleware::from_fn_with_state(state.clone(), limit_open))
+        .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT))
         .with_state(state)
+}
+
+/// Holds one of `max_open` permits while a request's body is read and it is set up.
+async fn limit_open(State(s): State<Arc<HttpState>>, req: Request, next: Next) -> Response {
+    let Ok(_permit) = s.open.try_acquire() else {
+        tracing::warn!("chat completion refused: too many open requests");
+        return error(StatusCode::TOO_MANY_REQUESTS, "too many open requests");
+    };
+    next.run(req).await
 }
 
 #[derive(Deserialize)]

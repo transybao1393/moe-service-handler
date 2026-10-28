@@ -58,6 +58,14 @@ picks one from each node's speed and memory.
   `[log] level` or `RUST_LOG`. Every line names the node; every line about a request carries
   `request` (the client's id, also in `chatcmpl-<id>`) and `ring` (its id in frames, metrics
   and worker logs). `RUST_LOG=debug` adds one line per step on every node.
+- **Service memory** (NF-2): the service's own memory (network buffers, requests, HTTP,
+  metrics) has a fixed allowance beside streammoe's cap, `[service] mem_allowance_mib`
+  (default 256). A node measures its footprint before the engine opens, adds the most its
+  buffers can grow to, and refuses to start over the allowance; while serving it warns if the
+  footprint passes cap + allowance. HTTP bodies over 1 MiB get 413, and requests beyond what
+  the scheduler can hold get 429 before their body is read. Measured at start: a worker
+  needs ~5 MiB; the coordinator with Qwen3.6's tokenizer ~140 MiB at worst (69 MiB at start,
+  67 MiB of it HTTP bodies). OLMoE on one node with a 4 GiB cap peaked at 1.16 GiB.
 - **API:** the coordinator serves OpenAI-compatible `GET /v1/models` and
   `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
   429, a ring that is down 503.

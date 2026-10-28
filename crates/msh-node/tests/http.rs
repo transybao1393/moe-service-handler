@@ -31,7 +31,7 @@ fn codec() -> Codec {
 fn app(sched: SchedulerConfig, n_ctx: usize) -> Router {
     let engine = MockEngine::new(0..4, 4, 64).with_vocab(VOCAB);
     let (client, _) = scheduler::spawn(engine, None, sched);
-    router(Arc::new(HttpState { client, codec: codec(), model: "mock".into(), n_ctx }))
+    router(Arc::new(HttpState::new(client, codec(), "mock".into(), n_ctx, 64)))
 }
 
 async fn post(app: &Router, body: Value) -> (StatusCode, String) {
@@ -114,4 +114,23 @@ async fn full_scheduler_answers_429() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn oversized_body_answers_413() {
+    let app = app(SchedulerConfig::default(), 1 << 20);
+    let words = "w1 ".repeat(msh_node::memory::HTTP_BODY_LIMIT / 3 + 1);
+    let body = json!({ "messages": [{ "role": "user", "content": words }], "max_tokens": 1 });
+    let (status, _) = post(&app, body).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn requests_over_the_open_limit_answer_429_before_reading() {
+    let engine = MockEngine::new(0..4, 4, 64).with_vocab(VOCAB);
+    let (client, _) = scheduler::spawn(engine, None, SchedulerConfig::default());
+    let app = router(Arc::new(HttpState::new(client, codec(), "mock".into(), 256, 0)));
+    let (status, body) = post(&app, chat(4, false)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(body.contains("too many open requests"), "{body}");
 }

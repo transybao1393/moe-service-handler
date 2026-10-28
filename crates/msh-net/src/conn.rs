@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use crate::frame::{read_frame, write_frame, FrameError, Header, MsgType, PROTOCOL_VERSION};
 
+/// Bytes of each connection's read and write buffers.
+pub const BUFFER_BYTES: usize = 256 * 1024;
+
 pub struct Connection {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
@@ -42,8 +45,8 @@ impl Connection {
         stream.set_nodelay(true)?;
         let peer_addr = stream.peer_addr()?;
         let mut conn = Connection {
-            reader: BufReader::with_capacity(256 * 1024, stream.try_clone()?),
-            writer: BufWriter::with_capacity(256 * 1024, stream),
+            reader: BufReader::with_capacity(BUFFER_BYTES, stream.try_clone()?),
+            writer: BufWriter::with_capacity(BUFFER_BYTES, stream),
             peer_name: String::new(),
             peer_addr,
         };

@@ -78,6 +78,7 @@ fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
         http: None,
         metrics: None,
         log: Default::default(),
+        service: Default::default(),
         nodes: splits
             .iter()
             .zip(&listeners)
@@ -203,7 +204,7 @@ fn http_chat_completion_answers_with_the_reference() {
 
     let codec = Codec::load(&model_dir().join("hf/tokenizer.json"), ChatTemplate::Olmoe).unwrap();
     let cluster = start(&[[0, 8], [8, 12], [12, 16]]);
-    let state = HttpState { client: (*cluster).clone(), codec, model: "olmoe".into(), n_ctx: 512 };
+    let state = HttpState::new((*cluster).clone(), codec, "olmoe".into(), 512, 64);
     let body = serde_json::json!({
         "messages": [{ "role": "user", "content": "What is the capital of France? Answer in one sentence." }],
     });

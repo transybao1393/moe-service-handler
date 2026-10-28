@@ -28,6 +28,7 @@ use msh_node::chat::Codec;
 use msh_node::config::{expand_home, Config, EngineKind, HttpConfig, LogConfig};
 use tracing::info;
 use msh_node::http::{self, HttpState};
+use msh_node::memory;
 use msh_node::metrics::{Metrics, RunInfo};
 use msh_node::node::Ring;
 use msh_node::engine::{Engine, MockEngine};
@@ -93,10 +94,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Every log line of this process, on every thread, names the node.
     let _span = tracing::info_span!("node", node = name).entered();
     let node = &cfg.nodes[idx];
+    // The tokenizer is the service's; load it before measuring the service's memory (NF-2).
+    let http = cfg.http.as_ref().filter(|_| idx == 0 && flag("--prompt").is_none());
+    let codec = http.map(|h| Codec::load(&expand_home(&h.tokenizer), h.chat_template)).transpose()?;
+    memory::check_start(&cfg, &memory::growth(&cfg, idx, http.is_some()))?;
     // Open the engine before joining the ring, so a range that does not fit fails here (DEP-4).
     match cfg.engine.kind {
-        EngineKind::Mock => serve(&cfg, idx, MockEngine::new(node.layer_range(), cfg.num_layers, cfg.hidden_dim), &flag),
-        EngineKind::StreamMoe => serve(&cfg, idx, open_streammoe(&cfg, idx)?, &flag),
+        EngineKind::Mock => {
+            serve(&cfg, idx, MockEngine::new(node.layer_range(), cfg.num_layers, cfg.hidden_dim), codec, &flag)
+        }
+        EngineKind::StreamMoe => serve(&cfg, idx, open_streammoe(&cfg, idx)?, codec, &flag),
     }
 }
 
@@ -136,6 +143,7 @@ fn plan_split(cfg: &mut Config, print: bool) -> Result<(), Box<dyn std::error::E
 }
 
 const GIB: f64 = (1u64 << 30) as f64;
+const MIB: f64 = (1u64 << 20) as f64;
 
 fn show_split(cfg: &Config, source: &str, print: bool, budget: impl Fn(usize) -> Option<String>) {
     let split: Vec<String> = cfg.nodes.iter().map(|n| format!("{}:{:?}", n.name, n.layer_range())).collect();
@@ -202,10 +210,13 @@ fn serve<'a, E: Engine + 'static>(
     cfg: &Config,
     idx: usize,
     engine: E,
+    codec: Option<Codec>,
     flag: &dyn Fn(&str) -> Option<&'a str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node = &cfg.nodes[idx];
     let name = node.name.as_str();
+    let limit = node.mem_cap(&cfg.engine).map(|cap| cap + cfg.service.mem_allowance());
+    memory::watch(limit, Duration::from_secs(5));
     let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
     let role = if idx == 0 { "coordinator" } else { "worker" };
     info!(role, layers = ?node.layer_range(), listen = node.listen_addr(), "listening");
@@ -219,8 +230,8 @@ fn serve<'a, E: Engine + 'static>(
     }
 
     let metrics = open_metrics(cfg, flag("--metrics"))?;
-    if let (None, Some(http)) = (flag("--prompt"), &cfg.http) {
-        return serve_http(cfg, http, engine, ring, metrics);
+    if let (Some(codec), Some(http)) = (codec, &cfg.http) {
+        return serve_http(cfg, http, codec, engine, ring, metrics);
     }
     let prompt: Vec<u32> = flag("--prompt")
         .unwrap_or("1,2,3,4,5,6,7,8")
@@ -257,6 +268,10 @@ fn serve<'a, E: Engine + 'static>(
         cfg.scheduler.max_in_flight,
         total as f64 / wall
     );
+    if let Some(now) = memory::footprint() {
+        let limit = limit.map_or("no cap".into(), |l| format!("cap + allowance {:.0} MiB", l as f64 / MIB));
+        println!("footprint {:.0} MiB ({limit})", now as f64 / MIB);
+    }
     Ok(())
 }
 
@@ -264,18 +279,13 @@ fn serve<'a, E: Engine + 'static>(
 fn serve_http<E: Engine + 'static>(
     cfg: &Config,
     http: &HttpConfig,
+    codec: Codec,
     engine: E,
     ring: Option<Ring>,
     metrics: Option<Metrics>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let codec = Codec::load(&expand_home(&http.tokenizer), http.chat_template)?;
     let (client, _sched) = scheduler::spawn_with_metrics(engine, ring, cfg.scheduler, metrics);
-    let state = Arc::new(HttpState {
-        client,
-        codec,
-        model: http.model.clone(),
-        n_ctx: cfg.engine.n_ctx,
-    });
+    let state = Arc::new(HttpState::new(client, codec, http.model.clone(), cfg.engine.n_ctx, memory::http_max_open(cfg)));
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&http.listen).await.map_err(|e| format!("bind {}: {e}", http.listen))?;

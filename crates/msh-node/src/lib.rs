@@ -8,6 +8,7 @@ pub mod config;
 pub mod draft;
 pub mod engine;
 pub mod http;
+pub mod memory;
 pub mod metrics;
 #[cfg(feature = "streammoe")]
 pub mod streammoe_engine;
