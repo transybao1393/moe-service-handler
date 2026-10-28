@@ -707,6 +707,24 @@ mod tests {
     }
 
     #[test]
+    fn kv_format_parses_on_every_split() {
+        let layerless = THREE.replace("layers = [0, 20]", "").replace("layers = [20, 30]", "").replace("layers = [30, 40]", "");
+        for (split, text, kind) in [
+            ("layers", THREE.to_string(), "streammoe"),
+            ("requests", layerless.clone(), "streammoe"),
+            // The expert split runs the mock only, which has no KV cache; the setting still parses.
+            ("experts", layerless, "mock"),
+        ] {
+            let text = text.replace(
+                "num_layers = 40",
+                &format!("num_layers = 40\nsplit = \"{split}\"\n[engine]\nkind = \"{kind}\"\nmodel_dir = \"/m\"\nkv_format = \"turbo3\""),
+            );
+            let c = Config::parse(&text).unwrap_or_else(|e| panic!("{split}: {e}"));
+            assert_eq!(c.engine.kv_format, KvFormat::Turbo3, "{split}");
+        }
+    }
+
+    #[test]
     fn rejects_gaps_overlaps_and_short_coverage() {
         for (from, to) in [("[20, 30]", "[21, 30]"), ("[20, 30]", "[19, 30]"), ("[30, 40]", "[30, 39]")] {
             assert!(Config::parse(&THREE.replace(from, to)).is_err(), "{to} accepted");

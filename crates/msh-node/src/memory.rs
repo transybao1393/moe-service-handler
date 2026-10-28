@@ -239,7 +239,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn footprint_counts_written_memory() {
         let before = footprint().unwrap();
-        let block = vec![1u8; 64 << 20];
+        let block = std::hint::black_box(vec![1u8; 64 << 20]);
         let after = footprint().unwrap();
         assert!(after >= before + (60 << 20), "{before} -> {after}");
         drop(block);
