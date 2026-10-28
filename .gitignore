@@ -29,3 +29,6 @@ tokenizer_config.json
 
 # Node and server logs
 *.log
+
+# Local notes: full chat history with Claude
+docs/chat-history.md
