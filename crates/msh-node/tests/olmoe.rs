@@ -90,6 +90,7 @@ fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
                 layers: Some(*layers),
                 speed: None,
                 mem_cap_gib: None,
+                prometheus: None,
             })
             .collect(),
     };

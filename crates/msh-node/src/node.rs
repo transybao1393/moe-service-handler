@@ -122,6 +122,7 @@ impl<E: Engine> Worker<E> {
                         let input = StageIn::Hidden(&hidden);
                         let r = self.engine.step(h.request_id, h.position, input, sample, &mut hidden_out, &mut tokens);
                         // This node's compute time travels on with the positions (CL-10).
+                        crate::stats::STATS.compute.observe(t0.elapsed());
                         let us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
                         stages.push(us);
                         debug!(ring = h.request_id, pos = h.position, positions = rows, us, "step");

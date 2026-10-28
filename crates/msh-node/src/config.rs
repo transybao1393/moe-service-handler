@@ -8,6 +8,7 @@
 //! name = "m4"
 //! addr = "192.168.1.10:7100"
 //! layers = [0, 20]         # half-open layer range
+//! prometheus = "0.0.0.0:9100"  # optional: GET /metrics on this node (CL-12)
 //!
 //! [[nodes]]                # last node runs the head and returns tokens to the first
 //! name = "m1a"
@@ -254,6 +255,8 @@ pub struct NodeConfig {
     pub speed: Option<f64>,
     /// Overrides `engine.mem_cap_gib` on this node.
     pub mem_cap_gib: Option<f64>,
+    /// Address for this node's Prometheus endpoint, `GET /metrics` (CL-12). Off when unset.
+    pub prometheus: Option<String>,
 }
 
 impl NodeConfig {

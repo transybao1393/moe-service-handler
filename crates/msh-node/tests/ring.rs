@@ -65,6 +65,7 @@ impl Cluster {
                     layers: Some(*layers),
                     speed: None,
                     mem_cap_gib: None,
+                    prometheus: None,
                 })
                 .collect(),
         };
@@ -210,6 +211,7 @@ fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Ring) + Send + 'st
         layers: Some(layers),
         speed: None,
         mem_cap_gib: None,
+        prometheus: None,
     };
     let cfg = Config {
         hidden_dim: DIM,

@@ -58,6 +58,11 @@ picks one from each node's speed and memory.
   `[log] level` or `RUST_LOG`. Every line names the node; every line about a request carries
   `request` (the client's id, also in `chatcmpl-<id>`) and `ring` (its id in frames, metrics
   and worker logs). `RUST_LOG=debug` adds one line per step on every node.
+- **Prometheus** (CL-12): `prometheus = "ADDR"` in a node's `[[nodes]]` entry serves
+  `GET /metrics` on that node: footprint and its limit, and compute time per step on every
+  node; on the coordinator also requests by outcome, active and waiting requests, tokens,
+  time to first token, decode-step round trip, drafts and prefix reuse, and the ring's ping
+  time. Every series carries `node="NAME"`.
 - **Service memory** (NF-2): the service's own memory (network buffers, requests, HTTP,
   metrics) has a fixed allowance beside streammoe's cap, `[service] mem_allowance_mib`
   (default 256). A node measures its footprint before the engine opens, adds the most its
@@ -75,7 +80,7 @@ picks one from each node's speed and memory.
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
 | `msh-net` | library + `msh-probe` | Frames, connections, latency probe | M0 done |
-| `msh-node` | binary | Coordinator / worker, config, planner, ring, scheduler, HTTP API, metrics, engines | Ring, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11); runs real streammoe (tested on OLMoE) |
+| `msh-node` | binary | Coordinator / worker, config, planner, ring, scheduler, HTTP API, metrics, engines | Ring, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11), Prometheus (CL-12), logs (NF-5), service memory allowance (NF-2); runs real streammoe (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
 The engine sits behind an `Engine` trait shaped like streammoe's `eval_request`: tokens or

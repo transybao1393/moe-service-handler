@@ -28,7 +28,7 @@ use msh_node::chat::Codec;
 use msh_node::config::{expand_home, Config, EngineKind, HttpConfig, LogConfig};
 use tracing::info;
 use msh_node::http::{self, HttpState};
-use msh_node::memory;
+use msh_node::{memory, stats};
 use msh_node::metrics::{Metrics, RunInfo};
 use msh_node::node::Ring;
 use msh_node::engine::{Engine, MockEngine};
@@ -216,7 +216,12 @@ fn serve<'a, E: Engine + 'static>(
     let node = &cfg.nodes[idx];
     let name = node.name.as_str();
     let limit = node.mem_cap(&cfg.engine).map(|cap| cap + cfg.service.mem_allowance());
+    stats::STATS.footprint_limit.store(limit.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     memory::watch(limit, Duration::from_secs(5));
+    if let Some(addr) = &node.prometheus {
+        let listener = TcpListener::bind(addr).map_err(|e| format!("bind prometheus {addr}: {e}"))?;
+        stats::serve(listener, name.to_string(), idx == 0);
+    }
     let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
     let role = if idx == 0 { "coordinator" } else { "worker" };
     info!(role, layers = ?node.layer_range(), listen = node.listen_addr(), "listening");

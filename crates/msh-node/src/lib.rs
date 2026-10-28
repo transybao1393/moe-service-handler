@@ -15,6 +15,7 @@ pub mod streammoe_engine;
 pub mod node;
 pub mod planner;
 pub mod scheduler;
+pub mod stats;
 
 use std::fmt;
 

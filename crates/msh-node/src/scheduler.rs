@@ -52,6 +52,7 @@ use crate::draft::{Drafter, PromptLookup};
 use crate::engine::{Engine, Sample, StageIn};
 use crate::metrics::{Metrics, StepKind, StepRecord};
 use crate::node::Ring;
+use crate::stats::STATS;
 use crate::Error;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -299,6 +300,8 @@ struct Request {
     /// Whether the engines hold exactly `tokens[..next_pos]`, so the request can be parked
     /// when it finishes; not so while a verify step's drafts are still being accepted.
     parkable: bool,
+    /// The client went away.
+    cancelled: bool,
 }
 
 /// A finished request whose state stays on every node.
@@ -373,6 +376,8 @@ impl<E: Engine> Scheduler<E> {
             }
             self.check_health();
             self.admit();
+            STATS.requests_active.store(self.active.len() as u64, Ordering::Relaxed);
+            STATS.requests_waiting.store(self.waiting.len() as u64, Ordering::Relaxed);
             if self.shutting_down && self.active.is_empty() {
                 return self.engine;
             }
@@ -455,6 +460,7 @@ impl<E: Engine> Scheduler<E> {
         };
         if let Some(reason) = reject {
             warn!(request = id, prompt = prompt.len(), reason, "rejected");
+            STATS.requests_rejected.add(1);
             let _ = events.send(Event::Rejected(reason));
             return;
         }
@@ -476,6 +482,7 @@ impl<E: Engine> Scheduler<E> {
             freeing: None,
             cached: 0,
             parkable: true,
+            cancelled: false,
         };
         self.waiting.push_back((id, r));
     }
@@ -498,6 +505,7 @@ impl<E: Engine> Scheduler<E> {
                 r.next_pos = p.tokens.len();
                 r.cached = p.tokens.len();
                 continues = Some(p.request);
+                STATS.cached_positions.add(r.cached as u64);
             }
             // Otherwise the ring id is the client id. A continued request keeps an older
             // client's id, which no later request can have, so ring ids never clash.
@@ -540,6 +548,7 @@ impl<E: Engine> Scheduler<E> {
             return self.finish(id, Event::Failed(e.to_string()));
         }
         debug!(request = r.id, ring = id, pos = start, positions = self.input.len(), drafted = drafts.len(), "step sent");
+        STATS.compute.observe(started.elapsed());
         let coord_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
         let positions = self.input.len() as u32;
         r.next_pos += positions as usize;
@@ -590,6 +599,7 @@ impl<E: Engine> Scheduler<E> {
             MsgType::Ping => {
                 if let Some((_, sent)) = self.ping.filter(|&(seq, _)| seq == id) {
                     self.ring_rtt = Some(sent.elapsed());
+                    STATS.ring_rtt_us.store(sent.elapsed().as_micros() as u64, Ordering::Relaxed);
                     self.ping = None;
                 }
             }
@@ -642,8 +652,15 @@ impl<E: Engine> Scheduler<E> {
             stage_us = ?self.stages,
             "step back"
         );
+        match kind {
+            StepKind::Decode => STATS.decode_step.observe(step.started.elapsed()),
+            _ => STATS.prompt_positions.add(step.positions as u64),
+        }
+        STATS.drafted.add(step.drafts.len() as u64);
+        STATS.accepted.add(accepted as u64);
         if kind == StepKind::FirstToken {
             let ttft = r.submitted.elapsed();
+            STATS.time_to_first_token.observe(ttft);
             info!(request = r.id, ring = id, ttft_ms = ttft.as_millis() as u64, "first token");
         }
         if let Some(m) = &mut self.metrics {
@@ -682,9 +699,12 @@ impl<E: Engine> Scheduler<E> {
             }
             r.tokens.push(token);
             let ev = Event::Token { token, latency: step.started.elapsed() };
+            STATS.tokens_generated.add(1);
             if r.events.send(ev).is_err() {
                 // The client went away: cancel. Nobody is listening for the outcome.
                 info!(request = r.id, ring = id, generated = r.generated(), "cancelled by the client");
+                r.cancelled = true;
+                STATS.requests_cancelled.add(1);
                 return self.finish(id, Event::Done);
             }
             if r.generated() == r.max_new {
@@ -720,15 +740,23 @@ impl<E: Engine> Scheduler<E> {
             let elapsed = r.submitted.elapsed();
             let generated = r.generated();
             match &outcome {
-                Event::Failed(e) => warn!(request = r.id, ring = id, generated, error = %e, "failed"),
-                _ => info!(
-                    request = r.id,
-                    ring = id,
-                    generated,
-                    ms = elapsed.as_millis() as u64,
-                    tok_s = (generated as f64 / elapsed.as_secs_f64() * 10.0).round() / 10.0,
-                    "done"
-                ),
+                Event::Failed(e) => {
+                    STATS.requests_failed.add(1);
+                    warn!(request = r.id, ring = id, generated, error = %e, "failed")
+                }
+                // Logged and counted where the client went away.
+                _ if r.cancelled => {}
+                _ => {
+                    STATS.requests_done.add(1);
+                    info!(
+                        request = r.id,
+                        ring = id,
+                        generated,
+                        ms = elapsed.as_millis() as u64,
+                        tok_s = (generated as f64 / elapsed.as_secs_f64() * 10.0).round() / 10.0,
+                        "done"
+                    )
+                }
             }
         }
         self.ready.retain(|&r| r != id);
@@ -787,6 +815,7 @@ impl<E: Engine> Scheduler<E> {
         let failed = format!("ring down: {reason}");
         for (id, r) in self.active.drain() {
             warn!(request = r.id, ring = id, generated = r.generated(), "failed: ring down");
+            STATS.requests_failed.add(1);
             self.engine.free(id);
             let ev = match r.freeing {
                 Some(outcome @ Event::Done) => outcome,
@@ -796,6 +825,7 @@ impl<E: Engine> Scheduler<E> {
         }
         for (_, r) in self.waiting.drain(..) {
             warn!(request = r.id, "failed: ring down");
+            STATS.requests_failed.add(1);
             let _ = r.events.send(Event::Failed(failed.clone()));
         }
         for p in self.parked.drain(..) {
