@@ -49,6 +49,8 @@ impl Cluster {
         let cfg = Config {
             hidden_dim: DIM,
             num_layers: 40,
+            split: Default::default(),
+            experts: Default::default(),
             scheduler: sched,
             engine: Default::default(),
             http: None,
@@ -219,6 +221,8 @@ fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Connection) + Send
     let cfg = Config {
         hidden_dim: DIM,
         num_layers: 40,
+        split: Default::default(),
+        experts: Default::default(),
         scheduler: sched,
         engine: Default::default(),
         http: None,

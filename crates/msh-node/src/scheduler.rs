@@ -37,6 +37,20 @@
 //! down: in-flight requests fail and new ones are rejected until the cluster is restarted. The
 //! ping queues behind hidden states on every node, so the timeout must exceed one full pass
 //! through the workers, prefill chunks included.
+//!
+//! Expert split ([`spawn_experts`], docs/expert-parallel.md): the coordinator runs every layer
+//! up to its routed experts, sends the hidden rows and the picked experts to every worker that
+//! owns some of them at once, and finishes the layer when each has sent back its `Partial`;
+//! after the last layer it runs the head. Throughput again comes from interleaving: while the
+//! workers run a layer for request A, the coordinator routes a layer of request B. One step of
+//! a request is in the cluster at a time (`prefill_depth` is 1), since a chunk's attention needs
+//! the previous chunk's. Only the coordinator keeps request state, so `Drop` and `Rewind` stay
+//! on it. It also keeps the expert ownership table ([`crate::owners`]): it sends each worker
+//! its experts (`Own`) before serving, counts every pick, and every `rebalance_every`
+//! positions sends a few experts to a less busy worker (`Move`); once the new owner confirms,
+//! the table changes and the old owner gets `Release`. The ping goes to every worker and is
+//! back when all have answered. A step's per-node times are summed over its layers, and the
+//! workers' share of the step is the slowest worker of each layer, summed.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,14 +59,16 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use msh_net::{decode_token, Connection, Header, MsgType, FLAG_EVERY_TOKEN};
+use msh_net::{decode_move, decode_token, encode_move, encode_own, Connection, FrameError, Header, MsgType, Pick, FLAG_EVERY_TOKEN};
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
+use crate::config::ExpertsConfig;
 use crate::draft::{Drafter, PromptLookup};
-use crate::engine::{Engine, Sample, StageIn};
+use crate::engine::{Engine, MoeShape, Sample, StageIn};
 use crate::metrics::{Metrics, StepKind, StepRecord};
 use crate::node::Star;
+use crate::owners::{Move, Owners};
 use crate::stats::STATS;
 use crate::Error;
 
@@ -124,7 +140,12 @@ pub struct Generation {
 
 enum Msg {
     Submit { id: u64, prompt: Vec<u32>, max_new: usize, events: Sender<Event> },
+    /// Layer split: a frame back from the last worker.
     Frame(Header, Vec<u8>),
+    /// Expert split: worker `from`'s outputs for one layer of a step.
+    Partial { from: usize, h: Header, layer: u16, compute_us: u32, values: Vec<f32> },
+    /// Expert split: any other frame from worker `from`.
+    Reply { from: usize, h: Header, payload: Vec<u8> },
     ClusterDown(String),
     Shutdown,
 }
@@ -214,7 +235,47 @@ pub fn spawn_with_metrics<E: Engine + 'static>(
     // The threads log inside the caller's span (the node's name).
     let span = tracing::Span::current();
     let next = star.map(|star| relay(star, &tx, &span));
-    let mut cfg = cfg;
+    start(engine, next, None, cfg, tx, rx, span, metrics)
+}
+
+/// Starts the scheduler on the expert split: `engine` runs every layer but the routed experts
+/// and the head, and the workers own the experts, split evenly to start. Sends every worker its
+/// experts and waits until all hold them. Without workers, `engine` runs everything.
+pub fn spawn_experts<E: Engine + 'static>(
+    engine: E,
+    star: Option<Star>,
+    cfg: SchedulerConfig,
+    experts: ExpertsConfig,
+    metrics: Option<Metrics>,
+) -> Result<(Client, JoinHandle<E>), Error> {
+    let Some(shape) = engine.moe_shape() else {
+        return Err(Error::Config("the engine cannot split by experts".into()));
+    };
+    if (shape.experts, shape.top_k) != (experts.count, experts.top_k) || !engine.has_head() {
+        let want = format!("{} experts, top {}, and the head", experts.count, experts.top_k);
+        return Err(Error::Config(format!("engine has {shape:?}, head {}; the config wants {want}", engine.has_head())));
+    }
+    // A chunk's attention needs the previous chunk's, and picks number rows in a u16.
+    let cfg = SchedulerConfig { prefill_depth: 1, prefill_chunk: cfg.prefill_chunk.min(1 << 16), ..cfg };
+    let (tx, rx) = mpsc::channel();
+    let span = tracing::Span::current();
+    let Some(star) = star else {
+        return Ok(start(engine, None, None, cfg, tx, rx, span, metrics));
+    };
+    let fan = Fan::start(star, shape, experts, engine.hidden_dim(), &tx, &span)?;
+    Ok(start(engine, None, Some(fan), cfg, tx, rx, span, metrics))
+}
+
+fn start<E: Engine + 'static>(
+    engine: E,
+    next: Option<Connection>,
+    fan: Option<Fan>,
+    mut cfg: SchedulerConfig,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+    span: tracing::Span,
+    metrics: Option<Metrics>,
+) -> (Client, JoinHandle<E>) {
     if cfg.max_draft > 0 && !engine.can_speculate() {
         warn!("the engine cannot verify and rewind draft tokens; speculative decoding is off");
         cfg.max_draft = 0;
@@ -223,6 +284,7 @@ pub fn spawn_with_metrics<E: Engine + 'static>(
     let s = Scheduler {
         engine,
         next,
+        fan,
         cfg,
         rx,
         drafter: Box::new(drafter),
@@ -235,15 +297,122 @@ pub fn spawn_with_metrics<E: Engine + 'static>(
         down: None,
         shutting_down: false,
         ping: None,
+        ping_left: 0,
         ping_seq: 0,
         next_ping_at: Instant::now(),
         ping_rtt: None,
         parked: VecDeque::new(),
         metrics,
         stages: Vec::new(),
+        workers_us: None,
     };
     let client = Client { inner: Arc::new(ClientInner { tx, next_id: AtomicU64::new(1) }) };
     (client, thread::spawn(move || span.in_scope(|| s.run())))
+}
+
+/// The coordinator's side of the expert split.
+struct Fan {
+    /// Sending half of each worker's connection; empty once the cluster is down.
+    sends: Vec<Connection>,
+    owners: Owners,
+    cfg: ExpertsConfig,
+    layers: u32,
+    /// Most experts a worker may own after moves.
+    max_owned: usize,
+    /// Moves sent to each worker and not confirmed yet, oldest first.
+    moving: Vec<VecDeque<Move>>,
+    /// Positions routed since the last rebalance.
+    since_rebalance: u64,
+    /// Scratch: one worker's picks, and a `Move` payload.
+    picks: Vec<Pick>,
+    weights: Vec<u8>,
+    frame: Vec<u8>,
+}
+
+impl Fan {
+    /// Sends every worker its share of the experts, waits until each holds them, and starts a
+    /// reader per worker.
+    fn start(
+        star: Star,
+        shape: MoeShape,
+        cfg: ExpertsConfig,
+        dim: usize,
+        tx: &Sender<Msg>,
+        span: &tracing::Span,
+    ) -> Result<Fan, Error> {
+        let n = star.workers.len();
+        let owners = Owners::even(shape.layers, shape.experts, n);
+        let (mut recvs, mut sends): (Vec<Connection>, Vec<Connection>) = star.workers.into_iter().unzip();
+        let mut buf = Vec::new();
+        // All at once, so the workers load their experts together.
+        for (w, send) in sends.iter_mut().enumerate() {
+            let own: Vec<(u16, u16)> = owners.owned_by(w).into_iter().map(|(l, e)| (l as u16, e as u16)).collect();
+            encode_own(&own, &mut buf);
+            send.send(MsgType::Own, 0, 0, &buf)?;
+        }
+        for recv in &mut recvs {
+            let h = recv.recv(&mut buf).map_err(|e| Error::Protocol(format!("{}: own: {e}", recv.peer_name())))?;
+            if h.msg_type != MsgType::Own {
+                return Err(Error::Protocol(format!("{}: expected Own back, got {:?}", recv.peer_name(), h.msg_type)));
+            }
+        }
+        let total = shape.layers as usize * shape.experts as usize;
+        info!(workers = n, layers = shape.layers, experts = shape.experts, top_k = shape.top_k, "experts assigned");
+        for (w, recv) in recvs.into_iter().enumerate() {
+            let (tx, span) = (tx.clone(), span.clone());
+            thread::spawn(move || span.in_scope(|| read_expert_worker(w, recv, dim, tx)));
+        }
+        Ok(Fan {
+            sends,
+            owners,
+            cfg,
+            layers: shape.layers,
+            max_owned: total.div_ceil(n) + cfg.extra_experts,
+            moving: vec![VecDeque::new(); n],
+            since_rebalance: 0,
+            picks: Vec::new(),
+            weights: Vec::new(),
+            frame: Vec::new(),
+        })
+    }
+}
+
+/// Receives what one worker sends back on the expert split: `Partial` outputs straight into
+/// their own buffer (NET-6), anything else as it is.
+fn read_expert_worker(from: usize, mut link: Connection, dim: usize, tx: Sender<Msg>) {
+    let mut buf = Vec::new();
+    loop {
+        let h = match link.recv_header() {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = tx.send(Msg::ClusterDown(format!("lost connection from {}: {e}", link.peer_name())));
+                break;
+            }
+        };
+        let msg = if h.msg_type == MsgType::Partial {
+            let mut values = Vec::new();
+            match link.recv_partial(&h, dim, &mut values) {
+                Ok((layer, compute_us)) => Msg::Partial { from, h, layer, compute_us, values },
+                // A malformed partial fails its request, like an error from the worker.
+                Err(e @ FrameError::Remote(_)) => {
+                    let payload = format!("{}: bad partial: {e}", link.peer_name()).into_bytes();
+                    Msg::Reply { from, h: Header::new(MsgType::Error, h.request_id, h.position, payload.len()), payload }
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::ClusterDown(format!("lost connection from {}: {e}", link.peer_name())));
+                    break;
+                }
+            }
+        } else {
+            if let Err(e) = link.recv_payload(&h, &mut buf) {
+                let _ = tx.send(Msg::ClusterDown(format!("lost connection from {}: {e}", link.peer_name())));
+                break;
+            }
+            Msg::Reply { from, h, payload: std::mem::take(&mut buf) }
+        };
+        // After the scheduler stops, keep reading until the worker closes, as `read_worker` does.
+        let _ = tx.send(msg);
+    }
 }
 
 /// Starts a reader per worker; returns the sending side of the first worker's connection.
@@ -324,6 +493,33 @@ struct Request {
     parkable: bool,
     /// The client went away.
     cancelled: bool,
+    /// Expert split: the step's progress through the layers.
+    fan: FanStep,
+}
+
+/// A request's step on the expert split. The buffers are kept from step to step.
+#[derive(Default)]
+struct FanStep {
+    /// The layer on the workers, or the number of layers once all are done.
+    layer: u32,
+    every: bool,
+    /// The step's rows: each layer's output without its routed experts, then with them.
+    hidden: Vec<f32>,
+    /// The rows the experts take, and each row's picks.
+    x: Vec<f32>,
+    picks: Vec<Pick>,
+    /// One output row per pick, filled in as `Partial`s come back.
+    outputs: Vec<f32>,
+    /// Per worker, the indexes in `picks` it was sent; cleared when its `Partial` is in.
+    sent: Vec<Vec<usize>>,
+    /// Workers whose `Partial` is still out.
+    waiting: usize,
+    /// Compute time on the coordinator, and on each worker, summed over the layers.
+    coord_us: u64,
+    worker_us: Vec<u64>,
+    /// The slowest worker of each layer, summed, and of the layer on the workers.
+    critical_us: u64,
+    layer_us: u64,
 }
 
 /// A finished request whose state stays on every node.
@@ -361,7 +557,10 @@ fn push_ready(ready: &mut VecDeque<u64>, id: u64) {
 
 struct Scheduler<E: Engine> {
     engine: E,
+    /// Layer split: the sending side of the first worker's connection.
     next: Option<Connection>,
+    /// Expert split with workers.
+    fan: Option<Fan>,
     cfg: SchedulerConfig,
     rx: Receiver<Msg>,
     drafter: Box<dyn Drafter>,
@@ -378,6 +577,9 @@ struct Scheduler<E: Engine> {
     shutting_down: bool,
     /// Outstanding health ping: sequence number and send time.
     ping: Option<(u64, Instant)>,
+    /// Workers the ping has not come back from: one on the layer split (the last), every
+    /// worker on the expert split.
+    ping_left: usize,
     ping_seq: u64,
     next_ping_at: Instant,
     /// Last health ping's trip through every worker (NET-5).
@@ -387,6 +589,8 @@ struct Scheduler<E: Engine> {
     metrics: Option<Metrics>,
     /// Scratch for the stage times of a returning token.
     stages: Vec<u32>,
+    /// The workers' share of a returning step when they ran at once (expert split).
+    workers_us: Option<u64>,
 }
 
 impl<E: Engine> Scheduler<E> {
@@ -420,18 +624,33 @@ impl<E: Engine> Scheduler<E> {
         }
     }
 
-    /// Closes the first worker's connection, so every worker exits in turn, and hands back
-    /// the engine.
+    /// Closes the connections to the workers, so every worker exits (on the layer split, in
+    /// turn), and hands back the engine.
     fn stop(mut self) -> E {
         if let Some(next) = &mut self.next {
             next.close_send();
         }
+        for send in self.fan.iter_mut().flat_map(|f| f.sends.iter_mut()) {
+            send.close_send();
+        }
         self.engine
+    }
+
+    /// The sending halves to the workers: the first worker's on the layer split, every
+    /// worker's on the expert split. Empty without live workers.
+    fn links(&mut self) -> &mut [Connection] {
+        match (&mut self.next, &mut self.fan) {
+            (Some(next), _) => std::slice::from_mut(next),
+            (None, Some(fan)) => &mut fan.sends,
+            (None, None) => &mut [],
+        }
     }
 
     /// When the health check next needs attention, or `None` without live workers.
     fn health_deadline(&self) -> Option<Instant> {
-        self.next.as_ref()?;
+        if self.next.is_none() && self.fan.as_ref().is_none_or(|f| f.sends.is_empty()) {
+            return None;
+        }
         Some(match self.ping {
             Some((_, sent)) => sent + Duration::from_millis(self.cfg.health_timeout_ms),
             None => self.next_ping_at,
@@ -439,21 +658,40 @@ impl<E: Engine> Scheduler<E> {
     }
 
     fn check_health(&mut self) {
-        let Some(next) = &mut self.next else { return };
         let now = Instant::now();
         if let Some((seq, sent)) = self.ping {
             if now.duration_since(sent) > Duration::from_millis(self.cfg.health_timeout_ms) {
                 let reason = format!("health ping {seq} not back after {} ms", self.cfg.health_timeout_ms);
                 self.cluster_down(reason);
             }
-        } else if now >= self.next_ping_at {
+        } else if now >= self.next_ping_at && !self.links().is_empty() {
             self.ping_seq += 1;
-            if let Err(e) = next.send(MsgType::Ping, self.ping_seq, 0, &[]) {
-                let reason = format!("send to {}: {e}", next.peer_name());
+            let seq = self.ping_seq;
+            let mut failed = None;
+            for link in self.links() {
+                if let Err(e) = link.send(MsgType::Ping, seq, 0, &[]) {
+                    failed = Some(format!("send to {}: {e}", link.peer_name()));
+                    break;
+                }
+            }
+            if let Some(reason) = failed {
                 return self.cluster_down(reason);
             }
-            self.ping = Some((self.ping_seq, now));
+            // On the layer split the ping comes back from the last worker only.
+            self.ping_left = if self.next.is_some() { 1 } else { self.links().len() };
+            self.ping = Some((seq, now));
             self.next_ping_at = now + Duration::from_millis(self.cfg.health_interval_ms);
+        }
+    }
+
+    /// A ping came back from a worker.
+    fn on_ping(&mut self, seq: u64) {
+        let Some((_, sent)) = self.ping.filter(|&(s, _)| s == seq) else { return };
+        self.ping_left = self.ping_left.saturating_sub(1);
+        if self.ping_left == 0 {
+            self.ping_rtt = Some(sent.elapsed());
+            STATS.ping_rtt_us.store(sent.elapsed().as_micros() as u64, Ordering::Relaxed);
+            self.ping = None;
         }
     }
 
@@ -461,6 +699,8 @@ impl<E: Engine> Scheduler<E> {
         match m {
             Msg::Submit { id, prompt, max_new, events } => self.submit(id, prompt, max_new, events),
             Msg::Frame(h, payload) => self.on_frame(h, payload),
+            Msg::Partial { from, h, layer, compute_us, values } => self.on_partial(from, h, layer, compute_us, values),
+            Msg::Reply { from, h, payload } => self.on_reply(from, h, payload),
             Msg::ClusterDown(reason) => self.cluster_down(reason),
             Msg::Shutdown => {
                 self.shutting_down = true;
@@ -513,6 +753,7 @@ impl<E: Engine> Scheduler<E> {
             cached: 0,
             parkable: true,
             cancelled: false,
+            fan: FanStep::default(),
         };
         self.waiting.push_back((id, r));
     }
@@ -573,16 +814,34 @@ impl<E: Engine> Scheduler<E> {
             self.input.extend_from_slice(&drafts);
         }
         let sample = if drafts.is_empty() { Sample::Last } else { Sample::Every };
-        let input = StageIn::Tokens(&self.input);
-        if let Err(e) = self.engine.step(id, start as u32, input, sample, &mut self.hidden, &mut self.tokens) {
+        let workers = self.fan.as_ref().map(|f| f.sends.len());
+        let result = match workers {
+            // Expert split: the embedding now, the layers one by one as the workers answer.
+            Some(_) => self.engine.embed(id, start as u32, &self.input, sample, &mut r.fan.hidden),
+            None => {
+                let input = StageIn::Tokens(&self.input);
+                self.engine.step(id, start as u32, input, sample, &mut self.hidden, &mut self.tokens)
+            }
+        };
+        if let Err(e) = result {
             return self.finish(id, Event::Failed(e.to_string()));
         }
         debug!(request = r.id, state = id, pos = start, positions = self.input.len(), drafted = drafts.len(), "step sent");
-        STATS.compute.observe(started.elapsed());
-        let coord_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
         let positions = self.input.len() as u32;
         r.next_pos += positions as usize;
         r.in_flight.push_back(Step { start: start as u32, positions, drafts, started });
+        if let Some(workers) = workers {
+            let f = &mut r.fan;
+            f.layer = 0;
+            f.every = sample == Sample::Every;
+            f.coord_us = started.elapsed().as_micros() as u64;
+            f.worker_us.clear();
+            f.worker_us.resize(workers, 0);
+            f.critical_us = 0;
+            return self.route_layer(id);
+        }
+        STATS.compute.observe(started.elapsed());
+        let coord_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
         let next = match (self.engine.has_head(), &mut self.next) {
             // One node holds every layer and the head.
             (true, None) => {
@@ -611,6 +870,170 @@ impl<E: Engine> Scheduler<E> {
         }
     }
 
+    /// Expert split: runs the next layer of `id`'s step up to its routed experts and sends each
+    /// worker its picks; after the last layer, runs the head.
+    fn route_layer(&mut self, id: u64) {
+        let dim = self.engine.hidden_dim();
+        let (Some(r), Some(fan)) = (self.active.get_mut(&id), self.fan.as_mut()) else { return };
+        let Some(&Step { start, positions, .. }) = r.in_flight.front() else { return };
+        let f = &mut r.fan;
+        let t0 = Instant::now();
+        if f.layer == fan.layers {
+            let sample = if f.every { Sample::Every } else { Sample::Last };
+            let result = self.engine.head(id, &f.hidden, sample, &mut self.tokens);
+            f.coord_us += t0.elapsed().as_micros() as u64;
+            if let Err(e) = result {
+                return self.finish(id, Event::Failed(e.to_string()));
+            }
+            STATS.compute.observe(Duration::from_micros(f.coord_us));
+            let us = |t: u64| t.min(u32::MAX as u64) as u32;
+            self.stages.clear();
+            self.stages.push(us(f.coord_us));
+            self.stages.extend(f.worker_us.iter().map(|&t| us(t)));
+            self.workers_us = Some(f.critical_us);
+            fan.since_rebalance += positions as u64;
+            let tokens = std::mem::take(&mut self.tokens);
+            self.on_tokens(id, start, &tokens);
+            self.tokens = tokens;
+            self.workers_us = None;
+            return self.rebalance();
+        }
+        let layer = f.layer;
+        if let Err(e) = self.engine.route(id, layer, &mut f.hidden, &mut f.x, &mut f.picks) {
+            return self.finish(id, Event::Failed(e.to_string()));
+        }
+        f.sent.resize_with(fan.sends.len(), Vec::new);
+        f.sent.iter_mut().for_each(Vec::clear);
+        for (k, p) in f.picks.iter().enumerate() {
+            fan.owners.count(layer, p.expert as u32);
+            f.sent[fan.owners.owner(layer, p.expert as u32)].push(k);
+        }
+        f.outputs.resize(f.picks.len() * dim, 0.0);
+        f.waiting = 0;
+        f.layer_us = 0;
+        f.coord_us += t0.elapsed().as_micros() as u64;
+        // To every worker that has picks, at once; the rows straight from the step (NET-6).
+        for (w, send) in fan.sends.iter_mut().enumerate() {
+            if f.sent[w].is_empty() {
+                continue;
+            }
+            fan.picks.clear();
+            fan.picks.extend(f.sent[w].iter().map(|&k| f.picks[k]));
+            if let Err(e) = send.send_experts(id, start, layer as u16, &fan.picks, &f.x) {
+                let reason = format!("send to {}: {e}", send.peer_name());
+                return self.cluster_down(reason);
+            }
+            f.waiting += 1;
+        }
+    }
+
+    /// Expert split: worker `from`'s outputs for a layer. Once every worker's are in, finishes
+    /// the layer and goes on to the next.
+    fn on_partial(&mut self, from: usize, h: Header, layer: u16, compute_us: u32, values: Vec<f32>) {
+        let (id, dim) = (h.request_id, self.engine.hidden_dim());
+        // Nothing waits for a step that already failed.
+        let Some(r) = self.active.get_mut(&id) else { return };
+        let f = &mut r.fan;
+        let current = r.in_flight.front().is_some_and(|s| s.start == h.position) && f.layer == layer as u32;
+        if !current || f.sent.get(from).is_none_or(Vec::is_empty) {
+            return;
+        }
+        let mut sent = std::mem::take(&mut f.sent[from]);
+        if values.len() != sent.len() * dim {
+            let name = self.fan.as_ref().and_then(|f| f.sends.get(from)).map_or("a worker", |c| c.peer_name());
+            let msg = format!("{name}: {} output rows for {} picks", values.len() / dim, sent.len());
+            return self.finish(id, Event::Failed(msg));
+        }
+        for (out, &k) in values.chunks_exact(dim).zip(&sent) {
+            f.outputs[k * dim..(k + 1) * dim].copy_from_slice(out);
+        }
+        sent.clear();
+        f.sent[from] = sent;
+        f.worker_us[from] += compute_us as u64;
+        f.layer_us = f.layer_us.max(compute_us as u64);
+        f.waiting -= 1;
+        if f.waiting > 0 {
+            return;
+        }
+        f.critical_us += f.layer_us;
+        let t0 = Instant::now();
+        self.engine.combine(layer as u32, &f.picks, &f.outputs, &mut f.hidden);
+        f.coord_us += t0.elapsed().as_micros() as u64;
+        f.layer += 1;
+        self.route_layer(id);
+    }
+
+    /// Expert split: any frame but `Partial` from worker `from`.
+    fn on_reply(&mut self, from: usize, h: Header, payload: Vec<u8>) {
+        let id = h.request_id;
+        match h.msg_type {
+            MsgType::Ping => self.on_ping(id),
+            // Answers a control frame: a move the worker could not take keeps the old owner.
+            MsgType::Error if id == 0 => {
+                let msg = String::from_utf8_lossy(&payload);
+                match self.fan.as_mut().and_then(|f| f.moving.get_mut(from)?.pop_front()) {
+                    Some(m) => warn!(layer = m.layer, expert = m.expert, error = %msg, "expert not moved"),
+                    None => warn!(error = %msg, "worker error"),
+                }
+            }
+            MsgType::Error => {
+                if self.active.get(&id).is_some_and(|r| !r.in_flight.is_empty()) {
+                    self.finish(id, Event::Failed(String::from_utf8_lossy(&payload).into_owned()))
+                }
+            }
+            MsgType::Move => self.on_moved(from, &payload),
+            other => self.cluster_down(format!("unexpected {other:?} frame from the workers")),
+        }
+    }
+
+    /// Worker `to` holds a moved expert: the table changes, then the old owner lets it go.
+    /// Layers sent to the old owner before still find it there; the links are FIFO.
+    fn on_moved(&mut self, to: usize, payload: &[u8]) {
+        let Some(fan) = self.fan.as_mut().filter(|f| !f.sends.is_empty()) else { return };
+        let got = decode_move(payload).ok().map(|(l, e, _)| (l as u32, e as u32));
+        let Some(m) = fan.moving[to].pop_front().filter(|m| Some((m.layer, m.expert)) == got) else {
+            return self.cluster_down(format!("worker {to} confirmed a move not asked for: {got:?}"));
+        };
+        fan.owners.set_owner(m.layer, m.expert, m.to);
+        debug!(layer = m.layer, expert = m.expert, from = m.from, to = m.to, "expert moved");
+        encode_move(m.layer as u16, m.expert as u16, &[], &mut fan.frame);
+        let old = &mut fan.sends[m.from];
+        if let Err(e) = old.send(MsgType::Release, 0, 0, &fan.frame) {
+            let reason = format!("send to {}: {e}", old.peer_name());
+            self.cluster_down(reason);
+        }
+    }
+
+    /// Expert split: every `rebalance_every` positions, sends a few experts to a less busy
+    /// worker, unless earlier moves are still out.
+    fn rebalance(&mut self) {
+        let Some(fan) = &mut self.fan else { return };
+        let every = fan.cfg.rebalance_every;
+        if every == 0 || fan.since_rebalance < every || fan.sends.is_empty() || fan.moving.iter().any(|m| !m.is_empty()) {
+            return;
+        }
+        fan.since_rebalance = 0;
+        let moves = fan.owners.plan_moves(fan.cfg.max_moves, fan.max_owned);
+        if moves.is_empty() {
+            return;
+        }
+        info!(moves = moves.len(), "moving experts");
+        for m in moves {
+            if let Err(e) = self.engine.expert_weights(m.layer, m.expert, &mut fan.weights) {
+                warn!(layer = m.layer, expert = m.expert, error = %e, "expert not moved");
+                continue;
+            }
+            encode_move(m.layer as u16, m.expert as u16, &fan.weights, &mut fan.frame);
+            debug!(layer = m.layer, expert = m.expert, from = m.from, to = m.to, "moving expert");
+            let new = &mut fan.sends[m.to];
+            if let Err(e) = new.send(MsgType::Move, 0, 0, &fan.frame) {
+                let reason = format!("send to {}: {e}", new.peer_name());
+                return self.cluster_down(reason);
+            }
+            fan.moving[m.to].push_back(m);
+        }
+    }
+
     fn on_frame(&mut self, h: Header, payload: Vec<u8>) {
         let id = h.request_id;
         let in_flight = self.active.get(&id).is_some_and(|r| r.freeing.is_none() && !r.in_flight.is_empty());
@@ -626,13 +1049,7 @@ impl<E: Engine> Scheduler<E> {
             MsgType::Error if in_flight => {
                 self.finish(id, Event::Failed(String::from_utf8_lossy(&payload).into_owned()))
             }
-            MsgType::Ping => {
-                if let Some((_, sent)) = self.ping.filter(|&(seq, _)| seq == id) {
-                    self.ping_rtt = Some(sent.elapsed());
-                    STATS.ping_rtt_us.store(sent.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    self.ping = None;
-                }
-            }
+            MsgType::Ping => self.on_ping(id),
             MsgType::Drop => {
                 if let Some(outcome) = self.active.get_mut(&id).and_then(|r| r.freeing.take()) {
                     let r = self.active.remove(&id).unwrap();
@@ -702,6 +1119,7 @@ impl<E: Engine> Scheduler<E> {
                 tokens: &tokens[..=accepted],
                 step_us,
                 stage_us: &self.stages,
+                workers_us: self.workers_us,
                 queue_us: r.queued.as_micros() as u64,
                 in_flight,
                 ping_rtt_us: self.ping_rtt.map(|d| d.as_micros() as u64),
@@ -864,6 +1282,12 @@ impl<E: Engine> Scheduler<E> {
         self.ready.clear();
         if let Some(mut next) = self.next.take() {
             next.close_send();
+        }
+        if let Some(fan) = &mut self.fan {
+            for mut send in fan.sends.drain(..) {
+                send.close_send();
+            }
+            fan.moving.iter_mut().for_each(VecDeque::clear);
         }
         self.down = Some(reason);
     }

@@ -7,18 +7,23 @@
 //! it returns from the last worker every node has freed the request (CL-9); `Rewind` (rejected
 //! draft tokens) too. An engine error on a worker comes back as an `Error` frame, which the
 //! controller passes on until it reaches the scheduler; the cluster stays up.
+//!
+//! With the expert split the controller sends each layer to every worker that has picks at
+//! once, and each answers on its own link: `Experts` gets back a `Partial`. A worker holds the
+//! experts `Own` and `Move` give it and no state per request, so `Drop` and `Rewind` never
+//! reach it. The same loop serves both splits; the controller decides which frames come.
 
 use std::io::ErrorKind;
 use std::net::TcpListener;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use msh_net::{encode_token, Connection, FrameError, MsgType, FLAG_EVERY_TOKEN};
+use msh_net::{decode_move, decode_own, encode_move, encode_token, Connection, FrameError, MsgType, FLAG_EVERY_TOKEN};
 
 use crate::config::Config;
 use crate::engine::{Engine, Sample, StageIn};
 use crate::Error;
-use tracing::{debug, warn};
+use tracing::{debug, info, trace, warn};
 
 /// The controller's connections to its workers, in config order, each split into a receiving
 /// and a sending half.
@@ -102,16 +107,76 @@ impl<E: Engine> Worker<E> {
         let mut buf = Vec::new();
         let mut out = Vec::new();
         let mut stages = Vec::new();
+        let mut picks = Vec::new();
+        let mut experts = Vec::new();
         loop {
             let h = match self.link.recv_header() {
                 Ok(h) => h,
                 Err(FrameError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => return Ok(self.engine),
                 Err(e) => return Err(e.into()),
             };
-            if h.msg_type != MsgType::Hidden {
+            if !matches!(h.msg_type, MsgType::Hidden | MsgType::Experts) {
                 self.link.recv_payload(&h, &mut buf)?;
             }
             match h.msg_type {
+                MsgType::Experts => {
+                    // Rows straight into `hidden`, outputs sent straight from `hidden_out` (NET-6).
+                    let decoded = self.link.recv_experts(&h, dim, &mut picks, &mut hidden).map_err(Error::from);
+                    let t0 = Instant::now();
+                    let result = decoded.and_then(|layer| {
+                        self.engine.run_experts(h.request_id, layer as u32, &hidden, &picks, &mut hidden_out)?;
+                        Ok(layer)
+                    });
+                    crate::stats::STATS.compute.observe(t0.elapsed());
+                    let us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                    match result {
+                        Ok(layer) => {
+                            trace!(state = h.request_id, pos = h.position, layer, picks = picks.len(), us, "experts");
+                            self.link.send_partial(h.request_id, h.position, layer, us, &hidden_out)?;
+                        }
+                        Err(e) => {
+                            warn!(state = h.request_id, pos = h.position, error = %e, "experts failed");
+                            let msg = format!("{}: {e}", self.name);
+                            self.link.send(MsgType::Error, h.request_id, h.position, msg.as_bytes())?;
+                        }
+                    }
+                }
+                // Control frames of the expert split come with request id 0; so does an error
+                // answering one.
+                MsgType::Own => {
+                    let result = decode_own(&buf, &mut experts).map_err(Error::from).and_then(|()| {
+                        let list: Vec<(u32, u32)> = experts.iter().map(|&(l, e)| (l as u32, e as u32)).collect();
+                        self.engine.own_experts(&list)
+                    });
+                    match result {
+                        Ok(()) => {
+                            info!(experts = experts.len(), "holding experts");
+                            self.link.send(MsgType::Own, 0, 0, &[])?;
+                        }
+                        Err(e) => self.send_control_error("own", &e)?,
+                    }
+                }
+                MsgType::Move => {
+                    let result = decode_move(&buf).map_err(Error::from).and_then(|(layer, expert, weights)| {
+                        self.engine.load_expert(layer as u32, expert as u32, weights)?;
+                        Ok((layer, expert))
+                    });
+                    match result {
+                        Ok((layer, expert)) => {
+                            debug!(layer, expert, "expert moved in");
+                            encode_move(layer, expert, &[], &mut out);
+                            self.link.send(MsgType::Move, 0, 0, &out)?;
+                        }
+                        Err(e) => self.send_control_error("move", &e)?,
+                    }
+                }
+                MsgType::Release => match decode_move(&buf) {
+                    Ok((layer, expert, _)) => {
+                        debug!(layer, expert, "expert released");
+                        self.engine.release_expert(layer as u32, expert as u32);
+                    }
+                    Err(e) => self.send_control_error("release", &e.into())?,
+                },
                 MsgType::Hidden => {
                     let sample = if h.flags & FLAG_EVERY_TOKEN != 0 { Sample::Every } else { Sample::Last };
                     // Straight into `hidden`, and sent back straight from `hidden_out` (NET-6).
@@ -164,5 +229,12 @@ impl<E: Engine> Worker<E> {
                 other => return Err(Error::Protocol(format!("{}: unexpected {other:?} frame", self.name))),
             }
         }
+    }
+
+    /// Reports a failed `Own`, `Move` or `Release` to the controller.
+    fn send_control_error(&mut self, what: &str, e: &Error) -> Result<(), Error> {
+        warn!(error = %e, "{what} failed");
+        let msg = format!("{}: {what}: {e}", self.name);
+        Ok(self.link.send(MsgType::Error, 0, 0, msg.as_bytes())?)
     }
 }

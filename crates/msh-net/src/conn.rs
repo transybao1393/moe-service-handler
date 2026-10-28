@@ -5,8 +5,9 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::frame::{
-    bad_payload, f32_bytes, f32_bytes_mut, read_frame, write_frame, write_stages, FrameError, Header, MsgType,
-    HEADER_LEN, PROTOCOL_VERSION,
+    bad_payload, check_rows, f32_bytes, f32_bytes_mut, read_frame, read_picks, write_experts_prefix, write_frame,
+    write_stages, FrameError, Header, MsgType, Pick, EXPERTS_PREFIX, HEADER_LEN, PARTIAL_PREFIX, PICK_LEN,
+    PROTOCOL_VERSION,
 };
 
 /// Bytes of each connection's read and write buffers.
@@ -207,6 +208,110 @@ impl Connection {
         values.resize(rest / 4, 0.0);
         self.reader.read_exact(f32_bytes_mut(values))?;
         Ok(rest / row)
+    }
+
+    /// Sends an `Experts` frame (the [`crate::encode_experts`] payload), the rows straight from
+    /// `rows` (NET-6).
+    pub fn send_experts(
+        &mut self,
+        request_id: u64,
+        position: u32,
+        layer: u16,
+        picks: &[Pick],
+        rows: &[f32],
+    ) -> io::Result<()> {
+        self.prefix.clear();
+        write_experts_prefix(layer, picks, &mut self.prefix);
+        let bytes = f32_bytes(rows);
+        let h = Header::new(MsgType::Experts, request_id, position, self.prefix.len() + bytes.len());
+        self.writer.write_all(&h.encode())?;
+        self.writer.write_all(&self.prefix)?;
+        self.writer.write_all(bytes)?;
+        self.writer.flush()
+    }
+
+    /// Reads an `Experts` frame's payload: the picks into `picks` and the rows straight into
+    /// `rows`, as [`crate::decode_experts`] would; returns the layer. A malformed payload is
+    /// still read in full.
+    pub fn recv_experts(
+        &mut self,
+        h: &Header,
+        hidden_dim: usize,
+        picks: &mut Vec<Pick>,
+        rows: &mut Vec<f32>,
+    ) -> Result<u16, FrameError> {
+        let len = h.payload_len as usize;
+        if len < EXPERTS_PREFIX {
+            self.skip(len)?;
+            return Err(bad_payload("experts payload too short".into()));
+        }
+        let mut head = [0u8; EXPERTS_PREFIX];
+        self.reader.read_exact(&mut head)?;
+        let n = u32::from_le_bytes(head[2..6].try_into().unwrap()) as usize;
+        let Some(rest) = (len - EXPERTS_PREFIX).checked_sub(PICK_LEN * n) else {
+            self.skip(len - EXPERTS_PREFIX)?;
+            return Err(bad_payload("experts payload too short".into()));
+        };
+        self.prefix.resize(PICK_LEN * n, 0);
+        self.reader.read_exact(&mut self.prefix)?;
+        read_picks(&self.prefix, picks);
+        if let Err(e) = check_rows(rest, hidden_dim, picks) {
+            self.skip(rest)?;
+            return Err(e);
+        }
+        self.read_rows(rest, rows)?;
+        Ok(u16::from_le_bytes([head[0], head[1]]))
+    }
+
+    /// Sends a `Partial` frame (the [`crate::encode_partial`] payload) straight from `values`.
+    pub fn send_partial(
+        &mut self,
+        request_id: u64,
+        position: u32,
+        layer: u16,
+        compute_us: u32,
+        values: &[f32],
+    ) -> io::Result<()> {
+        let bytes = f32_bytes(values);
+        let h = Header::new(MsgType::Partial, request_id, position, PARTIAL_PREFIX + bytes.len());
+        self.writer.write_all(&h.encode())?;
+        self.writer.write_all(&layer.to_le_bytes())?;
+        self.writer.write_all(&compute_us.to_le_bytes())?;
+        self.writer.write_all(bytes)?;
+        self.writer.flush()
+    }
+
+    /// Reads a `Partial` frame's payload straight into `values`, as [`crate::decode_partial`]
+    /// would; returns the layer and the worker's compute time. A malformed payload is still
+    /// read in full.
+    pub fn recv_partial(
+        &mut self,
+        h: &Header,
+        hidden_dim: usize,
+        values: &mut Vec<f32>,
+    ) -> Result<(u16, u32), FrameError> {
+        let len = h.payload_len as usize;
+        let rest = len.saturating_sub(PARTIAL_PREFIX);
+        if len < PARTIAL_PREFIX {
+            self.skip(len)?;
+            return Err(bad_payload("partial payload too short".into()));
+        }
+        let mut head = [0u8; PARTIAL_PREFIX];
+        self.reader.read_exact(&mut head)?;
+        if let Err(e) = check_rows(rest, hidden_dim, &[]) {
+            self.skip(rest)?;
+            return Err(e);
+        }
+        self.read_rows(rest, values)?;
+        Ok((u16::from_le_bytes([head[0], head[1]]), u32::from_le_bytes(head[2..6].try_into().unwrap())))
+    }
+
+    /// Reads `len` bytes of f32s straight into `values`.
+    fn read_rows(&mut self, len: usize, values: &mut Vec<f32>) -> io::Result<()> {
+        // Grows without zeroing what is already there; every byte is overwritten below.
+        values.truncate(len / 4);
+        values.resize(len / 4, 0.0);
+        self.reader.read_exact(f32_bytes_mut(values))
     }
 
     fn skip(&mut self, n: usize) -> io::Result<()> {

@@ -84,6 +84,66 @@ fn direct_hidden_frames_match_encoded_ones() {
 }
 
 #[test]
+fn direct_experts_and_partial_frames_match_encoded_ones() {
+    use msh_net::{decode_experts, decode_partial, encode_experts, encode_partial, Pick};
+    let (mut a, mut b) = pair();
+    let dim = 4;
+    let rows: Vec<f32> = (0..2 * dim).map(|i| i as f32 * 0.37 - 1.0).collect();
+    let picks = [Pick { row: 1, expert: 9, gate: 0.75 }, Pick { row: 0, expert: 2, gate: 0.125 }];
+
+    a.send_experts(7, 40, 3, &picks, &rows).unwrap();
+    let mut buf = Vec::new();
+    let h = b.recv_frame(&mut buf).unwrap();
+    assert_eq!((h.msg_type, h.request_id, h.position), (MsgType::Experts, 7, 40));
+    let mut encoded = Vec::new();
+    encode_experts(3, &picks, &rows, &mut encoded);
+    assert_eq!(buf, encoded);
+    a.send(MsgType::Experts, 8, 41, &encoded).unwrap();
+    let (mut got_picks, mut got_rows) = (Vec::new(), vec![5.0; 100]);
+    let h = b.recv_header().unwrap();
+    assert_eq!(b.recv_experts(&h, dim, &mut got_picks, &mut got_rows).unwrap(), 3);
+    assert_eq!((got_picks.as_slice(), got_rows.as_slice()), (&picks[..], rows.as_slice()));
+    let (mut old_picks, mut old_rows) = (Vec::new(), Vec::new());
+    decode_experts(&encoded, dim, &mut old_picks, &mut old_rows).unwrap();
+    assert_eq!((old_picks, old_rows), (got_picks, got_rows));
+
+    // One output row per pick.
+    b.send_partial(7, 40, 3, 55, &rows).unwrap();
+    let h = a.recv_frame(&mut buf).unwrap();
+    assert_eq!((h.msg_type, h.request_id, h.position), (MsgType::Partial, 7, 40));
+    encode_partial(3, 55, &rows, &mut encoded);
+    assert_eq!(buf, encoded);
+    b.send(MsgType::Partial, 8, 41, &encoded).unwrap();
+    let mut got = Vec::new();
+    let h = a.recv_header().unwrap();
+    assert_eq!(a.recv_partial(&h, dim, &mut got).unwrap(), (3, 55));
+    assert_eq!(got, rows);
+    let mut old = Vec::new();
+    assert_eq!(decode_partial(&encoded, dim, &mut old).unwrap(), (3, 55));
+    assert_eq!(old, got);
+}
+
+#[test]
+fn malformed_experts_and_partial_payloads_are_skipped() {
+    use msh_net::{encode_experts, Pick};
+    let (mut a, mut b) = pair();
+    let mut bad = Vec::new();
+    // A pick for row 2 of the step's 1 row.
+    encode_experts(0, &[Pick { row: 2, expert: 0, gate: 1.0 }], &[0.0; 4], &mut bad);
+    a.send(MsgType::Experts, 1, 0, &bad).unwrap();
+    // Not whole rows of 4 floats.
+    a.send(MsgType::Partial, 2, 0, &[0, 0, 0, 0, 0, 0, 1, 2, 3]).unwrap();
+    a.send(MsgType::Ping, 3, 0, b"next").unwrap();
+    let h = b.recv_header().unwrap();
+    assert!(b.recv_experts(&h, 4, &mut Vec::new(), &mut Vec::new()).is_err());
+    let h = b.recv_header().unwrap();
+    assert!(b.recv_partial(&h, 4, &mut Vec::new()).is_err());
+    let mut buf = Vec::new();
+    let h = b.recv_frame(&mut buf).unwrap();
+    assert_eq!((h.msg_type, h.request_id, buf.as_slice()), (MsgType::Ping, 3, &b"next"[..]));
+}
+
+#[test]
 fn malformed_hidden_payload_is_skipped() {
     let (mut a, mut b) = pair();
     // 2 stage-count bytes, then 5 bytes: not whole rows of 8 floats.

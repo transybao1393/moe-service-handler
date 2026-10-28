@@ -1,8 +1,11 @@
 # moe-service-handler
 
 <p align="center">
-  <img src="docs/assets/dataflow-v4.svg" width="900" alt="Data flow: a client's prompt enters the m4 controller, which runs the first layers and sends hidden states to the m1 worker; m1 sends its result back to the controller, which passes it to the m4b worker; m4b runs the last layers and the head and sends the token back to the controller; the controller streams it to the client. Three requests are in the cluster at once.">
+  <img src="docs/assets/dataflow-experts.svg" width="900" alt="Data flow, experts split across the workers: the prompt comes in to the m4 controller; for each of the 40 layers the controller runs attention and the router, sends the hidden state to both workers at once with the picked experts each owns, both workers compute their experts at the same time and send the outputs back, and the controller adds them up; after the last layer the controller's head picks the token and streams it to the client. The workers never talk to each other.">
 </p>
+
+<p align="center"><em>The expert split (<code>split = "experts"</code>): built and tested on the mock engine; the real
+engine needs two streammoe APIs first. Design: <a href="docs/expert-parallel.md"><code>docs/expert-parallel.md</code></a>.</em></p>
 
 Turns streammoe into a service that runs a large MoE model, Qwen3.6-35B-A3B, across three
 Mac minis: an M4 as the controller (coordinator), an M1 and a second M4. Every node holds part
@@ -13,15 +16,37 @@ kernels); this repo owns everything that spans machines or requests. Full requir
 
 ## Architecture
 
-Each node runs a contiguous layer range. The controller holds one persistent TCP connection to
-each worker; workers have no connections to each other. A step goes from the controller to m1
-and back, then from the controller to m4b and back: m4b holds the head, so what it sends back
-is the sampled token. The controller streams it to the client and starts the next step. The split in the picture (20 / 10 / 10 of Qwen3.6's 40 layers) is
+The controller holds one persistent TCP connection to each worker; workers have no
+connections to each other. The config's `split` picks how the model is divided.
+
+**Expert split** (`split = "experts"`, the target design; mock engine only for now). The
+controller runs the embedding, every layer's attention, router and shared expert, the KV
+cache and the head. Every routed expert has one home worker, which keeps it in memory. For
+each token:
+
+1. The prompt comes in to the controller (over HTTP).
+2. For layer L, the controller runs attention and the router, which picks 8 of 256 experts.
+3. It sends the hidden state to **both workers at once**, each with the picked experts it owns.
+4. Both workers compute their experts at the same time and send the outputs back.
+5. The controller adds them up and goes on to layer L+1: about 40 small round trips per token.
+6. After the last layer the head picks the token, and the controller streams it to the client.
+
+The controller counts how often each expert is picked and moves a few between workers so both
+get about the same work: the new owner gets the weights and confirms, then the old owner frees
+its copy. Workers keep no per-request state. A request runs one step at a time; several
+requests overlap, so every node stays busy.
+
+**Layer split** (`split = "layers"`, the default; what streammoe runs today). Each node runs a
+contiguous layer range. The controller runs its layers and sends the hidden state to m1, which
+sends its result back; the controller sends that on to m4b, which runs the last layers and the
+head and sends the token back. The workers take turns on every token, since m4b needs m1's
+result. The 20 / 10 / 10 split of Qwen3.6's 40 layers is
 [`configs/qwen36-3node.toml`](configs/qwen36-3node.toml); leave out `layers` and the planner
 picks one from each node's speed and memory.
 
 - **Frames:** 24-byte little-endian header (magic, version, type, request id, position,
-  length) + payload. Types: `Hidden`, `Token`, `Drop`, `Rewind`, `Ping`/`Pong`, `Hello`, `Error`.
+  length) + payload. Types: `Hidden`, `Token`, `Drop`, `Rewind`, `Ping`/`Pong`, `Hello`, `Error`; for
+  the expert split also `Experts`, `Partial`, `Own`, `Move`, `Release` (protocol version 5).
 - **f32 on the wire:** the engine works in f32, so a split pipeline stays bit-identical to
   one process. Hidden states go on the wire straight from the engine's output buffer and are
   read straight into the next engine's input, with no encode or decode copy (NET-6). The

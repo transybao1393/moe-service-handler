@@ -33,3 +33,6 @@ tokenizer_config.json
 # Local notes: full chat history with Claude and the decision log
 docs/chat-history.md
 docs/decision-log.md
+
+# Claude Code agent worktrees
+.claude/

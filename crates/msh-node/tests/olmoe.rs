@@ -73,6 +73,8 @@ fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
     let cfg = Config {
         hidden_dim: 2048,
         num_layers: 16,
+        split: Default::default(),
+        experts: Default::default(),
         scheduler: sched,
         engine: Default::default(),
         http: None,

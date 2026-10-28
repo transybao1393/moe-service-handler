@@ -16,12 +16,16 @@
 //! prefill chunk); the matching `Token` frame repeats that start position and holds the token
 //! sampled after the chunk's last position, or with [`FLAG_EVERY_TOKEN`] one token per position
 //! (verifying draft tokens in speculative decoding).
+//!
+//! The expert split (docs/expert-parallel.md) adds `Own`, `Experts`, `Partial`, `Move` and
+//! `Release`. An `Experts` frame and its `Partial` carry the step's request id and start
+//! position, and the layer in the payload; the other three use request id 0.
 
 use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"MSHN";
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// On a `Hidden` frame: the head returns the token sampled after every position, not just the
 /// last. Workers pass it on.
@@ -52,6 +56,20 @@ pub enum MsgType {
     /// Keep only the first `position` positions of a request (rejected draft tokens). Goes through
     /// every worker like `Drop`; no payload.
     Rewind = 8,
+    /// The experts a worker owns, replacing any it owned before (see [`encode_own`]). The worker
+    /// sends back an empty `Own` once it holds them all.
+    Own = 9,
+    /// One layer's expert work for a step: this worker's picks, then the hidden rows the experts
+    /// take (see [`encode_experts`]).
+    Experts = 10,
+    /// A worker's answer to `Experts`: each pick's output, in the order asked (see
+    /// [`encode_partial`]).
+    Partial = 11,
+    /// An expert's weights for its new owner (see [`encode_move`]). The worker sends back a
+    /// `Move` without weights once it holds the expert.
+    Move = 12,
+    /// The receiving worker no longer owns an expert; layer and expert as in `Move`, no weights.
+    Release = 13,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -67,6 +85,11 @@ impl TryFrom<u8> for MsgType {
             6 => MsgType::Hello,
             7 => MsgType::Error,
             8 => MsgType::Rewind,
+            9 => MsgType::Own,
+            10 => MsgType::Experts,
+            11 => MsgType::Partial,
+            12 => MsgType::Move,
+            13 => MsgType::Release,
             other => return Err(FrameError::UnknownType(other)),
         })
     }
@@ -254,6 +277,150 @@ pub fn decode_token(bytes: &[u8], tokens: &mut Vec<u32>, stage_us: &mut Vec<u32>
     Ok(())
 }
 
+// Expert-split payloads. Layer and expert ids are u16, and so is a pick's row (in the step):
+//
+//   Own:     count u32, (layer u16, expert u16) × count
+//   Experts: layer u16, pick_count u32, (row u16, expert u16, gate f32) × pick_count,
+//            f32 × (rows × hidden_dim)
+//   Partial: layer u16, compute_us u32, f32 × (pick_count × hidden_dim)
+//   Move:    layer u16, expert u16, weights (bytes; none in the reply and in `Release`)
+//
+// `Experts` carries every row of the step, so picks keep their row numbers; `Partial` returns
+// one row per pick. `compute_us` is the worker's compute time for the frame, like a stage time.
+
+/// One expert picked for one row; its gate weight scales the expert's output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pick {
+    pub row: u16,
+    pub expert: u16,
+    pub gate: f32,
+}
+
+/// Bytes of a pick on the wire.
+pub const PICK_LEN: usize = 8;
+/// Bytes before the picks of an `Experts` payload, and before the rows of a `Partial` payload.
+pub const EXPERTS_PREFIX: usize = 6;
+pub const PARTIAL_PREFIX: usize = 6;
+
+/// Encodes an `Own` payload.
+pub fn encode_own(experts: &[(u16, u16)], out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(&(experts.len() as u32).to_le_bytes());
+    for &(layer, expert) in experts {
+        out.extend_from_slice(&layer.to_le_bytes());
+        out.extend_from_slice(&expert.to_le_bytes());
+    }
+}
+
+/// Decodes an `Own` payload into `experts`, `(layer, expert)` pairs.
+pub fn decode_own(bytes: &[u8], experts: &mut Vec<(u16, u16)>) -> Result<(), FrameError> {
+    let (n, rest) = bytes.split_at_checked(4).ok_or_else(|| bad_payload("own payload too short".into()))?;
+    let n = u32::from_le_bytes(n.try_into().unwrap()) as usize;
+    if rest.len() != 4 * n {
+        return Err(bad_payload(format!("own payload of {} bytes for {n} experts", rest.len())));
+    }
+    experts.clear();
+    experts.extend(rest.chunks_exact(4).map(|c| (u16_at(c, 0), u16_at(c, 2))));
+    Ok(())
+}
+
+/// What an `Experts` payload has before its rows.
+pub(crate) fn write_experts_prefix(layer: u16, picks: &[Pick], out: &mut Vec<u8>) {
+    out.extend_from_slice(&layer.to_le_bytes());
+    out.extend_from_slice(&(picks.len() as u32).to_le_bytes());
+    for p in picks {
+        out.extend_from_slice(&p.row.to_le_bytes());
+        out.extend_from_slice(&p.expert.to_le_bytes());
+        out.extend_from_slice(&p.gate.to_le_bytes());
+    }
+}
+
+pub(crate) fn read_picks(bytes: &[u8], picks: &mut Vec<Pick>) {
+    picks.clear();
+    picks.extend(bytes.chunks_exact(PICK_LEN).map(|c| Pick {
+        row: u16_at(c, 0),
+        expert: u16_at(c, 2),
+        gate: f32::from_le_bytes(c[4..8].try_into().unwrap()),
+    }));
+}
+
+/// Checks that `len` bytes are whole rows and that every pick names one of them; returns the
+/// rows.
+pub(crate) fn check_rows(len: usize, hidden_dim: usize, picks: &[Pick]) -> Result<usize, FrameError> {
+    let row = hidden_dim * 4;
+    if row == 0 || len == 0 || len % row != 0 {
+        return Err(bad_payload(format!("rows of {len} bytes are not whole rows of {row}")));
+    }
+    let rows = len / row;
+    if let Some(p) = picks.iter().find(|p| p.row as usize >= rows) {
+        return Err(bad_payload(format!("pick for row {} of {rows}", p.row)));
+    }
+    Ok(rows)
+}
+
+/// Encodes an `Experts` payload: this worker's picks and every row of the step.
+pub fn encode_experts(layer: u16, picks: &[Pick], rows: &[f32], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(EXPERTS_PREFIX + PICK_LEN * picks.len() + 4 * rows.len());
+    write_experts_prefix(layer, picks, out);
+    out.extend_from_slice(f32_bytes(rows));
+}
+
+/// Decodes an `Experts` payload of `hidden_dim`-wide rows into `picks` and `rows`; returns the
+/// layer.
+pub fn decode_experts(
+    bytes: &[u8],
+    hidden_dim: usize,
+    picks: &mut Vec<Pick>,
+    rows: &mut Vec<f32>,
+) -> Result<u16, FrameError> {
+    let short = || bad_payload("experts payload too short".into());
+    let (head, rest) = bytes.split_at_checked(EXPERTS_PREFIX).ok_or_else(short)?;
+    let n = u32::from_le_bytes(head[2..6].try_into().unwrap()) as usize;
+    let (p, rest) = rest.split_at_checked(PICK_LEN * n).ok_or_else(short)?;
+    read_picks(p, picks);
+    check_rows(rest.len(), hidden_dim, picks)?;
+    rows.clear();
+    rows.extend(rest.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())));
+    Ok(u16_at(head, 0))
+}
+
+/// Encodes a `Partial` payload: one output row per pick.
+pub fn encode_partial(layer: u16, compute_us: u32, values: &[f32], out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(&layer.to_le_bytes());
+    out.extend_from_slice(&compute_us.to_le_bytes());
+    out.extend_from_slice(f32_bytes(values));
+}
+
+/// Decodes a `Partial` payload into `values`; returns the layer and the worker's compute time.
+pub fn decode_partial(bytes: &[u8], hidden_dim: usize, values: &mut Vec<f32>) -> Result<(u16, u32), FrameError> {
+    let (head, rest) =
+        bytes.split_at_checked(PARTIAL_PREFIX).ok_or_else(|| bad_payload("partial payload too short".into()))?;
+    check_rows(rest.len(), hidden_dim, &[])?;
+    values.clear();
+    values.extend(rest.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())));
+    Ok((u16_at(head, 0), u32::from_le_bytes(head[2..6].try_into().unwrap())))
+}
+
+/// Encodes a `Move` payload; empty `weights` for the reply and for `Release`.
+pub fn encode_move(layer: u16, expert: u16, weights: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(&layer.to_le_bytes());
+    out.extend_from_slice(&expert.to_le_bytes());
+    out.extend_from_slice(weights);
+}
+
+/// Decodes a `Move` (or `Release`) payload: layer, expert and the weights.
+pub fn decode_move(bytes: &[u8]) -> Result<(u16, u16, &[u8]), FrameError> {
+    let (head, weights) = bytes.split_at_checked(4).ok_or_else(|| bad_payload("move payload too short".into()))?;
+    Ok((u16_at(head, 0), u16_at(head, 2), weights))
+}
+
+fn u16_at(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([b[at], b[at + 1]])
+}
+
 /// `values` as the little-endian bytes the wire carries: on a little-endian host (every Apple
 /// Silicon Mac, NF-3) that is their own memory, so hidden states need no copy (NET-6).
 pub(crate) fn f32_bytes(values: &[f32]) -> &[u8] {
@@ -323,6 +490,68 @@ mod tests {
         assert!(decode_token(&bytes, &mut tokens, &mut stages).is_err());
         encode_token(&[], &[], &mut bytes);
         assert!(decode_token(&bytes, &mut tokens, &mut stages).is_err());
+    }
+
+    #[test]
+    fn own_payload_round_trip() {
+        let mut bytes = Vec::new();
+        let mut got = Vec::new();
+        for want in [&[][..], &[(0, 0), (39, 255), (u16::MAX, 7)]] {
+            encode_own(want, &mut bytes);
+            decode_own(&bytes, &mut got).unwrap();
+            assert_eq!(got, want);
+        }
+        assert!(decode_own(&bytes[..bytes.len() - 1], &mut got).is_err());
+        assert!(decode_own(&bytes[..3], &mut got).is_err());
+    }
+
+    #[test]
+    fn experts_payload_round_trip_is_exact() {
+        let picks = [
+            Pick { row: 0, expert: 3, gate: 0.25 },
+            Pick { row: 1, expert: 255, gate: f32::MIN_POSITIVE },
+            Pick { row: 1, expert: 0, gate: 1.0 - f32::EPSILON },
+        ];
+        let rows = [0.5f32, -0.0, 1e-40, f32::MAX, -3.25, std::f32::consts::E];
+        let mut bytes = Vec::new();
+        encode_experts(17, &picks, &rows, &mut bytes);
+        assert_eq!(bytes.len(), EXPERTS_PREFIX + 3 * PICK_LEN + 6 * 4);
+        let (mut p, mut r) = (Vec::new(), Vec::new());
+        assert_eq!(decode_experts(&bytes, 3, &mut p, &mut r).unwrap(), 17);
+        assert_eq!(p, picks);
+        assert_eq!(rows.map(f32::to_bits)[..], r.iter().map(|x| x.to_bits()).collect::<Vec<_>>()[..]);
+        // Rows must be whole, and every pick must name one.
+        assert!(decode_experts(&bytes, 4, &mut p, &mut r).is_err());
+        assert!(decode_experts(&bytes, 6, &mut p, &mut r).is_err(), "pick for row 1 of 1");
+        assert!(decode_experts(&bytes[..bytes.len() - 4], 3, &mut p, &mut r).is_err());
+        assert!(decode_experts(&bytes[..10], 3, &mut p, &mut r).is_err());
+        assert!(decode_experts(&bytes[..5], 3, &mut p, &mut r).is_err());
+    }
+
+    #[test]
+    fn partial_and_move_payloads_round_trip() {
+        let values = [1.0f32, -2.5, 0.125, 9.0];
+        let mut bytes = Vec::new();
+        encode_partial(39, 1234, &values, &mut bytes);
+        let mut got = Vec::new();
+        assert_eq!(decode_partial(&bytes, 2, &mut got).unwrap(), (39, 1234));
+        assert_eq!(got, values);
+        assert!(decode_partial(&bytes, 3, &mut got).is_err());
+        assert!(decode_partial(&bytes[..PARTIAL_PREFIX], 2, &mut got).is_err(), "no rows");
+
+        encode_move(5, 200, b"weights", &mut bytes);
+        assert_eq!(decode_move(&bytes).unwrap(), (5, 200, &b"weights"[..]));
+        encode_move(5, 200, &[], &mut bytes);
+        assert_eq!(decode_move(&bytes).unwrap(), (5, 200, &[][..]));
+        assert!(decode_move(&bytes[..3]).is_err());
+    }
+
+    #[test]
+    fn expert_split_types_decode() {
+        for t in [MsgType::Own, MsgType::Experts, MsgType::Partial, MsgType::Move, MsgType::Release] {
+            let h = Header::new(t, 3, 4, 0);
+            assert_eq!(Header::decode(&h.encode()).unwrap().msg_type, t);
+        }
     }
 
     #[test]

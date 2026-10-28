@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, Split};
 
 /// Largest HTTP request body accepted.
 pub const HTTP_BODY_LIMIT: usize = 1 << 20;
@@ -71,9 +71,20 @@ pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
     if workers > 0 {
         b.items.push(("connections", links * 2 * msh_net::conn::BUFFER_BYTES as u64));
     }
-    if idx == 0 {
+    // Expert split: each layer's picks come back as one output row per pick. A `Move` carries
+    // one expert's weights, counted with the engine's.
+    let picks = cfg.experts.top_k as u64;
+    let experts = cfg.split == Split::Experts;
+    if idx == 0 && experts {
+        // Per request in flight: its rows, the rows the experts take, one output row per pick,
+        // and the workers' partials on their way in (one row per pick in all).
+        let per_request = (2 + 2 * picks) * positions * row;
+        b.items.push(("frames", s.max_in_flight.max(1) as u64 * per_request));
+    } else if idx == 0 {
         // The step's output, sent straight from it, and each worker's result passed on.
         b.items.push(("frames", (1 + workers) * positions * row));
+    }
+    if idx == 0 {
         // Every admitted, queued or parked request holds up to n_ctx token ids.
         let held = (s.max_in_flight.max(1) + s.max_queue + s.prefix_cache) as u64;
         b.items.push(("requests", held * cfg.engine.n_ctx as u64 * 4));
@@ -83,6 +94,10 @@ pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
         if cfg.metrics.is_some() {
             b.items.push(("metrics", 64 << 10));
         }
+    } else if experts {
+        // The rows read straight off the wire, and an output row for each pick, all of them
+        // at worst.
+        b.items.push(("frames", (1 + picks) * positions * row));
     } else {
         // The hidden state read straight off the wire, and the step's output sent back.
         b.items.push(("frames", 2 * positions * row));
@@ -181,5 +196,31 @@ mod tests {
         assert_eq!(item(&worker, "connections"), Some(512 << 10));
         assert_eq!(item(&worker, "frames"), Some(2 * 64 * 2048 * 4));
         assert_eq!(item(&worker, "requests"), None);
+    }
+
+    #[test]
+    fn growth_on_the_expert_split() {
+        let cfg = Config::parse(
+            "hidden_dim = 2048\nnum_layers = 40\nsplit = \"experts\"\n[experts]\ntop_k = 8\n\
+             [scheduler]\nprefill_chunk = 64\nmax_in_flight = 3\nmax_queue = 5\n\
+             [[nodes]]\nname = \"m4\"\naddr = \"127.0.0.1:1\"\n\
+             [[nodes]]\nname = \"m1\"\naddr = \"127.0.0.1:2\"\n\
+             [[nodes]]\nname = \"m4b\"\naddr = \"127.0.0.1:3\"\n",
+        )
+        .unwrap();
+        let item = |b: &Budget, n: &str| b.items.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
+        let row = 2048 * 4;
+        let coord = growth(&cfg, 0, false);
+        // A link to each worker; per request in flight 2 + 2 × 8 rows per position.
+        assert_eq!(item(&coord, "connections"), Some(2 * (512 << 10)));
+        assert_eq!(item(&coord, "frames"), Some(3 * 18 * 64 * row));
+        assert_eq!(item(&coord, "requests"), Some(8 * 2048 * 4));
+        for w in [1, 2] {
+            let worker = growth(&cfg, w, false);
+            assert_eq!(item(&worker, "connections"), Some(512 << 10));
+            assert_eq!(item(&worker, "frames"), Some(9 * 64 * row));
+        }
+        // 27 MiB of frames on the controller, 4.5 MiB on a worker: well inside 256 MiB.
+        assert!(coord.total() < 64 << 20 && growth(&cfg, 1, false).total() < 8 << 20);
     }
 }

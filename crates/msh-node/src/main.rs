@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use msh_node::chat::Codec;
-use msh_node::config::{expand_home, Config, EngineKind, HttpConfig, LogConfig};
+use msh_node::config::{expand_home, Config, EngineKind, HttpConfig, LogConfig, Split};
 use tracing::info;
 use msh_node::http::{self, HttpState};
 use msh_node::{memory, stats};
@@ -99,12 +99,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let codec = http.map(|h| Codec::load(&expand_home(&h.tokenizer), h.chat_template)).transpose()?;
     memory::check_start(&cfg, &memory::growth(&cfg, idx, http.is_some()))?;
     // Open the engine before joining the cluster, so a range that does not fit fails here (DEP-4).
-    match cfg.engine.kind {
-        EngineKind::Mock => {
+    match (cfg.engine.kind, cfg.split) {
+        (EngineKind::Mock, Split::Layers) => {
             serve(&cfg, idx, MockEngine::new(node.layer_range(), cfg.num_layers, cfg.hidden_dim), codec, &flag)
         }
-        EngineKind::StreamMoe => serve(&cfg, idx, open_streammoe(&cfg, idx)?, codec, &flag),
+        // Every node builds the whole mock; a worker holds only the experts it is sent.
+        (EngineKind::Mock, Split::Experts) => {
+            let e = MockEngine::new(0..cfg.num_layers, cfg.num_layers, cfg.hidden_dim);
+            serve(&cfg, idx, e.with_experts(cfg.experts.count, cfg.experts.top_k), codec, &flag)
+        }
+        (EngineKind::StreamMoe, _) => serve(&cfg, idx, open_streammoe(&cfg, idx)?, codec, &flag),
     }
+}
+
+/// What node `i` runs, for logs: its layers, or its part of the expert split.
+fn role(cfg: &Config, i: usize) -> String {
+    match (cfg.split, i) {
+        (Split::Layers, _) => format!("{:?}", cfg.nodes[i].layer_range()),
+        (Split::Experts, 0) => "all layers but the routed experts".into(),
+        (Split::Experts, _) => "routed experts".into(),
+    }
+}
+
+/// Starts the scheduler for the config's split.
+fn start_scheduler<E: Engine + 'static>(
+    cfg: &Config,
+    engine: E,
+    star: Option<Star>,
+    metrics: Option<Metrics>,
+) -> Result<(scheduler::Client, std::thread::JoinHandle<E>), Box<dyn std::error::Error>> {
+    Ok(match cfg.split {
+        Split::Layers => scheduler::spawn_with_metrics(engine, star, cfg.scheduler, metrics),
+        Split::Experts => scheduler::spawn_experts(engine, star, cfg.scheduler, cfg.experts, metrics)?,
+    })
 }
 
 /// Plans the split unless the config gives it, logs it, and with `print` shows it on stdout.
@@ -146,6 +173,25 @@ const GIB: f64 = (1u64 << 30) as f64;
 const MIB: f64 = (1u64 << 20) as f64;
 
 fn show_split(cfg: &Config, source: &str, print: bool, budget: impl Fn(usize) -> Option<String>) {
+    if cfg.split == Split::Experts {
+        let workers = cfg.nodes.len() - 1;
+        let e = &cfg.experts;
+        info!(workers, experts = e.count, top_k = e.top_k, "expert split");
+        if print {
+            for (i, n) in cfg.nodes.iter().enumerate() {
+                let what = match i {
+                    0 => role(cfg, 0),
+                    // Even shares to start, as the controller assigns them.
+                    _ => {
+                        let share = msh_node::owners::Owners::even(1, e.count, workers).owned_by(i - 1).len();
+                        format!("{share} experts per layer to start")
+                    }
+                };
+                println!("{:<8} {what}", n.name);
+            }
+        }
+        return;
+    }
     let split: Vec<String> = cfg.nodes.iter().map(|n| format!("{}:{:?}", n.name, n.layer_range())).collect();
     info!(source, split = split.join(" "), "layer split");
     if !print {
@@ -225,14 +271,14 @@ fn serve<'a, E: Engine + 'static>(
     // Workers listen for the controller; the controller connects to each of them.
     if idx > 0 {
         let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
-        info!(role = "worker", layers = ?node.layer_range(), listen = node.listen_addr(), "waiting for the controller");
+        info!(role = "worker", runs = role(cfg, idx), listen = node.listen_addr(), "waiting for the controller");
         let link = accept_controller(cfg, idx, listener)?;
         info!(controller = link.peer_name(), "connected");
         Worker::new(engine, link, name).run()?;
         info!("controller disconnected, exiting");
         return Ok(());
     }
-    info!(role = "controller", layers = ?node.layer_range(), workers = cfg.nodes.len() - 1, "connecting to workers");
+    info!(role = "controller", runs = role(cfg, 0), workers = cfg.nodes.len() - 1, "connecting to workers");
     let star = connect_workers(cfg, CONNECT_TIMEOUT)?;
     info!(nodes = cfg.nodes.len(), "cluster ready");
 
@@ -250,7 +296,7 @@ fn serve<'a, E: Engine + 'static>(
 
     let requests: u32 = flag("--requests").unwrap_or("1").parse().map_err(|e| format!("--requests: {e}"))?;
 
-    let (client, sched) = scheduler::spawn_with_metrics(engine, star, cfg.scheduler, metrics);
+    let (client, sched) = start_scheduler(cfg, engine, star, metrics)?;
     let t0 = Instant::now();
     let rxs: Vec<_> = (0..requests).map(|_| client.submit(prompt.clone(), max_new)).collect();
     let mut total = 0;
@@ -291,7 +337,7 @@ fn serve_http<E: Engine + 'static>(
     star: Option<Star>,
     metrics: Option<Metrics>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (client, _sched) = scheduler::spawn_with_metrics(engine, star, cfg.scheduler, metrics);
+    let (client, _sched) = start_scheduler(cfg, engine, star, metrics)?;
     let state = Arc::new(HttpState::new(client, codec, http.model.clone(), cfg.engine.n_ctx, memory::http_max_open(cfg)));
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -307,8 +353,16 @@ fn open_metrics(cfg: &Config, flag: Option<&str>) -> Result<Option<Metrics>, Box
     let Some(path) = flag.map(String::from).or_else(|| cfg.metrics.as_ref().map(|m| m.csv.clone())) else {
         return Ok(None);
     };
-    let split: Vec<String> =
-        cfg.nodes.iter().map(|n| format!("{}:{}-{}", n.name, n.layer_range().start, n.layer_range().end)).collect();
+    let split: Vec<String> = match cfg.split {
+        Split::Layers => {
+            cfg.nodes.iter().map(|n| format!("{}:{}-{}", n.name, n.layer_range().start, n.layer_range().end)).collect()
+        }
+        Split::Experts => {
+            let mut s = vec![format!("experts {}/{}:", cfg.experts.top_k, cfg.experts.count)];
+            s.extend(cfg.nodes.iter().map(|n| n.name.clone()));
+            s
+        }
+    };
     let engine = match cfg.engine.kind {
         EngineKind::Mock => "mock".to_string(),
         EngineKind::StreamMoe => format!("streammoe {}", cfg.engine.model_dir),

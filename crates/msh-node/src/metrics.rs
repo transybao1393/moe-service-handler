@@ -3,8 +3,10 @@
 //!
 //! Each row splits the step's wall time on the coordinator into each node's compute time, as
 //! reported in the frames (no clock sync needed), and the remainder: network transfer and
-//! queueing behind other requests on the nodes. Rows also carry the run's metadata, so files
-//! from different runs can be concatenated.
+//! queueing behind other requests on the nodes. On the expert split the workers run at once, so
+//! `workers_us` is the slowest worker of each layer, summed, while `stage_us` keeps each node's
+//! own total. Rows also carry the run's metadata, so files from different runs can be
+//! concatenated.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -59,6 +61,9 @@ pub struct StepRecord<'a> {
     pub step_us: u64,
     /// Compute time per node in pipeline order, coordinator first.
     pub stage_us: &'a [u32],
+    /// The workers' compute on the step's path when they run at once (expert split: the
+    /// slowest worker of each layer, summed). `None`: the workers' stages, summed.
+    pub workers_us: Option<u64>,
     /// Time the request waited for an in-flight slot.
     pub queue_us: u64,
     /// Requests in flight when the step finished.
@@ -103,8 +108,9 @@ impl Metrics {
     }
 
     pub fn record(&mut self, r: &StepRecord) -> io::Result<()> {
-        let compute: u64 = r.stage_us.iter().map(|&t| t as u64).sum();
         let coord = r.stage_us.first().copied().unwrap_or(0) as u64;
+        let workers = r.workers_us.unwrap_or_else(|| r.stage_us.iter().skip(1).map(|&t| t as u64).sum());
+        let compute = coord + workers;
         let stages: Vec<String> = r.stage_us.iter().map(u32::to_string).collect();
         let kind = r.kind.as_str();
         let tokens = match r.kind {
@@ -119,7 +125,7 @@ impl Metrics {
             r.pos,
             r.positions,
             r.step_us,
-            compute - coord,
+            workers,
             r.step_us.saturating_sub(compute),
             stages.join(";"),
             r.queue_us,
@@ -170,6 +176,7 @@ mod tests {
             tokens: &[42, 43],
             step_us: 1000,
             stage_us,
+            workers_us: None,
             queue_us: 5,
             in_flight: 2,
             ping_rtt_us: Some(300),
@@ -190,6 +197,12 @@ mod tests {
         assert_eq!(lines[0], HEADER);
         assert_eq!(lines[1], "7,abc,h,\"Apple M4, 16 GB\",m4:0-8 m1a:8-16,mock,1,3,1,prefill,,1000,400,350,250,400;350,5,2,300,0,3,1");
         assert!(lines[2].contains(",decode,42;43,"));
+        // Two workers at once: their share is the critical path, not the sum of their stages.
+        let mut m = Metrics::create(&path, &run).unwrap();
+        m.record(&StepRecord { workers_us: Some(500), ..rec(StepKind::Decode, &[300, 450, 200]) }).unwrap();
+        m.flush().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.lines().last().unwrap().contains(",1000,300,500,200,300;450;200,"), "{text}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -26,6 +26,23 @@
 //! `health_timeout_ms` (5000), `prefill_chunk` (64), `prefill_depth` (3), `max_draft` (0:
 //! no speculative decoding), `draft_min_ngram` (3) and `prefix_cache` (0: no prefix reuse).
 //!
+//! `split` picks how the model is divided. `"layers"` (the default) is the layer split above.
+//! `"experts"` is the expert split (docs/expert-parallel.md): the controller runs every layer's
+//! attention, shared expert and router, the embedding and the head, and sends each layer's
+//! hidden rows to every worker at once; each worker runs the routed experts it owns. No node
+//! takes `layers`. For now only the mock engine can split by experts. An optional `[experts]`
+//! table sets `count` (routed experts per layer, default 256), `top_k` (experts picked per
+//! position, 8), `rebalance_every` (positions routed between rebalances, 1024; 0 never moves
+//! experts), `max_moves` (experts moved per rebalance, 8) and `extra_experts` (how many more
+//! than an even share a worker may come to own, 64):
+//!
+//! ```toml
+//! split = "experts"
+//! [experts]
+//! count = 256
+//! top_k = 8
+//! ```
+//!
 //! An optional `[engine]` table picks the engine (default: the mock):
 //!
 //! ```toml
@@ -87,6 +104,10 @@ pub struct Config {
     pub hidden_dim: usize,
     pub num_layers: u32,
     #[serde(default)]
+    pub split: Split,
+    #[serde(default)]
+    pub experts: ExpertsConfig,
+    #[serde(default)]
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub engine: EngineConfig,
@@ -99,6 +120,40 @@ pub struct Config {
     #[serde(default)]
     pub service: ServiceConfig,
     pub nodes: Vec<NodeConfig>,
+}
+
+/// How the model is divided across the nodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Split {
+    /// Each node runs a contiguous layer range; a step visits the workers in turn.
+    #[default]
+    Layers,
+    /// The controller runs everything but the routed experts; each layer goes to every worker
+    /// at once, and each worker runs the experts it owns.
+    Experts,
+}
+
+/// The expert split's shape and rebalancing.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExpertsConfig {
+    /// Routed experts per layer.
+    pub count: u32,
+    /// Experts the router picks per position.
+    pub top_k: u32,
+    /// Positions routed between rebalances; 0 keeps the starting split.
+    pub rebalance_every: u64,
+    /// Most experts moved per rebalance.
+    pub max_moves: usize,
+    /// How many experts beyond an even share a worker may come to own.
+    pub extra_experts: usize,
+}
+
+impl Default for ExpertsConfig {
+    fn default() -> Self {
+        ExpertsConfig { count: 256, top_k: 8, rebalance_every: 1024, max_moves: 8, extra_experts: 64 }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -307,6 +362,9 @@ impl Config {
                 return bad(format!("node {}: speed must be positive", n.name));
             }
         }
+        if self.split == Split::Experts {
+            return self.validate_experts();
+        }
         match self.nodes.iter().filter(|n| n.layers.is_some()).count() {
             0 if self.nodes.len() > self.num_layers as usize => {
                 return bad(format!("{} nodes for {} layers", self.nodes.len(), self.num_layers));
@@ -334,13 +392,35 @@ impl Config {
         Ok(())
     }
 
-    /// Whether the config leaves the split to the planner.
+    fn validate_experts(&self) -> Result<(), Error> {
+        let bad = |m: String| Err(Error::Config(m));
+        if let Some(n) = self.nodes.iter().find(|n| n.layers.is_some()) {
+            return bad(format!("node {}: split = \"experts\" takes no layers", n.name));
+        }
+        if self.engine.kind != EngineKind::Mock {
+            return bad("split = \"experts\" needs the mock engine until streammoe can run a layer without its experts".into());
+        }
+        let e = &self.experts;
+        // Layer and expert ids are u16 on the wire; the owner table keeps a byte per expert.
+        if e.count == 0 || e.count > 1 << 16 || self.num_layers > 1 << 16 {
+            return bad(format!("{} experts per layer, {} layers: both must be 1..=65536", e.count, self.num_layers));
+        }
+        if e.top_k == 0 || e.top_k > e.count {
+            return bad(format!("experts.top_k = {} must be 1..={}", e.top_k, e.count));
+        }
+        if self.nodes.len() > 256 {
+            return bad(format!("{} nodes; the expert split takes at most 255 workers", self.nodes.len()));
+        }
+        Ok(())
+    }
+
+    /// Whether the config leaves the layer split to the planner.
     pub fn is_planned(&self) -> bool {
-        self.nodes.iter().all(|n| n.layers.is_none())
+        self.split == Split::Layers && self.nodes.iter().all(|n| n.layers.is_none())
     }
 
     /// Fills in every node's layers with the planner's split (CL-3) unless the config gives
-    /// them (CL-4). `fits(i, range)` says whether node `i` can hold `range`.
+    /// them (CL-4) or splits by experts. `fits(i, range)` says whether node `i` can hold `range`.
     pub fn plan_layers(&mut self, fits: impl Fn(usize, Range<u32>) -> bool) -> Result<(), Error> {
         if !self.is_planned() {
             return Ok(());
@@ -470,6 +550,23 @@ mod tests {
         let http = Config::parse(&text).unwrap().http.unwrap();
         assert_eq!((http.chat_template, http.model.as_str()), (ChatTemplate::Chatml, "q"));
         assert!(Config::parse(THREE).unwrap().http.is_none());
+    }
+
+    #[test]
+    fn expert_split_takes_no_layers() {
+        let layerless = THREE.replace("layers = [0, 20]", "").replace("layers = [20, 30]", "").replace("layers = [30, 40]", "");
+        let text = layerless.replace("num_layers = 40", "num_layers = 40\nsplit = \"experts\"\n[experts]\ncount = 16\ntop_k = 4");
+        let mut c = Config::parse(&text).unwrap();
+        assert_eq!((c.split, c.experts.count, c.experts.top_k, c.experts.max_moves), (Split::Experts, 16, 4, 8));
+        assert!(!c.is_planned());
+        c.plan_layers(|_, _| true).unwrap();
+        assert!(c.nodes.iter().all(|n| n.layers.is_none()), "no layer split is planned");
+        assert_eq!(Config::parse(&layerless).unwrap().split, Split::Layers);
+        assert!(Config::parse(&THREE.replace("num_layers = 40", "num_layers = 40\nsplit = \"experts\"")).is_err());
+        assert!(Config::parse(&text.replace("top_k = 4", "top_k = 17")).is_err());
+        assert!(Config::parse(&text.replace("split = \"experts\"", "split = \"rows\"")).is_err());
+        let streammoe = text.replace("[experts]", "[engine]\nkind = \"streammoe\"\nmodel_dir = \"/m\"\n[experts]");
+        assert!(Config::parse(&streammoe).is_err());
     }
 
     #[test]

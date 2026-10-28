@@ -1,8 +1,9 @@
 //! `msh-node`: coordinator and worker roles for moe-service-handler.
 //!
-//! A controller and its workers, each running a contiguous layer range. The controller talks to
-//! every worker; workers never talk to each other. Its scheduler keeps several requests in
-//! flight.
+//! A controller and its workers, each running a contiguous layer range, or (`split =
+//! "experts"`) the controller running everything but the routed experts and the workers
+//! owning those. The controller talks to every worker; workers never talk to each other. Its
+//! scheduler keeps several requests in flight.
 
 pub mod chat;
 pub mod config;
@@ -14,6 +15,7 @@ pub mod metrics;
 #[cfg(feature = "streammoe")]
 pub mod streammoe_engine;
 pub mod node;
+pub mod owners;
 pub mod planner;
 pub mod scheduler;
 pub mod stats;
