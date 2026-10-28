@@ -12,7 +12,7 @@ use std::path::Path;
 
 use streammoe::{Ctx, OpenConfig, ReqId, StageInput, StageOutput};
 
-use crate::config::KvFormat;
+use crate::config::{KvFormat, PrefetchGuess};
 use crate::engine::{Engine, Sample, StageIn};
 use crate::Error;
 
@@ -33,6 +33,11 @@ pub struct OpenSpec<'a> {
     pub attn_threads: Option<usize>,
     /// `None` keeps streammoe's default.
     pub runtime_overhead: Option<u64>,
+    /// Expert files, relative to `model_dir`.
+    pub experts_dir: &'a str,
+    pub prefetch_guess: Option<PrefetchGuess>,
+    pub prefetch_experts: Option<usize>,
+    pub fast_experts_dir: Option<&'a Path>,
 }
 
 impl<'a> OpenSpec<'a> {
@@ -48,6 +53,10 @@ impl<'a> OpenSpec<'a> {
             kv_format: KvFormat::F32,
             attn_threads: None,
             runtime_overhead: None,
+            experts_dir: "root",
+            prefetch_guess: None,
+            prefetch_experts: None,
+            fast_experts_dir: None,
         }
     }
 }
@@ -87,19 +96,32 @@ impl StreamMoeEngine {
             },
             attn_threads: spec.attn_threads.unwrap_or(defaults.attn_threads),
             runtime_overhead: spec.runtime_overhead.unwrap_or(defaults.runtime_overhead),
+            prefetch_guess: match spec.prefetch_guess {
+                None => defaults.prefetch_guess,
+                Some(PrefetchGuess::Prev) => streammoe::PrefetchGuess::PrevToken,
+                Some(PrefetchGuess::Cross) => streammoe::PrefetchGuess::CrossLayer,
+            },
+            prefetch_experts: spec.prefetch_experts.or(defaults.prefetch_experts),
+            fast_experts_dir: spec.fast_experts_dir.map(Path::to_path_buf),
             ..defaults
         };
         let ctx = Ctx::open_with(
             &art.join("model_weights.bin"),
             &art.join("model_weights.json"),
             &art.join("vocab.bin"),
-            &spec.model_dir.join("root"),
+            &spec.model_dir.join(spec.experts_dir),
             /* use_2bit = */ false,
             &cfg,
         )
         .map_err(|e| Error::Engine(format!("open {}: {e}", spec.model_dir.display())))?;
         let logits = vec![0.0; ctx.n_vocab()];
         Ok(StreamMoeEngine { ctx, admitted: HashSet::new(), logits, tokens: Vec::new() })
+    }
+
+    /// streammoe's expert read counters for this node: disk reads by kind, prefetch hits,
+    /// time waiting on I/O.
+    pub fn expert_io_stats(&self) -> streammoe::ExpertIoStats {
+        self.ctx.expert_io_stats()
     }
 }
 

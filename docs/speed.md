@@ -32,7 +32,7 @@ Then each node's own step gets faster: expert streaming, prefetch and a balanced
 | Prefix reuse across chat turns | No re-prefill of the conversation so far | scheduler | Done (`prefix_cache`) |
 | Batched decode per node | Several requests' tokens in one pass on each node | engine | streammoe API needed |
 | Cross-node expert prefetch | Next node starts its SSD reads before the hidden state arrives | protocol, engine | streammoe API needed |
-| Streaming settings per node | Fewer SSD stalls: prefetch guesses, packed 3-bit experts, fast disk tier | `[engine]` | Partly passed through |
+| Streaming settings per node | Fewer SSD stalls: prefetch guesses, packed 3-bit experts, fast disk tier | `[engine]` | Passed through; streammoe defaults kept until measured |
 | Planner (CL-3) | Layers split by each node's memory and speed, so no node holds the ring back | coordinator | To do |
 
 ## Speculative decoding in the ring
@@ -62,6 +62,24 @@ verify pass is disk-bound: the drafts route to experts that are not in RAM. The 
 come out differently, because the hops are paid once per trip instead of once per token,
 and three nodes' RAM holds more experts. That has to be measured on the Mac minis before it
 is turned on by default.
+
+## Expert streaming settings
+
+Each node streams its own layers' experts from its SSD, keeping the most used in a RAM hot
+tier. `[engine]` passes streammoe's settings on:
+
+- `prefetch_guess`: `prev` (streammoe's default) or `cross`. streamoe measured `cross` with 6
+  experts 14% faster than its default on Qwen3.6-35B-A3B at a 4 GiB cap, and no faster on
+  OLMoE. In a cluster each node's first layer cannot use `cross` (it has no previous layer to
+  guess from), so the gain may be smaller.
+- `prefetch_experts`: 4 by default under a cap; 6 was best in that measurement.
+- `experts_dir`: `root` (4-bit) or `root-3bit` (packed 3-bit: 13 vs 17 GB on a3b, 9–15%
+  faster in streamoe's runs, slightly less accurate).
+- `fast_experts_dir`: copies of the hottest layers' experts on a faster disk.
+
+These stay at streammoe's defaults until they are measured on the Mac minis.
+`StreamMoeEngine::expert_io_stats` gives a node's disk reads, prefetch reads and hits, and
+I/O wait.
 
 ## Prefix reuse
 

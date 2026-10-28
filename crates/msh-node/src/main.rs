@@ -60,6 +60,7 @@ fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box
     use msh_node::streammoe_engine::{OpenSpec, StreamMoeEngine};
     let node = &cfg.nodes[idx];
     let model_dir = expand_home(&cfg.engine.model_dir);
+    let fast_experts_dir = cfg.engine.fast_experts_dir.as_deref().map(expand_home);
     let t0 = Instant::now();
     let engine = StreamMoeEngine::open(&OpenSpec {
         model_dir: &model_dir,
@@ -71,6 +72,10 @@ fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box
         kv_format: cfg.engine.kv_format,
         attn_threads: cfg.engine.attn_threads,
         runtime_overhead: cfg.engine.runtime_overhead(),
+        experts_dir: &cfg.engine.experts_dir,
+        prefetch_guess: cfg.engine.prefetch_guess,
+        prefetch_experts: cfg.engine.prefetch_experts,
+        fast_experts_dir: fast_experts_dir.as_deref(),
     })?;
     eprintln!("{}: streammoe opened layers {:?} in {:.1} s", node.name, node.layer_range(), t0.elapsed().as_secs_f64());
     Ok(engine)

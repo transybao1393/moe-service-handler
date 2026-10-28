@@ -31,6 +31,10 @@
 //! kv_format = "f16"                    # optional: f32 (default), f16, turbo4, turbo3
 //! attn_threads = 4                     # optional: CPU decode attention threads
 //! runtime_overhead_gib = 0.75          # optional: unitemized room inside the cap
+//! experts_dir = "root-3bit"            # optional: packed 3-bit experts (default "root")
+//! prefetch_guess = "cross"             # optional: prev (streammoe default) or cross
+//! prefetch_experts = 6                 # optional: experts prefetched per guess
+//! fast_experts_dir = "/Volumes/fast/x" # optional: faster disk with copies of some layers
 //! ```
 //!
 //! An optional `[http]` table makes the coordinator serve the OpenAI-compatible API:
@@ -125,6 +129,28 @@ pub struct EngineConfig {
     /// Room inside the cap for memory streammoe does not itemize, in GiB; `None` keeps its
     /// default (0.5). Long decodes can need 0.75.
     pub runtime_overhead_gib: Option<f64>,
+    /// Expert files under `model_dir`: `root` (4-bit, default) or `root-3bit` (packed 3-bit,
+    /// smaller and faster, slightly less accurate). streammoe detects the layout.
+    pub experts_dir: String,
+    /// How decode guesses the experts to prefetch; `None` keeps streammoe's default (`prev`).
+    pub prefetch_guess: Option<PrefetchGuess>,
+    /// Experts per layer each guess prefetches; `None` keeps streammoe's default (4 under a
+    /// cap). `0` turns speculative prefetch off.
+    pub prefetch_experts: Option<usize>,
+    /// A faster disk holding copies of some layers' expert files (same layout); `None` reads
+    /// everything from `experts_dir`.
+    pub fast_experts_dir: Option<String>,
+}
+
+/// Where decode's expert prefetch guesses come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefetchGuess {
+    /// The previous token's experts for the same layer.
+    Prev,
+    /// The current hidden state through the next layer's router. Not possible for the first
+    /// layer of a node's range, which falls back to `prev`.
+    Cross,
 }
 
 impl Default for EngineConfig {
@@ -137,6 +163,10 @@ impl Default for EngineConfig {
             kv_format: KvFormat::F32,
             attn_threads: None,
             runtime_overhead_gib: None,
+            experts_dir: "root".into(),
+            prefetch_guess: None,
+            prefetch_experts: None,
+            fast_experts_dir: None,
         }
     }
 }
@@ -291,6 +321,15 @@ mod tests {
         );
         let e = Config::parse(&text).unwrap().engine;
         assert_eq!((e.kv_format, e.attn_threads, e.runtime_overhead()), (KvFormat::Turbo4, Some(8), Some(3 << 28)));
+        let streaming = text.replace(
+            "kv_format = \"turbo4\"",
+            "experts_dir = \"root-3bit\"\nprefetch_guess = \"cross\"\nprefetch_experts = 6\nfast_experts_dir = \"/f\"",
+        );
+        let e = Config::parse(&streaming).unwrap().engine;
+        assert_eq!(
+            (e.experts_dir.as_str(), e.prefetch_guess, e.prefetch_experts, e.fast_experts_dir.as_deref()),
+            ("root-3bit", Some(PrefetchGuess::Cross), Some(6), Some("/f"))
+        );
         let e = Config::parse(THREE).unwrap().engine;
         assert_eq!((e.kv_format, e.attn_threads, e.runtime_overhead()), (KvFormat::F32, None, None));
         assert!(Config::parse(&text.replace("turbo4", "q8")).is_err());

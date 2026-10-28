@@ -82,8 +82,9 @@ Each node opens streammoe for its own role in the ring:
 - **Prefill scratch sized to `prefill_chunk`**, the most positions one step brings, instead of
   streammoe's 512.
 - **Frame buffers counted in the cap** (`host_buffers`).
-- `[engine]` passes on `kv_format` (`f32` default, `f16`, `turbo4`, `turbo3`), `attn_threads`
-  and `runtime_overhead_gib`. Only `f32` keeps a split bit-identical to one node; `f16` gave
+- `[engine]` passes on `kv_format` (`f32` default, `f16`, `turbo4`, `turbo3`), `attn_threads`,
+  `runtime_overhead_gib` and the expert streaming settings (`experts_dir`, `prefetch_guess`,
+  `prefetch_experts`, `fast_experts_dir`; see [`docs/speed.md`](docs/speed.md)). Only `f32` keeps a split bit-identical to one node; `f16` gave
   the same tokens in our runs, TurboQuant did not.
 
 streamoe's multi-request decode (`eval_requests`) and multi-token passes (`eval_tokens`, for

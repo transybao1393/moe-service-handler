@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use msh_node::config::{expand_home, Config, NodeConfig};
+use msh_node::config::{expand_home, Config, NodeConfig, PrefetchGuess};
 use msh_node::streammoe_engine::{OpenSpec, StreamMoeEngine};
 use msh_node::node::{join_ring, Worker};
 use msh_node::scheduler::{self, collect, Client, SchedulerConfig};
@@ -134,6 +134,30 @@ fn three_node_ring_matches_mlx_reference_with_requests_in_flight() {
     for rx in rxs {
         assert_eq!(collect(rx).unwrap().tokens, REF);
     }
+}
+
+#[test]
+#[ignore = "needs the OLMoE model on disk"]
+fn prefetch_settings_keep_the_output() {
+    // Prefetch only changes what is read ahead, never the math.
+    let dir = model_dir();
+    let mut prefetch_reads = Vec::new();
+    for prefetch_experts in [0, 6] {
+        let spec = OpenSpec {
+            n_ctx: 512,
+            mem_cap: Some(3 << 30),
+            prefetch_guess: Some(PrefetchGuess::Cross),
+            prefetch_experts: Some(prefetch_experts),
+            ..OpenSpec::new(&dir, 0..16)
+        };
+        let engine = StreamMoeEngine::open(&spec).expect("open OLMoE");
+        let (client, coordinator) = scheduler::spawn(engine, None, SchedulerConfig::default());
+        assert_eq!(client.generate(PROMPT.to_vec(), 32).unwrap().tokens, REF, "prefetch {prefetch_experts}");
+        drop(client);
+        prefetch_reads.push(coordinator.join().unwrap().expert_io_stats().prefetch.reads);
+    }
+    assert_eq!(prefetch_reads[0], 0, "prefetch off reads nothing ahead");
+    assert!(prefetch_reads[1] > 0, "prefetch 6 reads ahead: {prefetch_reads:?}");
 }
 
 #[test]
