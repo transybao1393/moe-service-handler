@@ -1,7 +1,7 @@
 # moe-service-handler
 
 <p align="center">
-  <img src="docs/assets/dataflow-experts.svg" width="900" alt="Data flow, experts split across the workers: the prompt comes in to the m4 controller; for each of the 40 layers the controller runs attention and the router, sends the hidden state to both workers at once with the picked experts each owns, both workers compute their experts at the same time and send the outputs back, and the controller adds them up; after the last layer the controller's head picks the token and streams it to the client. The workers never talk to each other.">
+  <img src="docs/assets/dataflow-experts-v2.svg" width="900" alt="Data flow, experts split across the workers: at start the m4 controller loads its weights from its SSD and sends each worker the experts it owns; the prompt comes in to the m4 controller; for each of the 40 layers the controller runs attention and the router, sends the hidden state to both workers at once with the picked experts each owns, both workers compute their experts at the same time and send the outputs back, and the controller adds them up; after the last layer the controller's head picks the token and streams it to the client. Now and then the controller reads one expert from the SSD and moves it to the less busy worker. The workers never talk to each other.">
 </p>
 
 <p align="center"><em>The expert split (<code>split = "experts"</code>): built and tested on the mock engine; the real
@@ -21,8 +21,9 @@ connections to each other. The config's `split` picks how the model is divided.
 
 **Expert split** (`split = "experts"`, the target design; mock engine only for now). The
 controller runs the embedding, every layer's attention, router and shared expert, the KV
-cache and the head. Every routed expert has one home worker, which keeps it in memory. For
-each token:
+cache and the head. Every routed expert has one home worker, which keeps it in memory. At
+start the controller loads its weights from its SSD and sends each worker the experts it owns;
+after that the SSD is read only when an expert moves. For each token:
 
 1. The prompt comes in to the controller (over HTTP).
 2. For layer L, the controller runs attention and the router, which picks 8 of 256 experts.
