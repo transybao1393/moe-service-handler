@@ -66,7 +66,22 @@ implementations:
   flight. Built with a model feature (`--features olmoe` or `qwen36`) and selected with
   `[engine] kind = "streammoe"`. streammoe comes from
   [transybao1393/streamoe](https://github.com/transybao1393/streamoe), pinned to a commit in
-  `crates/msh-node/Cargo.toml`.
+  `crates/msh-node/Cargo.toml` (0.2.0-beta.1).
+
+Each node opens streammoe for its own role in the ring:
+
+- **No checkpoints:** a stage never snapshots, and under a cap each checkpoint would take a
+  full state's memory from the expert hot tier.
+- **Prefill scratch sized to `prefill_chunk`**, the most positions one step brings, instead of
+  streammoe's 512.
+- **Frame buffers counted in the cap** (`host_buffers`).
+- `[engine]` passes on `kv_format` (`f32` default, `f16`, `turbo4`, `turbo3`), `attn_threads`
+  and `runtime_overhead_gib`. Only `f32` keeps a split bit-identical to one node; `f16` gave
+  the same tokens in our runs, TurboQuant did not.
+
+streamoe's multi-request decode (`eval_requests`) and multi-token passes (`eval_tokens`, for
+speculative decoding) run on the whole model only, so the cluster cannot use them yet; each
+node runs one request's step at a time.
 
 For development the real engine runs **OLMoE-1B-7B** (16 layers, 3.9 GB at 4-bit) from
 `~/models/olmoe-1b-7b`: a 3-process 8/4/4 split reproduces streammoe's MLX reference answer
@@ -117,6 +132,14 @@ Prefill of a 400-token prompt, OLMoE 8/4/4 split in 3 processes on the M3 Pro, b
 
 Bigger chunks are faster but hold the coordinator longer, delaying other requests' decode
 steps (a 64-token chunk takes ~180 ms on m4's 8 layers).
+
+Moving to streammoe 0.2.0-beta.1, same setup (3 GiB cap per node, 400-token prompt, 128
+tokens):
+
+| | Hot tier (m4) | Prefill on m4 | Decode |
+| --- | --- | --- | --- |
+| streammoe defaults | 0.31 GiB | 2.7 s | 42–44 tok/s |
+| Opened for the ring (no checkpoints, 64-token scratch) | 1.45 GiB | 1.5 s | 51 tok/s |
 
 ## License
 

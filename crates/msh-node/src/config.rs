@@ -16,8 +16,8 @@
 //! ```
 //!
 //! A single node with `layers = [0, 40]` is mode A. An optional `[scheduler]` table sets
-//! `max_in_flight` (default 3), `max_queue` (64), `health_interval_ms` (1000) and
-//! `health_timeout_ms` (5000).
+//! `max_in_flight` (default 3), `max_queue` (64), `health_interval_ms` (1000),
+//! `health_timeout_ms` (5000), `prefill_chunk` (64) and `prefill_depth` (3).
 //!
 //! An optional `[engine]` table picks the engine (default: the mock):
 //!
@@ -27,6 +27,9 @@
 //! model_dir = "~/models/olmoe-1b-7b"   # artifacts/ and root/ as streammoe's converters write them
 //! n_ctx = 2048
 //! mem_cap_gib = 3.0                    # per node; a node can override it with its own mem_cap_gib
+//! kv_format = "f16"                    # optional: f32 (default), f16, turbo4, turbo3
+//! attn_threads = 4                     # optional: CPU decode attention threads
+//! runtime_overhead_gib = 0.75          # optional: unitemized room inside the cap
 //! ```
 //!
 //! An optional `[http]` table makes the coordinator serve the OpenAI-compatible API:
@@ -39,7 +42,7 @@
 //! model = "olmoe-1b-7b"                # name reported to clients
 //! ```
 //!
-//! An optional `[metrics]` table makes the coordinator write one CSV row per position
+//! An optional `[metrics]` table makes the coordinator write one CSV row per step
 //! (CL-10, CL-11); `msh-node --metrics FILE` does the same for one run:
 //!
 //! ```toml
@@ -113,12 +116,45 @@ pub struct EngineConfig {
     pub n_ctx: usize,
     /// Hard memory cap for streammoe on each node, in GiB. `None` = uncapped.
     pub mem_cap_gib: Option<f64>,
+    /// Storage of each node's KV cache. Smaller formats leave more of the cap to the expert
+    /// hot tier.
+    pub kv_format: KvFormat,
+    /// Threads for streammoe's CPU decode attention; `None` keeps its default.
+    pub attn_threads: Option<usize>,
+    /// Room inside the cap for memory streammoe does not itemize, in GiB; `None` keeps its
+    /// default (0.5). Long decodes can need 0.75.
+    pub runtime_overhead_gib: Option<f64>,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        EngineConfig { kind: EngineKind::Mock, model_dir: String::new(), n_ctx: 2048, mem_cap_gib: None }
+        EngineConfig {
+            kind: EngineKind::Mock,
+            model_dir: String::new(),
+            n_ctx: 2048,
+            mem_cap_gib: None,
+            kv_format: KvFormat::F32,
+            attn_threads: None,
+            runtime_overhead_gib: None,
+        }
     }
+}
+
+impl EngineConfig {
+    pub fn runtime_overhead(&self) -> Option<u64> {
+        self.runtime_overhead_gib.map(gib)
+    }
+}
+
+/// KV cache storage: f32, f16, or TurboQuant 4 / 3-bit (smallest, slightly less accurate).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvFormat {
+    #[default]
+    F32,
+    F16,
+    Turbo4,
+    Turbo3,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -145,8 +181,12 @@ impl NodeConfig {
 
     /// This node's streammoe memory cap in bytes.
     pub fn mem_cap(&self, engine: &EngineConfig) -> Option<u64> {
-        self.mem_cap_gib.or(engine.mem_cap_gib).map(|g| (g * (1u64 << 30) as f64) as u64)
+        self.mem_cap_gib.or(engine.mem_cap_gib).map(gib)
     }
+}
+
+fn gib(g: f64) -> u64 {
+    (g * (1u64 << 30) as f64) as u64
 }
 
 impl Config {
@@ -240,6 +280,19 @@ mod tests {
         assert_eq!(c.nodes[1].mem_cap(&c.engine), Some(1 << 29));
         assert_eq!(Config::parse(THREE).unwrap().engine.kind, EngineKind::Mock);
         assert!(Config::parse(&text.replace("model_dir = \"/m\"", "")).is_err());
+    }
+
+    #[test]
+    fn engine_tuning() {
+        let text = THREE.replace(
+            "num_layers = 40",
+            "num_layers = 40\n[engine]\nkind = \"streammoe\"\nmodel_dir = \"/m\"\nkv_format = \"turbo4\"\nattn_threads = 8\nruntime_overhead_gib = 0.75",
+        );
+        let e = Config::parse(&text).unwrap().engine;
+        assert_eq!((e.kv_format, e.attn_threads, e.runtime_overhead()), (KvFormat::Turbo4, Some(8), Some(3 << 28)));
+        let e = Config::parse(THREE).unwrap().engine;
+        assert_eq!((e.kv_format, e.attn_threads, e.runtime_overhead()), (KvFormat::F32, None, None));
+        assert!(Config::parse(&text.replace("turbo4", "q8")).is_err());
     }
 
     #[test]

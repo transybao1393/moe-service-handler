@@ -12,6 +12,7 @@ use std::path::Path;
 
 use streammoe::{Ctx, OpenConfig, ReqId, StageInput, StageOutput};
 
+use crate::config::KvFormat;
 use crate::engine::{Engine, StageIn};
 use crate::Error;
 
@@ -24,6 +25,31 @@ pub struct OpenSpec<'a> {
     pub n_ctx: usize,
     pub mem_cap: Option<u64>,
     pub max_requests: usize,
+    /// The cluster's prefill chunk: the most positions one step brings, which sizes
+    /// streammoe's prefill scratch and this node's frame buffers.
+    pub prefill_chunk: usize,
+    pub kv_format: KvFormat,
+    /// `None` keeps streammoe's default.
+    pub attn_threads: Option<usize>,
+    /// `None` keeps streammoe's default.
+    pub runtime_overhead: Option<u64>,
+}
+
+impl<'a> OpenSpec<'a> {
+    /// The whole of `layers` with every setting at its default.
+    pub fn new(model_dir: &'a Path, layers: std::ops::Range<u32>) -> Self {
+        OpenSpec {
+            model_dir,
+            layers,
+            n_ctx: 2048,
+            mem_cap: None,
+            max_requests: 1,
+            prefill_chunk: 64,
+            kv_format: KvFormat::F32,
+            attn_threads: None,
+            runtime_overhead: None,
+        }
+    }
 }
 
 pub struct StreamMoeEngine {
@@ -37,6 +63,8 @@ pub struct StreamMoeEngine {
 impl StreamMoeEngine {
     pub fn open(spec: &OpenSpec) -> Result<Self, Error> {
         let art = spec.model_dir.join("artifacts");
+        let defaults = OpenConfig::default();
+        let chunk = spec.prefill_chunk.max(1);
         let cfg = OpenConfig {
             n_ctx: spec.n_ctx,
             mem_cap: spec.mem_cap,
@@ -44,7 +72,22 @@ impl StreamMoeEngine {
             // Slot 0 is streammoe's always-admitted default request, which this engine never
             // uses, so N requests in flight need N + 1 slots (one idle slot of KV memory).
             max_requests: spec.max_requests + 1,
-            ..OpenConfig::default()
+            // A pipeline stage never snapshots; under a cap each checkpoint would take a full
+            // state's memory from the hot tier.
+            max_checkpoints: 0,
+            prefill_chunk: Some(chunk),
+            // A worker's receive, input, output and send buffers each hold one chunk of f32
+            // rows; the coordinator holds fewer.
+            host_buffers: (4 * chunk * streammoe::riir::VARIANT.hidden_dim * 4) as u64,
+            kv_format: match spec.kv_format {
+                KvFormat::F32 => streammoe::KvFormat::F32,
+                KvFormat::F16 => streammoe::KvFormat::F16,
+                KvFormat::Turbo4 => streammoe::KvFormat::Turbo4,
+                KvFormat::Turbo3 => streammoe::KvFormat::Turbo3,
+            },
+            attn_threads: spec.attn_threads.unwrap_or(defaults.attn_threads),
+            runtime_overhead: spec.runtime_overhead.unwrap_or(defaults.runtime_overhead),
+            ..defaults
         };
         let ctx = Ctx::open_with(
             &art.join("model_weights.bin"),

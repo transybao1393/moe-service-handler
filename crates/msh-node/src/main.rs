@@ -67,6 +67,10 @@ fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box
         n_ctx: cfg.engine.n_ctx,
         mem_cap: node.mem_cap(&cfg.engine),
         max_requests: cfg.scheduler.max_in_flight,
+        prefill_chunk: cfg.scheduler.prefill_chunk,
+        kv_format: cfg.engine.kv_format,
+        attn_threads: cfg.engine.attn_threads,
+        runtime_overhead: cfg.engine.runtime_overhead(),
     })?;
     eprintln!("{}: streammoe opened layers {:?} in {:.1} s", node.name, node.layer_range(), t0.elapsed().as_secs_f64());
     Ok(engine)

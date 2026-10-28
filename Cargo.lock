@@ -601,34 +601,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moeflux"
-version = "0.1.0-pre.4"
-source = "git+https://github.com/transybao1393/streamoe.git?rev=748bb3e8b83c59ce79ca98b1512958e023670fc8#748bb3e8b83c59ce79ca98b1512958e023670fc8"
-dependencies = [
- "bytemuck",
- "libc",
- "memmap2",
- "metal",
- "moeflux-metal",
- "objc",
- "rayon",
- "serde",
- "serde_json",
- "static_assertions",
- "sysinfo",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "moeflux-metal"
-version = "0.1.0-pre.4"
-source = "git+https://github.com/transybao1393/streamoe.git?rev=748bb3e8b83c59ce79ca98b1512958e023670fc8#748bb3e8b83c59ce79ca98b1512958e023670fc8"
-dependencies = [
- "metal",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -660,10 +632,10 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "http-body-util",
- "moeflux",
  "msh-net",
  "serde",
  "serde_json",
+ "streammoe",
  "tokenizers",
  "tokio",
  "tokio-stream",
@@ -1011,6 +983,34 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "streammoe"
+version = "0.2.0-beta.1"
+source = "git+https://github.com/transybao1393/streamoe.git?rev=5608cf2abab16b1442fee86905e391bab90ac48a#5608cf2abab16b1442fee86905e391bab90ac48a"
+dependencies = [
+ "bytemuck",
+ "libc",
+ "memmap2",
+ "metal",
+ "objc",
+ "rayon",
+ "serde",
+ "serde_json",
+ "static_assertions",
+ "streammoe-metal",
+ "sysinfo",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "streammoe-metal"
+version = "0.2.0-beta.1"
+source = "git+https://github.com/transybao1393/streamoe.git?rev=5608cf2abab16b1442fee86905e391bab90ac48a#5608cf2abab16b1442fee86905e391bab90ac48a"
+dependencies = [
+ "metal",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "strsim"

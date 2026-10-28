@@ -36,7 +36,7 @@ fn model_dir() -> PathBuf {
 /// context per process, as in a real deployment. A ring of threads runs uncapped.
 fn open(layers: std::ops::Range<u32>, max_requests: usize, mem_cap: Option<u64>) -> StreamMoeEngine {
     let dir = model_dir();
-    StreamMoeEngine::open(&OpenSpec { model_dir: &dir, layers, n_ctx: 512, mem_cap, max_requests })
+    StreamMoeEngine::open(&OpenSpec { n_ctx: 512, mem_cap, max_requests, ..OpenSpec::new(&dir, layers) })
         .expect("open OLMoE (is the model converted at ~/models/olmoe-1b-7b?)")
 }
 
