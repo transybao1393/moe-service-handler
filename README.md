@@ -1,7 +1,7 @@
 # moe-service-handler
 
 <p align="center">
-  <img src="docs/assets/dataflow.svg" width="920" alt="Data flow: a client's prompt enters the M4 coordinator; hidden states pass through the layer ranges on the M4, the M1 and a second M4; the last node samples a token, sends it back to the coordinator, and the coordinator streams it to the client. Three requests are in the ring at once.">
+  <img src="docs/assets/dataflow.svg" width="900" alt="Data flow: a client's prompt enters the m4 controller, which runs the first layers and sends hidden states to the m1 worker; m1 passes them to the m4b worker, which runs the last layers and the head and sends the token back to the controller; the controller streams it to the client. Three requests are in the ring at once.">
 </p>
 
 Turns streammoe into a service that runs a large MoE model, Qwen3.6-35B-A3B, across three

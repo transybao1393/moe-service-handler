@@ -1,73 +1,81 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 300" width="920" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 470" width="900" role="img" aria-labelledby="t d">
 <title id="t">moe-service-handler data flow</title>
-<desc id="d">A client sends a request to the M4 coordinator. Hidden states flow through the layer ranges on the M4, the M1 and a second M4; the last node samples a token and sends it back to the coordinator, which streams it to the client. Three requests are in the ring at once.</desc>
+<desc id="d">A client sends a prompt to the m4 controller. The controller runs the first layers and sends hidden states to the m1 worker; m1 runs its layers and passes them to the m4b worker; m4b runs the last layers and the head, and sends the sampled token back to the controller, which streams it to the client. Three requests are in the ring at once.</desc>
 <style>
   .bg { fill: #ffffff; }
   .node { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.5; }
+  .ctl { fill: #eff6ff; stroke: #64748b; stroke-width: 1.5; }
   .client { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 1.5; }
   .wire { fill: none; stroke: #94a3b8; stroke-width: 2; }
+  .back { fill: none; stroke: #94a3b8; stroke-width: 2; stroke-dasharray: 6 4; }
   .h { font: 600 14px ui-sans-serif, -apple-system, "Segoe UI", sans-serif; fill: #0f172a; }
   .s { font: 12px ui-sans-serif, -apple-system, "Segoe UI", sans-serif; fill: #475569; }
   .m { font: 11px ui-monospace, "SF Mono", Menlo, monospace; fill: #64748b; }
+  .arrow { fill: #94a3b8; }
   @media (prefers-color-scheme: dark) {
     .bg { fill: #0d1117; }
     .node { fill: #161b22; stroke: #484f58; }
+    .ctl { fill: #172033; stroke: #6e7681; }
     .client { fill: #1c2128; stroke: #484f58; }
-    .wire { stroke: #484f58; }
+    .wire, .back { stroke: #6e7681; }
+    .arrow { fill: #6e7681; }
     .h { fill: #e6edf3; }
     .s { fill: #9da7b3; }
     .m { fill: #8b949e; }
   }
 </style>
-<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker></defs>
-<rect class="bg" width="920" height="300" rx="12"/>
-
-<rect class="client" x="20" y="88" width="100" height="100" rx="10"/>
-<text class="h" x="70" y="128" text-anchor="middle">client</text>
-<text class="s" x="70" y="146" text-anchor="middle">OpenAI API</text>
-<path class="wire" d="M120,108 L176,108" marker-end="url(#a)"/><text class="m" x="148" y="96" text-anchor="middle">prompt</text>
-<path class="wire" d="M180,168 L124,168" marker-end="url(#a)"/><text class="m" x="150" y="184" text-anchor="middle">stream</text>
-<path class="wire" d="M370,118 L436,118" marker-end="url(#a)"/><text class="m" x="405" y="108" text-anchor="middle">Hidden</text><text class="m" x="405" y="136" text-anchor="middle">f32</text>
-<path class="wire" d="M630,118 L696,118" marker-end="url(#a)"/><text class="m" x="665" y="108" text-anchor="middle">Hidden</text><text class="m" x="665" y="136" text-anchor="middle">f32</text>
-<path class="wire" d="M795,200 L795,248 L275,248 L275,204" marker-end="url(#a)"/>
-<text class="m" x="535" y="270" text-anchor="middle">Token · u32 (one per position when verifying drafts) · same TCP ring</text>
-<rect class="node" x="180" y="68" width="190" height="132" rx="12"/>
-<rect x="180" y="68" width="190" height="132" rx="12" fill="#3b82f6" fill-opacity="0.16" stroke="#3b82f6" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.0;0.2" dur="4.5s" begin="0s" repeatCount="indefinite"/></rect>
-<rect x="180" y="68" width="190" height="132" rx="12" fill="#10b981" fill-opacity="0.16" stroke="#10b981" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.0;0.2" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></rect>
-<rect x="180" y="68" width="190" height="132" rx="12" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.0;0.2" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></rect>
-<text class="h" x="275.0" y="98" text-anchor="middle">m4 · coordinator</text>
-<text class="s" x="275.0" y="118" text-anchor="middle">Mac mini M4</text>
-<text class="s" x="275.0" y="138" text-anchor="middle">HTTP · scheduler · drafts</text>
-<text class="m" x="275.0" y="182" text-anchor="middle">embed + layers 0–19</text>
-<rect class="node" x="440" y="68" width="190" height="132" rx="12"/>
-<rect x="440" y="68" width="190" height="132" rx="12" fill="#3b82f6" fill-opacity="0.16" stroke="#3b82f6" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.3;0.5" dur="4.5s" begin="0s" repeatCount="indefinite"/></rect>
-<rect x="440" y="68" width="190" height="132" rx="12" fill="#10b981" fill-opacity="0.16" stroke="#10b981" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.3;0.5" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></rect>
-<rect x="440" y="68" width="190" height="132" rx="12" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.3;0.5" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></rect>
-<text class="h" x="535.0" y="98" text-anchor="middle">m1 · worker</text>
-<text class="s" x="535.0" y="118" text-anchor="middle">Mac mini M1</text>
-<text class="m" x="535.0" y="182" text-anchor="middle">layers 20–29</text>
-<rect class="node" x="700" y="68" width="190" height="132" rx="12"/>
-<rect x="700" y="68" width="190" height="132" rx="12" fill="#3b82f6" fill-opacity="0.16" stroke="#3b82f6" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.6;0.8" dur="4.5s" begin="0s" repeatCount="indefinite"/></rect>
-<rect x="700" y="68" width="190" height="132" rx="12" fill="#10b981" fill-opacity="0.16" stroke="#10b981" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.6;0.8" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></rect>
-<rect x="700" y="68" width="190" height="132" rx="12" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.6;0.8" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></rect>
-<text class="h" x="795.0" y="98" text-anchor="middle">m4b · worker</text>
-<text class="s" x="795.0" y="118" text-anchor="middle">Mac mini M4</text>
-<text class="m" x="795.0" y="182" text-anchor="middle">layers 30–39 + head</text>
-<circle r="6" fill="#3b82f6" opacity="0"><animateMotion path="M370,118 L440,118" keyPoints="0;0;1;1" keyTimes="0;0.2;0.3;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.2;0.3" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
-<circle r="6" fill="#3b82f6" opacity="0"><animateMotion path="M630,118 L700,118" keyPoints="0;0;1;1" keyTimes="0;0.5;0.6;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.5;0.6" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
-<circle r="6" fill="#3b82f6" opacity="0"><animateMotion path="M795,200 L795,248 L275,248 L275,200" keyPoints="0;0;1;1" keyTimes="0;0.8;0.97;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.8;0.97" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
-<circle r="5" fill="#3b82f6" opacity="0"><animateMotion path="M180,168 L120,168" keyPoints="0;0;1;1" keyTimes="0;0.001;0.12;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.001;0.12" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
-<circle r="6" fill="#10b981" opacity="0"><animateMotion path="M370,118 L440,118" keyPoints="0;0;1;1" keyTimes="0;0.2;0.3;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.2;0.3" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
-<circle r="6" fill="#10b981" opacity="0"><animateMotion path="M630,118 L700,118" keyPoints="0;0;1;1" keyTimes="0;0.5;0.6;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.5;0.6" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
-<circle r="6" fill="#10b981" opacity="0"><animateMotion path="M795,200 L795,248 L275,248 L275,200" keyPoints="0;0;1;1" keyTimes="0;0.8;0.97;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.8;0.97" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
-<circle r="5" fill="#10b981" opacity="0"><animateMotion path="M180,168 L120,168" keyPoints="0;0;1;1" keyTimes="0;0.001;0.12;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.001;0.12" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
-<circle r="6" fill="#f59e0b" opacity="0"><animateMotion path="M370,118 L440,118" keyPoints="0;0;1;1" keyTimes="0;0.2;0.3;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.2;0.3" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
-<circle r="6" fill="#f59e0b" opacity="0"><animateMotion path="M630,118 L700,118" keyPoints="0;0;1;1" keyTimes="0;0.5;0.6;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.5;0.6" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
-<circle r="6" fill="#f59e0b" opacity="0"><animateMotion path="M795,200 L795,248 L275,248 L275,200" keyPoints="0;0;1;1" keyTimes="0;0.8;0.97;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.8;0.97" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
-<circle r="5" fill="#f59e0b" opacity="0"><animateMotion path="M180,168 L120,168" keyPoints="0;0;1;1" keyTimes="0;0.001;0.12;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.001;0.12" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
-<text class="s" x="20" y="34">Each node runs its own layers and passes the result on; the last one samples the token.</text>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="bg" width="900" height="470" rx="12"/>
+<text class="s" x="20" y="32">The controller sends each step to the workers and gets the token back; each node runs its own layers.</text>
 <text class="s" x="20" y="52">Three requests in the ring at once, so every node stays busy:</text>
 <circle cx="392" cy="48" r="6" fill="#3b82f6"/><text class="s" x="402" y="52">request 1</text>
 <circle cx="472" cy="48" r="6" fill="#10b981"/><text class="s" x="482" y="52">request 2</text>
 <circle cx="552" cy="48" r="6" fill="#f59e0b"/><text class="s" x="562" y="52">request 3</text>
+<rect class="client" x="20" y="190" width="100" height="100" rx="12"/>
+<text class="h" x="70" y="232" text-anchor="middle">client</text>
+<text class="s" x="70" y="250" text-anchor="middle">OpenAI API</text>
+<rect class="ctl" x="190" y="164" width="210" height="152" rx="12"/>
+<rect x="190" y="164" width="210" height="152" rx="12" fill="#3b82f6" fill-opacity="0.16" stroke="#3b82f6" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.0;0.2" dur="4.5s" begin="0s" repeatCount="indefinite"/></rect>
+<rect x="190" y="164" width="210" height="152" rx="12" fill="#10b981" fill-opacity="0.16" stroke="#10b981" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.0;0.2" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></rect>
+<rect x="190" y="164" width="210" height="152" rx="12" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.0;0.2" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></rect>
+<text class="h" x="295" y="194" text-anchor="middle">m4 · controller</text>
+<text class="s" x="295" y="214" text-anchor="middle">Mac mini M4</text>
+<text class="s" x="295" y="236" text-anchor="middle">HTTP · scheduler · drafts</text>
+<text class="m" x="295" y="294" text-anchor="middle">embed + layers 0–19</text>
+<rect class="node" x="620" y="84" width="250" height="120" rx="12"/>
+<rect x="620" y="84" width="250" height="120" rx="12" fill="#3b82f6" fill-opacity="0.16" stroke="#3b82f6" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.3;0.5" dur="4.5s" begin="0s" repeatCount="indefinite"/></rect>
+<rect x="620" y="84" width="250" height="120" rx="12" fill="#10b981" fill-opacity="0.16" stroke="#10b981" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.3;0.5" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></rect>
+<rect x="620" y="84" width="250" height="120" rx="12" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.3;0.5" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></rect>
+<text class="h" x="745" y="116" text-anchor="middle">m1 · worker</text>
+<text class="s" x="745" y="136" text-anchor="middle">Mac mini M1</text>
+<text class="m" x="745" y="182" text-anchor="middle">layers 20–29</text>
+<rect class="node" x="620" y="296" width="250" height="120" rx="12"/>
+<rect x="620" y="296" width="250" height="120" rx="12" fill="#3b82f6" fill-opacity="0.16" stroke="#3b82f6" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.6;0.8" dur="4.5s" begin="0s" repeatCount="indefinite"/></rect>
+<rect x="620" y="296" width="250" height="120" rx="12" fill="#10b981" fill-opacity="0.16" stroke="#10b981" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.6;0.8" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></rect>
+<rect x="620" y="296" width="250" height="120" rx="12" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="2" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.6;0.8" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></rect>
+<text class="h" x="745" y="328" text-anchor="middle">m4b · worker</text>
+<text class="s" x="745" y="348" text-anchor="middle">Mac mini M4</text>
+<text class="m" x="745" y="394" text-anchor="middle">layers 30–39 + head</text>
+<path class="wire" d="M120,214 L186,214" marker-end="url(#a)"/><text class="m" x="153" y="204" text-anchor="middle">prompt</text>
+<path class="wire" d="M190,266 L120,266" marker-end="url(#a)"/><text class="m" x="155" y="284" text-anchor="middle">stream</text>
+<path class="wire" d="M400,198 L620,150" marker-end="url(#a)"/>
+<text class="m" x="500" y="158" text-anchor="middle">Hidden · f32</text>
+<path class="wire" d="M745,204 L745,296" marker-end="url(#a)"/>
+<text class="m" x="757" y="246">Hidden · f32</text>
+<path class="back" d="M620,350 L400,282" marker-end="url(#a)"/>
+<text class="m" x="520" y="346" text-anchor="middle">Token · u32</text>
+<text class="m" x="520" y="362" text-anchor="middle">back to the controller</text>
+<circle r="6" fill="#3b82f6" opacity="0"><animateMotion path="M400,198 L620,150" keyPoints="0;0;1;1" keyTimes="0;0.2;0.3;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.2;0.3" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#3b82f6" opacity="0"><animateMotion path="M745,204 L745,296" keyPoints="0;0;1;1" keyTimes="0;0.5;0.6;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.5;0.6" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#3b82f6" opacity="0"><animateMotion path="M620,350 L400,282" keyPoints="0;0;1;1" keyTimes="0;0.8;0.95;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.8;0.95" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
+<circle r="5" fill="#3b82f6" opacity="0"><animateMotion path="M190,266 L120,266" keyPoints="0;0;1;1" keyTimes="0;0.001;0.12;1" calcMode="linear" dur="4.5s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.001;0.12" dur="4.5s" begin="0s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#10b981" opacity="0"><animateMotion path="M400,198 L620,150" keyPoints="0;0;1;1" keyTimes="0;0.2;0.3;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.2;0.3" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#10b981" opacity="0"><animateMotion path="M745,204 L745,296" keyPoints="0;0;1;1" keyTimes="0;0.5;0.6;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.5;0.6" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#10b981" opacity="0"><animateMotion path="M620,350 L400,282" keyPoints="0;0;1;1" keyTimes="0;0.8;0.95;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.8;0.95" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
+<circle r="5" fill="#10b981" opacity="0"><animateMotion path="M190,266 L120,266" keyPoints="0;0;1;1" keyTimes="0;0.001;0.12;1" calcMode="linear" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.001;0.12" dur="4.5s" begin="-1.50s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#f59e0b" opacity="0"><animateMotion path="M400,198 L620,150" keyPoints="0;0;1;1" keyTimes="0;0.2;0.3;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.2;0.3" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#f59e0b" opacity="0"><animateMotion path="M745,204 L745,296" keyPoints="0;0;1;1" keyTimes="0;0.5;0.6;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.5;0.6" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
+<circle r="6" fill="#f59e0b" opacity="0"><animateMotion path="M620,350 L400,282" keyPoints="0;0;1;1" keyTimes="0;0.8;0.95;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.8;0.95" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
+<circle r="5" fill="#f59e0b" opacity="0"><animateMotion path="M190,266 L120,266" keyPoints="0;0;1;1" keyTimes="0;0.001;0.12;1" calcMode="linear" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.001;0.12" dur="4.5s" begin="-3.00s" repeatCount="indefinite"/></circle>
+<text class="s" x="20" y="446">One TCP ring, m4 → m1 → m4b → m4. Each hop is one persistent connection; Drop, Rewind and Ping go round the same way.</text>
 </svg>

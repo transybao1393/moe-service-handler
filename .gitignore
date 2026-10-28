@@ -30,5 +30,6 @@ tokenizer_config.json
 # Node and server logs
 *.log
 
-# Local notes: full chat history with Claude
+# Local notes: full chat history with Claude and the decision log
 docs/chat-history.md
+docs/decision-log.md
