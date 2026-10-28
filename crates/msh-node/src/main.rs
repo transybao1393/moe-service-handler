@@ -12,7 +12,8 @@
 //! it serves the OpenAI-compatible API. With `--prompt` (token ids) it submits K concurrent
 //! greedy generations, prints throughput and exits. `--metrics FILE` (or `[metrics] csv`)
 //! appends one row per position to a CSV.
-//! Every other node is a worker and serves until the coordinator disconnects. With
+//! Every other node is a worker and serves one coordinator connection after another, from a
+//! clean state each time; the coordinator reconnects a lost worker by itself. With
 //! `split = "requests"` the coordinator opens no engine and serves once at least one worker is
 //! ready (waiting up to 60 s for all); each worker opens the whole model and serves one
 //! coordinator connection after another, so a coordinator that lost it can reconnect.
@@ -35,7 +36,7 @@ use msh_node::{memory, stats};
 use msh_node::metrics::{Metrics, RunInfo};
 use msh_node::node::Star;
 use msh_node::engine::{Engine, MockEngine};
-use msh_node::node::{accept_controller, connect_workers, RequestWorker, Worker};
+use msh_node::node::{connect_workers, RequestWorker, Worker};
 use msh_node::planner;
 use msh_node::scheduler::{self, collect};
 
@@ -149,7 +150,7 @@ fn start_scheduler<E: Engine + 'static>(
 /// Plans the split unless the config gives it, logs it, and with `print` shows it on stdout.
 #[cfg(feature = "streammoe")]
 fn plan_split(cfg: &mut Config, print: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use msh_node::streammoe_engine::Budgeter;
+    use msh_node::streammoe_engine::{with_spec, Budgeter};
     let caps: Vec<Option<u64>> = cfg.nodes.iter().map(|n| n.mem_cap(&cfg.engine)).collect();
     let budgeter = match cfg.engine.kind {
         EngineKind::StreamMoe if caps.iter().any(Option::is_some) => {
@@ -163,8 +164,11 @@ fn plan_split(cfg: &mut Config, print: bool) -> Result<(), Box<dyn std::error::E
     show_split(cfg, source, print, |i| {
         budget(i, cfg.layers_of(i)?).map(|b| {
             format!(
-                "fixed {:.2} GiB, hot tier {:.2} of {:.2} GiB experts",
+                "fixed {:.2} GiB (KV {:?} {:.3} + scratch {:.3}), hot tier {:.2} of {:.2} GiB experts",
                 b.fixed as f64 / GIB,
+                cfg.engine.kv_format,
+                b.kv as f64 / GIB,
+                b.kv_scratch as f64 / GIB,
                 b.hot_tier as f64 / GIB,
                 b.range_experts as f64 / GIB
             )
@@ -239,36 +243,9 @@ fn show_split(cfg: &Config, source: &str, print: bool, budget: impl Fn(usize) ->
     }
 }
 
-/// Calls `f` with the open settings for `layers` on this config.
-#[cfg(feature = "streammoe")]
-fn with_spec<T>(
-    cfg: &Config,
-    layers: Range<u32>,
-    mem_cap: Option<u64>,
-    f: impl FnOnce(&msh_node::streammoe_engine::OpenSpec) -> T,
-) -> T {
-    let model_dir = expand_home(&cfg.engine.model_dir);
-    let fast_experts_dir = cfg.engine.fast_experts_dir.as_deref().map(expand_home);
-    f(&msh_node::streammoe_engine::OpenSpec {
-        model_dir: &model_dir,
-        layers,
-        n_ctx: cfg.engine.n_ctx,
-        mem_cap,
-        max_requests: cfg.scheduler.engine_slots(),
-        prefill_chunk: cfg.scheduler.prefill_chunk,
-        kv_format: cfg.engine.kv_format,
-        attn_threads: cfg.engine.attn_threads,
-        runtime_overhead: cfg.engine.runtime_overhead(),
-        experts_dir: &cfg.engine.experts_dir,
-        prefetch_guess: cfg.engine.prefetch_guess,
-        prefetch_experts: cfg.engine.prefetch_experts,
-        fast_experts_dir: fast_experts_dir.as_deref(),
-    })
-}
-
 #[cfg(feature = "streammoe")]
 fn open_streammoe(cfg: &Config, idx: usize) -> Result<impl Engine + 'static, Box<dyn std::error::Error>> {
-    use msh_node::streammoe_engine::StreamMoeEngine;
+    use msh_node::streammoe_engine::{with_spec, StreamMoeEngine};
     let node = &cfg.nodes[idx];
     let layers = cfg.layers_of(idx).ok_or("this node runs no layers")?;
     let t0 = Instant::now();
@@ -296,10 +273,7 @@ fn serve<'a, E: Engine + 'static>(
     if idx > 0 {
         let listener = TcpListener::bind(node.listen_addr()).map_err(|e| format!("bind {}: {e}", node.listen_addr()))?;
         info!(role = "worker", runs = role(cfg, idx), listen = node.listen_addr(), "waiting for the controller");
-        let link = accept_controller(cfg, idx, listener)?;
-        info!(controller = link.peer_name(), "connected");
-        Worker::new(engine, link, name).run()?;
-        info!("controller disconnected, exiting");
+        Worker::idle(engine, name).serve_forever(cfg, idx, &listener)?;
         return Ok(());
     }
     info!(role = "controller", runs = role(cfg, 0), workers = cfg.nodes.len() - 1, "connecting to workers");
@@ -345,6 +319,12 @@ fn serve_requests<'a>(
     }
     let workers = cfg.nodes.len() - 1;
     info!(role = "controller", runs = role(cfg, 0), workers, "connecting to workers");
+    // The bench repeats one prompt; answers from the cache would not measure the workers.
+    let mut cfg = cfg.clone();
+    if codec.is_none() {
+        cfg.cache.mode = msh_node::config::CacheMode::Off;
+    }
+    let cfg = &cfg;
     let (client, sched) = msh_node::requests::spawn(cfg)?;
     let board = client.board().expect("request split").clone();
     let ready = board.wait_ready(workers, CONNECT_TIMEOUT);

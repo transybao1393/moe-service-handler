@@ -23,10 +23,23 @@
 //! were on. A request without progress (a token, or prompt positions in a status report) for
 //! `stall_timeout_ms` fails alone and is dropped on its worker. A worker whose connection
 //! breaks is down: its requests that have sent no token yet go back to the front of the queue,
-//! the others fail, and a background thread reconnects; after its `Hello` it is ready again.
+//! the others fail, and a background thread reconnects, forever, waiting `[net]
+//! reconnect_min_ms` doubling to `reconnect_max_ms` between tries (the table shows the tries
+//! and when the next is due); after its `Hello` it is ready again. A failed write on a link
+//! counts as the link broken.
 //! The cluster takes requests while at least one worker is ready; with none, new and queued
 //! requests are refused as "cluster down". Every state change is one log line: worker, from,
 //! to, reason.
+//!
+//! The controller keeps its own answer cache ([`crate::cache`], `[cache]`), behind its own
+//! lock. A submitted request is looked up on the caller's thread (the HTTP handler), after its
+//! prompt is tokenized and before the queue: a prompt it has answered (or in similar mode, one
+//! close to it) gets that answer streamed back at once, as if from a worker, skipping the
+//! queue, the capacity checks and every worker, even while no worker is ready. Such a request
+//! is one log line with its kind and similarity, and shows in the table with phase `cached`
+//! and worker `controller`. The scheduler thread fills the cache when a worker's `Done` ends a
+//! request at the limit or the end-of-sequence token; failed, cancelled, stalled and dropped
+//! requests are not kept.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,11 +50,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use msh_net::{
     decode_done, decode_status, decode_token, encode_start, Connection, DoneReason, FrameError, Header, MsgType, Status,
+    Writer,
 };
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, Split};
+use crate::backoff::Backoff;
+use crate::cache::{Cache, CacheStats, Hit, Probe};
+use crate::config::{Config, NetConfig, Split};
 use crate::scheduler::{Client, Event, Msg, SchedulerConfig};
 use crate::stats::{WorkerSeries, STATS};
 use crate::Error;
@@ -52,6 +68,8 @@ pub(crate) enum Note {
     Frame { worker: usize, link: u64, h: Header, payload: Vec<u8> },
     Lost { worker: usize, link: u64, reason: String },
     Joined { worker: usize, conn: Connection },
+    /// A reconnect try failed; the next comes after `wait`.
+    Retry { worker: usize, tries: u32, wait: Duration },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -108,6 +126,10 @@ pub struct WorkerView {
     pub footprint: u64,
     pub cap: u64,
     pub last_error: Option<LastError>,
+    /// While connecting or down: failed reconnect tries so far, and when the next is due
+    /// (Unix ms).
+    pub reconnect_tries: u32,
+    pub next_try: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -143,6 +165,33 @@ pub struct RequestView {
     pub retries: u32,
     /// Set while its worker is stuck: what it was on.
     pub stuck: Option<String>,
+    /// Answered from the cache: how.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached: Option<CachedView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CachedView {
+    /// `exact` or `similar`.
+    pub kind: &'static str,
+    pub similarity: f32,
+    /// The worker that made the answer.
+    pub made_by: String,
+}
+
+/// Requests answered from the cache that the table keeps showing.
+const SERVED_KEPT: usize = 16;
+
+/// The answer cache and the requests it answered lately, behind their own lock so lookups
+/// and reads never wait on the scheduler. Lock order: `Board::inner`, then this.
+struct CacheState {
+    cache: Cache,
+    served: VecDeque<RequestView>,
+    shutting_down: bool,
+}
+
+fn lock_cache(c: &Mutex<CacheState>) -> MutexGuard<'_, CacheState> {
+    c.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Recent events, for rates and counts over a window.
@@ -185,8 +234,11 @@ struct Slot {
     reason: String,
     /// Set by `drain`: the worker is draining whenever it is up.
     drain: bool,
-    send: Option<Connection>,
+    send: Option<Writer>,
     link: u64,
+    /// Failed reconnect tries since the link was lost, and when the next is due.
+    tries: u32,
+    next_try: Option<Instant>,
     /// Since when the current link is up.
     up_since: Instant,
     /// Outstanding ping: sequence number and send time.
@@ -234,6 +286,9 @@ struct Req {
     retries: u32,
     /// The client has its outcome; the worker's `Done` frees the slot.
     dropping: bool,
+    /// Its cache key, and the tokens sent so far, for the cache once it is done.
+    probe: Option<Probe>,
+    answer: Vec<u32>,
 }
 
 impl Req {
@@ -251,11 +306,13 @@ impl Req {
 /// HTTP API. Every method takes the lock for its own duration.
 pub struct Board {
     inner: Mutex<Inner>,
+    cache: Arc<Mutex<CacheState>>,
 }
 
 struct Inner {
     me: String,
     cfg: SchedulerConfig,
+    net: NetConfig,
     workers: Vec<Slot>,
     reqs: HashMap<u64, Req>,
     queue: VecDeque<u64>,
@@ -269,6 +326,7 @@ struct Inner {
     tokens: Vec<u32>,
     stages: Vec<u32>,
     status: Status,
+    cache: Arc<Mutex<CacheState>>,
 }
 
 /// Starts the request split's scheduler for `cfg`: node 0 is this controller, every other
@@ -292,6 +350,8 @@ pub fn spawn(cfg: &Config) -> Result<(Client, JoinHandle<()>), Error> {
             drain: false,
             send: None,
             link: 0,
+            tries: 0,
+            next_try: None,
             up_since: now,
             ping: None,
             next_ping_at: now,
@@ -311,6 +371,7 @@ pub fn spawn(cfg: &Config) -> Result<(Client, JoinHandle<()>), Error> {
     let inner = Inner {
         me: cfg.nodes[0].name.clone(),
         cfg: cfg.scheduler,
+        net: cfg.net,
         workers,
         reqs: HashMap::new(),
         queue: VecDeque::new(),
@@ -323,11 +384,17 @@ pub fn spawn(cfg: &Config) -> Result<(Client, JoinHandle<()>), Error> {
         tokens: Vec::new(),
         stages: Vec::new(),
         status: Status::default(),
+        cache: Arc::new(Mutex::new(CacheState {
+            cache: Cache::new(&cfg.cache, crate::cache::scope(cfg)),
+            served: VecDeque::new(),
+            shutting_down: false,
+        })),
     };
     for w in 0..inner.workers.len() {
         inner.reconnect(w);
     }
-    let board = Arc::new(Board { inner: Mutex::new(inner) });
+    let cache = inner.cache.clone();
+    let board = Arc::new(Board { inner: Mutex::new(inner), cache });
     let client = Client::new(tx, Some(board.clone()));
     let handle = thread::spawn(move || span.in_scope(|| run(board, rx)));
     Ok((client, handle))
@@ -364,6 +431,12 @@ fn unix_ms(at: Instant) -> u64 {
     t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// A time to come as Unix ms.
+fn unix_ms_ahead(at: Instant) -> u64 {
+    let t = SystemTime::now() + at.saturating_duration_since(Instant::now());
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
 fn ms(d: Duration) -> u64 {
     d.as_millis() as u64
 }
@@ -390,7 +463,9 @@ impl Board {
         let mut ids: Vec<u64> = b.reqs.keys().copied().filter(|id| !b.queue.contains(id)).collect();
         ids.sort_unstable();
         ids.extend(b.queue.iter().copied());
-        ids.iter().map(|id| b.request_view(&b.reqs[id])).collect()
+        let mut views: Vec<RequestView> = ids.iter().map(|id| b.request_view(&b.reqs[id])).collect();
+        views.extend(lock_cache(&self.cache).served.iter().cloned());
+        views
     }
 
     pub fn request(&self, id: u64) -> Option<RequestView> {
@@ -475,9 +550,60 @@ impl Board {
         Ok(b.view(w))
     }
 
+    /// Answers request `id` from the cache if it can, at once on the caller's thread.
+    /// Otherwise returns the probe, if any, for the scheduler to keep with the request.
+    pub(crate) fn from_cache(&self, id: u64, prompt: &[u32], max_new: usize, events: &Sender<Event>) -> Result<(), Option<Probe>> {
+        if prompt.is_empty() || max_new == 0 {
+            return Err(None);
+        }
+        let mut c = lock_cache(&self.cache);
+        if c.shutting_down {
+            return Err(None);
+        }
+        let Some(probe) = c.cache.probe(prompt, max_new) else { return Err(None) };
+        let Some(hit) = c.cache.lookup(&probe) else { return Err(Some(probe)) };
+        let now = unix_ms(Instant::now());
+        let sent = hit.answer.len() as u32;
+        if c.served.len() == SERVED_KEPT {
+            c.served.pop_front();
+        }
+        c.served.push_back(RequestView {
+            id,
+            worker: Some("controller".into()),
+            phase: "cached",
+            position: prompt.len() as u32 + sent,
+            prompt_tokens: prompt.len(),
+            tokens_sent: sent,
+            max_tokens: max_new,
+            submitted: now,
+            started: Some(now),
+            last_progress: Some(now),
+            waiting_ms: 0,
+            idle_ms: None,
+            retries: 0,
+            stuck: None,
+            cached: Some(CachedView { kind: hit.kind, similarity: hit.similarity, made_by: hit.worker.clone() }),
+        });
+        drop(c);
+        answer_from_cache(id, hit, events);
+        Ok(())
+    }
+
     /// The per-worker Prometheus series.
     pub fn series(&self) -> Vec<WorkerSeries> {
         self.lock().series()
+    }
+
+    /// The answer cache's counts and limits.
+    pub fn cache(&self) -> CacheStats {
+        lock_cache(&self.cache).cache.stats()
+    }
+
+    /// Empties the answer cache; returns how many answers it held.
+    pub fn clear_cache(&self) -> usize {
+        let n = lock_cache(&self.cache).cache.clear();
+        info!(entries = n, "answer cache cleared");
+        n
     }
 }
 
@@ -517,6 +643,8 @@ impl Inner {
                 request: *request,
                 message: m.clone(),
             }),
+            reconnect_tries: s.tries,
+            next_try: s.next_try.map(unix_ms_ahead),
         }
     }
 
@@ -546,6 +674,7 @@ impl Inner {
             idle_ms: r.started.map(|_| ms(r.last_progress.elapsed())),
             retries: r.retries,
             stuck,
+            cached: None,
         }
     }
 
@@ -596,9 +725,15 @@ impl Inner {
 
     fn handle(&mut self, m: Msg) {
         match m {
-            Msg::Submit { id, prompt, max_new, events } => self.submit(id, prompt, max_new, events),
+            Msg::Submit { id, prompt, max_new, events, probe } => self.submit(id, prompt, max_new, events, probe),
             Msg::Shutdown => self.begin_shutdown(),
             Msg::Requests(Note::Joined { worker, conn }) => self.joined(worker, conn),
+            Msg::Requests(Note::Retry { worker, tries, wait }) => {
+                let s = &mut self.workers[worker];
+                if s.send.is_none() {
+                    (s.tries, s.next_try) = (tries, Some(Instant::now() + wait));
+                }
+            }
             Msg::Requests(Note::Frame { worker, link, h, payload }) => {
                 if self.workers[worker].link == link && self.workers[worker].send.is_some() {
                     self.on_frame(worker, h, payload);
@@ -610,7 +745,7 @@ impl Inner {
                 }
             }
             // The other splits' messages.
-            Msg::Frame(..) | Msg::Partial { .. } | Msg::Reply { .. } | Msg::ClusterDown(_) => {}
+            Msg::Frame { .. } | Msg::Partial { .. } | Msg::Reply { .. } | Msg::ClusterDown { .. } | Msg::Rejoined(_) => {}
         }
     }
 
@@ -619,6 +754,7 @@ impl Inner {
             return;
         }
         self.shutting_down = true;
+        lock_cache(&self.cache).shutting_down = true;
         info!(active = self.reqs.len() - self.queue.len(), waiting = self.queue.len(), "shutting down");
         while let Some(id) = self.queue.pop_front() {
             let r = self.reqs.remove(&id).unwrap();
@@ -630,14 +766,16 @@ impl Inner {
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         for s in &mut self.workers {
-            if let Some(mut send) = s.send.take() {
-                send.close_send();
+            if let Some(send) = s.send.take() {
+                send.close();
             }
         }
         crate::stats::WORKERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
-    fn submit(&mut self, id: u64, prompt: Vec<u32>, max_new: usize, events: Sender<Event>) {
+    /// A request the cache did not answer; `probe` is its cache key, to fill the cache with
+    /// its answer.
+    fn submit(&mut self, id: u64, prompt: Vec<u32>, max_new: usize, events: Sender<Event>, probe: Option<Probe>) {
         let ready = self.ready();
         let reject = if self.shutting_down {
             Some("shutting down".to_string())
@@ -679,6 +817,8 @@ impl Inner {
             last_token: None,
             retries: 0,
             dropping: false,
+            probe,
+            answer: Vec::new(),
         };
         self.reqs.insert(id, r);
         self.queue.push_back(id);
@@ -777,6 +917,7 @@ impl Inner {
             conn.close_send();
             return;
         }
+        let conn = conn.with_max_chunk(self.net.max_chunk());
         let peer = conn.peer_addr();
         let (recv, send) = match conn.split() {
             Ok(halves) => halves,
@@ -788,11 +929,18 @@ impl Inner {
         let now = Instant::now();
         let s = &mut self.workers[w];
         s.link += 1;
+        let (link, tx, span) = (s.link, self.tx.clone(), self.span.clone());
+        // A failed write breaks the link as a failed read does.
+        let lost = tx.clone();
+        send.on_error(move |e| {
+            let _ = lost.send(Msg::Requests(Note::Lost { worker: w, link, reason: format!("send: {e}") }));
+        });
         s.send = Some(send);
         s.up_since = now;
         s.ping = None;
         s.next_ping_at = now;
-        let (link, tx, span) = (s.link, self.tx.clone(), self.span.clone());
+        s.tries = 0;
+        s.next_try = None;
         thread::spawn(move || span.in_scope(|| read_worker(w, link, recv, tx)));
         let to = self.up_state(w);
         self.set_state(w, to, format!("connected to {peer}"));
@@ -803,8 +951,9 @@ impl Inner {
     /// rest fail, and the worker reconnects in the background.
     fn lost(&mut self, w: usize, reason: String) {
         let s = &mut self.workers[w];
-        if let Some(mut send) = s.send.take() {
-            send.close_send();
+        // Nothing queued is worth waiting for: cut the link at once.
+        if let Some(send) = s.send.take() {
+            send.abort();
         }
         s.ping = None;
         s.last_error = Some((Instant::now(), None, format!("link lost: {reason}")));
@@ -838,25 +987,33 @@ impl Inner {
         self.dispatch();
     }
 
-    /// Connects to worker `w` in the background until it answers `Hello` with its name.
+    /// Connects to worker `w` in the background until it answers `Hello` with its name, with
+    /// backoff between tries, forever.
     fn reconnect(&self, w: usize) {
         let s = &self.workers[w];
         let (name, addr, me) = (s.name.clone(), s.addr.clone(), self.me.clone());
-        let (tx, stop, span) = (self.tx.clone(), self.stop.clone(), self.span.clone());
+        let (tx, stop, span, net) = (self.tx.clone(), self.stop.clone(), self.span.clone(), self.net);
         thread::spawn(move || {
             span.in_scope(|| {
-                let mut wait = Duration::from_millis(50);
+                let mut backoff = Backoff::new(&net);
                 while !stop.load(Ordering::Relaxed) {
-                    match Connection::connect(addr.as_str(), &me, Duration::from_secs(1)) {
+                    let why = match Connection::connect(addr.as_str(), &me, Duration::from_secs(1)) {
                         Ok(c) if c.peer_name() == name => {
                             let _ = tx.send(Msg::Requests(Note::Joined { worker: w, conn: c }));
                             return;
                         }
-                        Ok(c) => warn!(worker = name, addr, got = c.peer_name(), "a different node answered"),
-                        Err(e) => debug!(worker = name, addr, error = %e, "connect"),
+                        Ok(c) => format!("a different node answered: {}", c.peer_name()),
+                        Err(e) => e.to_string(),
+                    };
+                    let wait = backoff.failed();
+                    let tries = backoff.tries();
+                    info!(worker = name, addr, tries, wait_ms = ms(wait), error = why, "reconnect failed");
+                    let _ = tx.send(Msg::Requests(Note::Retry { worker: w, tries, wait }));
+                    // In short sleeps, so a shutdown is not held up.
+                    let until = Instant::now() + wait;
+                    while !stop.load(Ordering::Relaxed) && Instant::now() < until {
+                        thread::sleep(until.saturating_duration_since(Instant::now()).min(Duration::from_millis(50)));
                     }
-                    thread::sleep(wait);
-                    wait = (wait * 2).min(Duration::from_secs(1));
                 }
             })
         });
@@ -893,6 +1050,10 @@ impl Inner {
                     STATS.requests_done.add(1);
                     self.workers[w].done += 1;
                     let _ = r.events.send(Event::Done);
+                    let complete = matches!(reason, "length" | "eos") && r.answer.len() == r.sent as usize;
+                    if let Some(p) = r.probe.filter(|_| complete) {
+                        lock_cache(&self.cache).cache.insert(p, r.answer, &self.workers[w].name);
+                    }
                 }
                 self.dispatch();
             }
@@ -977,6 +1138,9 @@ impl Inner {
             r.decoding = true;
             r.last_progress = now;
             r.last_token = Some(now);
+            if r.probe.is_some() {
+                r.answer.push(token);
+            }
             s.tokens.add(now, 1, RATE_WINDOW);
             STATS.tokens_generated.add(1);
             if r.events.send(Event::Token { token, latency }).is_err() {
@@ -1037,6 +1201,32 @@ impl Inner {
         STATS.requests_waiting.store(self.queue.len() as u64, Ordering::Relaxed);
         *crate::stats::WORKERS.lock().unwrap_or_else(|e| e.into_inner()) = self.series();
     }
+}
+
+/// Streams a cached answer to the client, as a worker's tokens would come.
+fn answer_from_cache(id: u64, hit: Hit, events: &Sender<Event>) {
+    info!(
+        request = id,
+        phase = "cached",
+        worker = "controller",
+        kind = hit.kind,
+        similarity = format_args!("{:.4}", hit.similarity),
+        made_by = hit.worker,
+        age_s = hit.age.as_secs(),
+        hits = hit.hits,
+        generated = hit.answer.len(),
+        "cache hit"
+    );
+    for &token in &hit.answer {
+        if events.send(Event::Token { token, latency: Duration::ZERO }).is_err() {
+            info!(request = id, "cancelled by the client");
+            STATS.requests_cancelled.add(1);
+            return;
+        }
+    }
+    STATS.tokens_generated.add(hit.answer.len() as u64);
+    STATS.requests_done.add(1);
+    let _ = events.send(Event::Done);
 }
 
 /// Receives what one worker sends and hands it to the scheduler; reports when the link ends.

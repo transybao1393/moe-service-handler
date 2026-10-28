@@ -9,3 +9,6 @@ rust-version.workspace = true
 [[bin]]
 name = "msh-probe"
 path = "src/bin/msh-probe.rs"
+
+[dependencies]
+libc = "0.2"

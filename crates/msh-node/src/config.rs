@@ -98,6 +98,39 @@
 //! An optional `[service]` table sets `mem_allowance_mib` (default 256): memory for the
 //! service itself (network buffers, requests, HTTP, metrics), beside the engine's cap (NF-2).
 //!
+//! An optional `[net]` table tunes the links between the controller and the workers:
+//!
+//! ```toml
+//! [net]
+//! max_chunk_kib = 64       # largest frame payload (4..=4096); bigger messages go in chunks,
+//!                          # so a token or ping waits at most one chunk behind a prompt chunk
+//! reconnect_min_ms = 500   # first wait before reconnecting a lost worker, doubled each try
+//! reconnect_max_ms = 10000 # longest wait between tries; the controller tries forever
+//! ```
+//!
+//! Every split reconnects a lost worker in the background. On the layer and expert splits the
+//! cluster is down until every worker is back (in-flight requests fail, new ones are refused),
+//! then serves again by itself. A worker that hears nothing from the controller for
+//! `health_timeout_ms` (the controller pings every `health_interval_ms`) drops the link, frees
+//! what it held and waits for the next controller.
+//!
+//! An optional `[cache]` table sets the controller's answer cache on the request split
+//! ([`crate::cache`]): prompts it has answered, kept in its own RAM inside the service
+//! allowance. `mode = "exact"` (the default) answers a repeat of a prompt, token for token, from
+//! the cache; `"similar"` also answers a prompt whose vector is within `similar_threshold` of
+//! one cached (cosine), which changes answers, so it is opt-in; `"off"` keeps nothing. Least
+//! recently used entries go first past `max_entries` or `max_mib`. `bits` is the TurboQuant
+//! width of the prompt vectors (2, 3 or 4):
+//!
+//! ```toml
+//! [cache]
+//! mode = "similar"
+//! similar_threshold = 0.98
+//! max_entries = 10000
+//! max_mib = 32
+//! bits = 4
+//! ```
+//!
 //! An optional `[log]` table sets the log (NF-5). `RUST_LOG` overrides `level`.
 //!
 //! ```toml
@@ -136,7 +169,82 @@ pub struct Config {
     pub log: LogConfig,
     #[serde(default)]
     pub service: ServiceConfig,
+    #[serde(default)]
+    pub net: NetConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
     pub nodes: Vec<NodeConfig>,
+}
+
+/// What the controller's answer cache keeps and answers (request split only).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheMode {
+    Off,
+    /// A prompt seen before, token for token.
+    #[default]
+    Exact,
+    /// Also a prompt close enough to one seen before.
+    Similar,
+}
+
+impl CacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheMode::Off => "off",
+            CacheMode::Exact => "exact",
+            CacheMode::Similar => "similar",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    pub mode: CacheMode,
+    /// Least cosine between prompt vectors for a similar hit.
+    pub similar_threshold: f32,
+    pub max_entries: usize,
+    pub max_mib: f64,
+    /// TurboQuant bits per coordinate of a prompt vector.
+    pub bits: u32,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        CacheConfig { mode: CacheMode::Exact, similar_threshold: 0.98, max_entries: 10_000, max_mib: 32.0, bits: 4 }
+    }
+}
+
+impl CacheConfig {
+    pub fn max_bytes(&self) -> u64 {
+        (self.max_mib * (1u64 << 20) as f64) as u64
+    }
+}
+
+/// The links between the controller and the workers.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetConfig {
+    /// Largest frame payload in KiB; bigger messages are sent in chunks of this size.
+    pub max_chunk_kib: usize,
+    /// First wait before reconnecting a lost worker; doubled after each failed try.
+    pub reconnect_min_ms: u64,
+    /// Longest wait between tries.
+    pub reconnect_max_ms: u64,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        NetConfig { max_chunk_kib: 64, reconnect_min_ms: 500, reconnect_max_ms: 10_000 }
+    }
+}
+
+impl NetConfig {
+    /// The largest frame payload in bytes.
+    pub fn max_chunk(&self) -> usize {
+        self.max_chunk_kib << 10
+    }
 }
 
 /// How the model is divided across the nodes.
@@ -373,6 +481,23 @@ impl Config {
         }
         if self.nodes.is_empty() {
             return bad("no nodes".into());
+        }
+        let n = &self.net;
+        if !(4..=4096).contains(&n.max_chunk_kib) {
+            return bad(format!("net.max_chunk_kib = {} must be 4..=4096", n.max_chunk_kib));
+        }
+        if n.reconnect_min_ms == 0 || n.reconnect_min_ms > n.reconnect_max_ms {
+            return bad("net.reconnect_min_ms must be positive and at most net.reconnect_max_ms".into());
+        }
+        let c = &self.cache;
+        if !(2..=4).contains(&c.bits) {
+            return bad(format!("cache.bits = {} must be 2, 3 or 4", c.bits));
+        }
+        if !(c.similar_threshold > 0.0 && c.similar_threshold <= 1.0) {
+            return bad(format!("cache.similar_threshold = {} must be in (0, 1]", c.similar_threshold));
+        }
+        if c.max_entries == 0 || !(c.max_mib > 0.0 && c.max_mib.is_finite()) {
+            return bad("cache.max_entries and cache.max_mib must be positive".into());
         }
         for (i, n) in self.nodes.iter().enumerate() {
             if self.nodes[..i].iter().any(|m| m.name == n.name) {
@@ -641,6 +766,51 @@ mod tests {
         assert!(Config::parse(&alone).is_err(), "no worker");
         let streammoe = text.replace("[scheduler]", "[engine]\nkind = \"streammoe\"\nmodel_dir = \"/m\"\n[scheduler]");
         assert!(Config::parse(&streammoe).is_ok());
+    }
+
+    #[test]
+    fn cache_section() {
+        let c = Config::parse(THREE).unwrap();
+        assert_eq!((c.cache.mode, c.cache.similar_threshold, c.cache.bits), (CacheMode::Exact, 0.98, 4));
+        assert_eq!(c.cache.max_bytes(), 32 << 20);
+        let text = |t: &str| THREE.replace("num_layers = 40", &format!("num_layers = 40\n[cache]\n{t}"));
+        let c = Config::parse(&text("mode = \"similar\"\nsimilar_threshold = 0.9\nmax_entries = 5\nmax_mib = 0.5\nbits = 3")).unwrap();
+        assert_eq!((c.cache.mode, c.cache.similar_threshold, c.cache.max_entries, c.cache.bits), (CacheMode::Similar, 0.9, 5, 3));
+        assert_eq!(Config::parse(&text("mode = \"off\"")).unwrap().cache.mode, CacheMode::Off);
+        for bad in ["bits = 1", "bits = 5", "similar_threshold = 0", "similar_threshold = 1.5", "max_entries = 0", "max_mib = 0", "mode = \"fuzzy\"", "size = 1"] {
+            assert!(Config::parse(&text(bad)).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn net_section() {
+        let c = Config::parse(THREE).unwrap();
+        assert_eq!((c.net.max_chunk(), c.net.reconnect_min_ms, c.net.reconnect_max_ms), (64 << 10, 500, 10_000));
+        let text = |t: &str| THREE.replace("num_layers = 40", &format!("num_layers = 40\n[net]\n{t}"));
+        let c = Config::parse(&text("max_chunk_kib = 4\nreconnect_min_ms = 50\nreconnect_max_ms = 50")).unwrap();
+        assert_eq!((c.net.max_chunk(), c.net.reconnect_min_ms), (4096, 50));
+        assert!(Config::parse(&text("max_chunk_kib = 4096")).is_ok());
+        for bad in ["max_chunk_kib = 3", "max_chunk_kib = 4097", "reconnect_min_ms = 0", "reconnect_min_ms = 20000", "chunk = 1"] {
+            assert!(Config::parse(&text(bad)).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn kv_format_parses_on_every_split() {
+        let layerless = THREE.replace("layers = [0, 20]", "").replace("layers = [20, 30]", "").replace("layers = [30, 40]", "");
+        for (split, text, kind) in [
+            ("layers", THREE.to_string(), "streammoe"),
+            ("requests", layerless.clone(), "streammoe"),
+            // The expert split runs the mock only, which has no KV cache; the setting still parses.
+            ("experts", layerless, "mock"),
+        ] {
+            let text = text.replace(
+                "num_layers = 40",
+                &format!("num_layers = 40\nsplit = \"{split}\"\n[engine]\nkind = \"{kind}\"\nmodel_dir = \"/m\"\nkv_format = \"turbo3\""),
+            );
+            let c = Config::parse(&text).unwrap_or_else(|e| panic!("{split}: {e}"));
+            assert_eq!(c.engine.kv_format, KvFormat::Turbo3, "{split}");
+        }
     }
 
     #[test]

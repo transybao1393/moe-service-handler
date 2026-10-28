@@ -12,7 +12,7 @@ use std::path::Path;
 
 use streammoe::{Ctx, OpenConfig, ReqId, StageInput, StageOutput};
 
-use crate::config::{KvFormat, PrefetchGuess};
+use crate::config::{expand_home, Config, KvFormat, PrefetchGuess};
 use crate::engine::{Engine, Sample, StageIn};
 use crate::Error;
 
@@ -59,6 +59,33 @@ impl<'a> OpenSpec<'a> {
             fast_experts_dir: None,
         }
     }
+}
+
+/// Calls `f` with the open settings for `layers` on this config. Every split opens and plans
+/// through here, so the `[engine]` table reaches streammoe the same way on each.
+pub fn with_spec<T>(
+    cfg: &Config,
+    layers: std::ops::Range<u32>,
+    mem_cap: Option<u64>,
+    f: impl FnOnce(&OpenSpec) -> T,
+) -> T {
+    let model_dir = expand_home(&cfg.engine.model_dir);
+    let fast_experts_dir = cfg.engine.fast_experts_dir.as_deref().map(expand_home);
+    f(&OpenSpec {
+        model_dir: &model_dir,
+        layers,
+        n_ctx: cfg.engine.n_ctx,
+        mem_cap,
+        max_requests: cfg.scheduler.engine_slots(),
+        prefill_chunk: cfg.scheduler.prefill_chunk,
+        kv_format: cfg.engine.kv_format,
+        attn_threads: cfg.engine.attn_threads,
+        runtime_overhead: cfg.engine.runtime_overhead(),
+        experts_dir: &cfg.engine.experts_dir,
+        prefetch_guess: cfg.engine.prefetch_guess,
+        prefetch_experts: cfg.engine.prefetch_experts,
+        fast_experts_dir: fast_experts_dir.as_deref(),
+    })
 }
 
 pub struct StreamMoeEngine {
@@ -117,6 +144,10 @@ pub struct RangeBudget {
     pub hot_tier: u64,
     /// Every expert of the range (4-bit size).
     pub range_experts: u64,
+    /// Part of `fixed`: the KV cache of every request slot at `n_ctx`.
+    pub kv: u64,
+    /// Part of `fixed`: the f32 prefill scratch a quantized KV cache needs (0 for f32).
+    pub kv_scratch: u64,
 }
 
 /// Plans layer ranges against a cap as streammoe's open does, for the planner. Experts count
@@ -162,14 +193,17 @@ impl Budgeter {
             cfg.resolved_prefill_chunk(),
         );
         plan.set(Account::HostBuffers, cfg.host_buffers);
+        let kv = cfg.max_requests as u64 * kv_bytes_per_token_fmt(v, &range, cfg.kv_format) * cfg.n_ctx as u64;
+        let mut kv_scratch = 0;
         if cfg.kv_format != streammoe::KvFormat::F32 {
-            let kv = kv_bytes_per_token_fmt(v, &range, cfg.kv_format);
-            plan.set(Account::Kv, cfg.max_requests as u64 * kv * cfg.n_ctx as u64);
-            plan.set(Account::KvScratch, kv_scratch_bytes(v, &range, cfg.n_ctx, cfg.kv_format));
+            kv_scratch = kv_scratch_bytes(v, &range, cfg.n_ctx, cfg.kv_format);
+            plan.set(Account::Kv, kv);
+            plan.set(Account::KvScratch, kv_scratch);
         }
         let range_experts = range.len() as u64 * v.num_experts as u64 * v.expert_size_4bit() as u64;
         let fixed = plan.total();
-        RangeBudget { fixed, hot_tier: cap.saturating_sub(fixed).min(range_experts), range_experts }
+        let hot_tier = cap.saturating_sub(fixed).min(range_experts);
+        RangeBudget { fixed, hot_tier, range_experts, kv, kv_scratch }
     }
 }
 
@@ -274,4 +308,54 @@ fn argmax(v: &[f32]) -> u32 {
         }
     }
     best as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Split;
+
+    const NODES: &str = r#"
+        [[nodes]]
+        name = "a"
+        addr = "127.0.0.1:1"
+        LAYERS_A
+        [[nodes]]
+        name = "b"
+        addr = "127.0.0.1:2"
+        LAYERS_B
+    "#;
+
+    fn config(split: &str, kv: &str, layers: [&str; 2]) -> Config {
+        let text = format!(
+            "hidden_dim = 2048\nnum_layers = 16\nsplit = \"{split}\"\n[engine]\nkind = \"streammoe\"\nmodel_dir = \"/m\"\nkv_format = \"{kv}\"\n{}",
+            NODES.replace("LAYERS_A", layers[0]).replace("LAYERS_B", layers[1])
+        );
+        Config::parse(&text).unwrap()
+    }
+
+    #[test]
+    fn kv_format_reaches_streammoe_on_every_split_that_opens_it() {
+        let formats = [
+            ("f32", streammoe::KvFormat::F32),
+            ("f16", streammoe::KvFormat::F16),
+            ("turbo4", streammoe::KvFormat::Turbo4),
+            ("turbo3", streammoe::KvFormat::Turbo3),
+        ];
+        for (name, want) in formats {
+            let layers = config("layers", name, ["layers = [0, 8]", "layers = [8, 16]"]);
+            let requests = config("requests", name, ["", ""]);
+            assert_eq!(requests.split, Split::Requests);
+            for cfg in [&layers, &requests] {
+                // Every node that opens an engine: both on the layer split, the workers on the
+                // request split (its controller opens none).
+                let opened: Vec<_> = (0..cfg.nodes.len()).filter_map(|i| cfg.layers_of(i)).collect();
+                assert!(!opened.is_empty());
+                for r in opened {
+                    let got = with_spec(cfg, r, Some(3 << 30), |s| (s.kv_format, open_config(s).kv_format));
+                    assert!(got.0 == cfg.engine.kv_format && got.1 == want, "{name} on {:?}", cfg.split);
+                }
+            }
+        }
+    }
 }

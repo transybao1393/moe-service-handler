@@ -8,7 +8,7 @@ split = "requests"
 kind = "streammoe"
 model_dir = "~/models/olmoe-1b-7b"
 n_ctx = 2048
-mem_cap_gib = 3.0
+mem_cap_gib = 4.0  # f32 KV: a whole-model worker needs 3.17 GiB fixed
 
 [http]
 listen = "127.0.0.1:8080"

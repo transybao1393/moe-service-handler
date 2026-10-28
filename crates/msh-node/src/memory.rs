@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::config::{Config, Split};
+use crate::config::{CacheMode, Config, Split};
 
 /// Largest HTTP request body accepted.
 pub const HTTP_BODY_LIMIT: usize = 1 << 20;
@@ -68,16 +68,29 @@ pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
     let positions = s.prefill_chunk.max(1).max(1 + s.max_draft) as u64;
     let mut b = Budget::default();
     let workers = cfg.nodes.len() as u64 - 1;
-    // A read and a write buffer per connection: one to each worker on the controller, one to
-    // the controller on a worker.
+    // One connection to each worker on the controller, one to the controller on a worker.
     let links = if idx == 0 { workers } else { 1 };
     if workers > 0 {
-        b.items.push(("connections", links * 2 * msh_net::conn::BUFFER_BYTES as u64));
+        b.items.push(("connections", links * connection_bytes(cfg)));
     }
     // Expert split: each layer's picks come back as one output row per pick. A `Move` carries
     // one expert's weights, counted with the engine's.
     let picks = cfg.experts.top_k as u64;
     let experts = cfg.split == Split::Experts;
+    if workers > 0 {
+        // The biggest message a link sends and receives this way: a prompt chunk's rows, or on
+        // the expert split a layer's output rows, one per pick.
+        let chunk = positions * row;
+        let (send, recv) = match (experts, idx) {
+            (false, _) => (chunk, chunk),
+            (true, 0) => (chunk, picks * chunk),
+            (true, _) => (picks * chunk, chunk),
+        };
+        // Messages a link has on the way at once: a step per request in flight, and on the
+        // layer split `prefill_depth` prompt chunks of each.
+        let depth = if experts { 1 } else { s.prefill_depth.max(1) as u64 };
+        link_buffers(&mut b, links, s.max_in_flight.max(1) as u64 * depth, send, recv);
+    }
     if idx == 0 && experts {
         // Per request in flight: its rows, the rows the experts take, one output row per pick,
         // and the workers' partials on their way in (one row per pick in all).
@@ -111,26 +124,58 @@ pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
 /// [`growth`] on the request split. The controller holds token ids, never hidden states: every
 /// request in flight on any worker or queued keeps its prompt (for a retry) up to n_ctx ids,
 /// and one `Start` payload is built at a time. A worker holds its requests' token ids, the
-/// `Start` read off the wire, and the engine's output for a prompt chunk.
+/// `Start` read off the wire, and the engine's output for a prompt chunk. The controller's
+/// answer cache holds up to `max_mib`, and each request kept for it its answer so far (up to
+/// n_ctx ids) and in similar mode its prompt vector; a similar lookup builds one query table.
 fn growth_requests(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
     let s = &cfg.scheduler;
     let workers = cfg.nodes.len() as u64 - 1;
     let ids = cfg.engine.n_ctx as u64 * 4;
     let mut b = Budget::default();
     let links = if idx == 0 { workers } else { 1 };
-    b.items.push(("connections", links * 2 * msh_net::conn::BUFFER_BYTES as u64));
+    b.items.push(("connections", links * connection_bytes(cfg)));
     b.items.push(("frames", ids));
+    // A `Start` per request a worker runs; every other frame is small. No rows to pool.
+    let starts = s.max_in_flight.max(1) as u64;
+    let (send, recv) = if idx == 0 { (ids, 0) } else { (0, ids) };
+    link_buffers(&mut b, links, starts, send, recv);
+    b.items.retain(|&(k, _)| k != "row pool");
     if idx == 0 {
         let held = workers * s.max_in_flight.max(1) as u64 + s.max_queue as u64;
         b.items.push(("requests", held * ids));
         if serves_http {
             b.items.push(("http bodies", http_max_open(cfg) as u64 * HTTP_BODY_LIMIT as u64));
         }
+        let c = &cfg.cache;
+        if c.mode != CacheMode::Off {
+            let similar = c.mode == CacheMode::Similar;
+            let vector = if similar { crate::cache::VECTOR_DIM as u64 * 4 } else { 0 };
+            // At most two 4-bit codes per byte, a float per byte value.
+            let table = if similar { crate::cache::VECTOR_DIM as u64 / 2 * 256 * 4 } else { 0 };
+            b.items.push(("cache", c.max_bytes() + held * (ids + vector) + table));
+        }
     } else {
         b.items.push(("requests", s.max_in_flight.max(1) as u64 * ids));
         b.items.push(("hidden", s.prefill_chunk.max(1) as u64 * cfg.hidden_dim as u64 * 4));
     }
     b
+}
+
+/// A connection's read buffer, the unused write buffer its receiving half keeps, and its
+/// writer's batch of small frames and one chunk's header.
+fn connection_bytes(cfg: &Config) -> u64 {
+    (2 * msh_net::conn::BUFFER_BYTES + cfg.net.max_chunk()) as u64
+}
+
+/// Buffers the chunked links add, for `links` links with up to `n` messages each on the way,
+/// the biggest sent `send` bytes and received `recv`: the writer's queue (bounded at
+/// [`msh_net::writer::BULK_QUEUE_BYTES`] plus the message that fills it), messages being
+/// joined from their chunks, and the spare row buffers kept for reuse.
+fn link_buffers(b: &mut Budget, links: u64, n: u64, send: u64, recv: u64) {
+    let bulk = msh_net::writer::BULK_QUEUE_BYTES as u64;
+    b.items.push(("writer queues", links * (n * send).min(bulk + send)));
+    b.items.push(("chunk buffers", links * n * recv));
+    b.items.push(("row pool", msh_net::writer::POOL_BUFFERS as u64 * send.max(recv)));
 }
 
 /// HTTP requests open at once: as many as the scheduler can hold. More get 429 before their
@@ -204,7 +249,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn footprint_counts_written_memory() {
         let before = footprint().unwrap();
-        let block = vec![1u8; 64 << 20];
+        let block = std::hint::black_box(vec![1u8; 64 << 20]);
         let after = footprint().unwrap();
         assert!(after >= before + (60 << 20), "{before} -> {after}");
         drop(block);
@@ -224,39 +269,77 @@ mod tests {
         assert_eq!(item(&coord, "frames"), Some(2 * 64 * 2048 * 4));
         assert_eq!(item(&coord, "requests"), Some(8 * 2048 * 4));
         assert_eq!(item(&coord, "http bodies"), Some(8 << 20));
-        assert_eq!(item(&coord, "connections"), Some(512 << 10));
+        let conn = 2 * (32 << 10) + (64 << 10);
+        assert_eq!(item(&coord, "connections"), Some(conn));
         let worker = growth(&cfg, 1, false);
-        assert_eq!(item(&worker, "connections"), Some(512 << 10));
+        assert_eq!(item(&worker, "connections"), Some(conn));
         assert_eq!(item(&worker, "frames"), Some(2 * 64 * 2048 * 4));
         assert_eq!(item(&worker, "requests"), None);
     }
 
     #[test]
+    fn growth_counts_the_chunked_links() {
+        let text = |net: &str| {
+            format!(
+                "hidden_dim = 2048\nnum_layers = 40\n[scheduler]\nprefill_chunk = 64\nmax_in_flight = 3\nprefill_depth = 2\n{net}\n\
+                 [[nodes]]\nname = \"a\"\naddr = \"127.0.0.1:1\"\nlayers = [0, 10]\n\
+                 [[nodes]]\nname = \"b\"\naddr = \"127.0.0.1:2\"\nlayers = [10, 20]\n\
+                 [[nodes]]\nname = \"c\"\naddr = \"127.0.0.1:3\"\nlayers = [20, 40]\n"
+            )
+        };
+        let item = |b: &Budget, n: &str| b.items.iter().find(|(k, _)| *k == n).map(|(_, v)| *v).unwrap();
+        let chunk = 64 * 2048 * 4;
+        let coord = growth(&Config::parse(&text("")).unwrap(), 0, false);
+        // Two links, each with up to 3 requests × 2 prompt chunks on the way.
+        assert_eq!(item(&coord, "writer queues"), 2 * 6 * chunk);
+        assert_eq!(item(&coord, "chunk buffers"), 2 * 6 * chunk);
+        assert_eq!(item(&coord, "row pool"), 8 * chunk);
+        assert_eq!(item(&coord, "connections"), 2 * (2 * (32 << 10) + (64 << 10)));
+        // Bigger chunks need a bigger batch; a long queue stops at the bound.
+        let big = Config::parse(&text("[net]\nmax_chunk_kib = 1024").replace("max_in_flight = 3", "max_in_flight = 8")).unwrap();
+        let g = growth(&big, 1, false);
+        assert_eq!(item(&g, "connections"), 2 * (32 << 10) + (1 << 20));
+        assert_eq!(item(&g, "writer queues"), (4 << 20) + chunk);
+        assert_eq!(item(&g, "chunk buffers"), 16 * chunk);
+    }
+
+    #[test]
     fn growth_on_the_request_split() {
-        let cfg = Config::parse(
+        let text = String::from(
             "hidden_dim = 2048\nnum_layers = 40\nsplit = \"requests\"\n\
              [scheduler]\nprefill_chunk = 64\nmax_in_flight = 2\nmax_queue = 5\n\
              [engine]\nn_ctx = 4096\n\
              [[nodes]]\nname = \"m4\"\naddr = \"127.0.0.1:1\"\n\
              [[nodes]]\nname = \"m1\"\naddr = \"127.0.0.1:2\"\n\
              [[nodes]]\nname = \"m4b\"\naddr = \"127.0.0.1:3\"\n",
-        )
-        .unwrap();
+        );
+        let cfg = Config::parse(&text).unwrap();
         let item = |b: &Budget, n: &str| b.items.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
         let ids = 4096 * 4;
         let coord = growth(&cfg, 0, true);
-        assert_eq!(item(&coord, "connections"), Some(2 * (512 << 10)));
+        let conn = 2 * (32 << 10) + (64 << 10);
+        assert_eq!(item(&coord, "connections"), Some(2 * conn));
+        // A `Start` per request in flight on each link, and no rows to pool.
+        assert_eq!((item(&coord, "writer queues"), item(&coord, "row pool")), (Some(2 * 2 * ids), None));
         // Two per worker in flight and five queued, each up to n_ctx ids; no hidden states.
         assert_eq!(item(&coord, "requests"), Some(9 * ids));
         assert_eq!(item(&coord, "frames"), Some(ids));
         assert_eq!(item(&coord, "hidden"), None);
         assert_eq!(item(&coord, "http bodies"), Some(9 << 20));
+        // The answer cache, and each request's answer on its way to it.
+        assert_eq!(item(&coord, "cache"), Some((32 << 20) + 9 * ids));
         let worker = growth(&cfg, 1, false);
-        assert_eq!(item(&worker, "connections"), Some(512 << 10));
+        assert_eq!(item(&worker, "connections"), Some(conn));
+        assert_eq!(item(&worker, "chunk buffers"), Some(2 * ids));
         assert_eq!(item(&worker, "requests"), Some(2 * ids));
         assert_eq!(item(&worker, "hidden"), Some(64 * 2048 * 4));
+        assert_eq!(item(&worker, "cache"), None);
         // Well inside 256 MiB on both.
-        assert!(coord.total() < 16 << 20 && worker.total() < 4 << 20);
+        assert!(coord.total() < 48 << 20 && worker.total() < 4 << 20);
+        let similar = Config::parse(&text.replace("n_ctx = 4096", "n_ctx = 4096\n[cache]\nmode = \"similar\"\nmax_mib = 8")).unwrap();
+        assert_eq!(item(&growth(&similar, 0, true), "cache"), Some((8 << 20) + 9 * (ids + 1024) + (128 << 10)));
+        let off = Config::parse(&text.replace("n_ctx = 4096", "n_ctx = 4096\n[cache]\nmode = \"off\"")).unwrap();
+        assert_eq!(item(&growth(&off, 0, true), "cache"), None);
     }
 
     #[test]
@@ -273,15 +356,21 @@ mod tests {
         let row = 2048 * 4;
         let coord = growth(&cfg, 0, false);
         // A link to each worker; per request in flight 2 + 2 × 8 rows per position.
-        assert_eq!(item(&coord, "connections"), Some(2 * (512 << 10)));
+        let conn = 2 * (32 << 10) + (64 << 10);
+        assert_eq!(item(&coord, "connections"), Some(2 * conn));
+        // Each link: a layer's rows out per request in flight, a pick's output row back for
+        // each of its positions.
+        assert_eq!(item(&coord, "writer queues"), Some(2 * 3 * 64 * row));
+        assert_eq!(item(&coord, "chunk buffers"), Some(2 * 3 * 8 * 64 * row));
         assert_eq!(item(&coord, "frames"), Some(3 * 18 * 64 * row));
         assert_eq!(item(&coord, "requests"), Some(8 * 2048 * 4));
         for w in [1, 2] {
             let worker = growth(&cfg, w, false);
-            assert_eq!(item(&worker, "connections"), Some(512 << 10));
+            assert_eq!(item(&worker, "connections"), Some(conn));
             assert_eq!(item(&worker, "frames"), Some(9 * 64 * row));
         }
-        // 27 MiB of frames on the controller, 4.5 MiB on a worker: well inside 256 MiB.
-        assert!(coord.total() < 64 << 20 && growth(&cfg, 1, false).total() < 8 << 20);
+        // 27 MiB of frames on the controller and 59 MiB for its links, 4.5 and 46 MiB on a
+        // worker: inside 256 MiB.
+        assert!(coord.total() < 128 << 20 && growth(&cfg, 1, false).total() < 64 << 20);
     }
 }

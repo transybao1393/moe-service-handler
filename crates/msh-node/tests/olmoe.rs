@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use msh_node::config::{expand_home, Config, NodeConfig, PrefetchGuess};
+use msh_node::config::{expand_home, Config, KvFormat, NodeConfig, PrefetchGuess};
 use msh_node::streammoe_engine::{OpenSpec, StreamMoeEngine};
 use msh_node::node::{accept_controller, connect_workers, Worker};
 use msh_node::scheduler::{self, collect, Client, SchedulerConfig};
@@ -34,9 +34,17 @@ fn model_dir() -> PathBuf {
 
 /// streammoe's cap is checked against the whole process's footprint, so it only holds with one
 /// context per process, as in a real deployment. A cluster of threads runs uncapped.
+///
+/// Always f32 KV, whatever the deployment configs use: these tests check the split against the
+/// MLX reference token for token, and a TurboQuant KV cache changes the wording.
 fn open(layers: std::ops::Range<u32>, max_requests: usize, mem_cap: Option<u64>) -> StreamMoeEngine {
+    open_kv(layers, max_requests, mem_cap, KvFormat::F32)
+}
+
+fn open_kv(layers: std::ops::Range<u32>, max_requests: usize, mem_cap: Option<u64>, kv_format: KvFormat) -> StreamMoeEngine {
     let dir = model_dir();
-    StreamMoeEngine::open(&OpenSpec { n_ctx: 512, mem_cap, max_requests, ..OpenSpec::new(&dir, layers) })
+    let spec = OpenSpec { n_ctx: 512, mem_cap, max_requests, kv_format, ..OpenSpec::new(&dir, layers) };
+    StreamMoeEngine::open(&spec)
         .expect("open OLMoE (is the model converted at ~/models/olmoe-1b-7b?)")
 }
 
@@ -68,6 +76,10 @@ fn start(splits: &[[u32; 2]]) -> Cluster {
 }
 
 fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
+    start_kv(splits, sched, KvFormat::F32)
+}
+
+fn start_kv(splits: &[[u32; 2]], sched: SchedulerConfig, kv_format: KvFormat) -> Cluster {
     let cap = (splits.len() == 1).then_some(3 << 30);
     let listeners: Vec<TcpListener> = splits.iter().map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
     let cfg = Config {
@@ -81,6 +93,8 @@ fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
         metrics: None,
         log: Default::default(),
         service: Default::default(),
+        net: Default::default(),
+        cache: Default::default(),
         nodes: splits
             .iter()
             .zip(&listeners)
@@ -101,13 +115,13 @@ fn start_with(splits: &[[u32; 2]], sched: SchedulerConfig) -> Cluster {
     let mut threads = Vec::new();
     for (k, l) in listeners.enumerate() {
         let (i, cfg) = (k + 1, cfg.clone());
-        let engine = open(cfg.nodes[i].layer_range(), sched.engine_slots(), cap);
+        let engine = open_kv(cfg.nodes[i].layer_range(), sched.engine_slots(), cap, kv_format);
         threads.push(thread::spawn(move || {
             let link = accept_controller(&cfg, i, l).unwrap();
             Worker::new(engine, link, &cfg.nodes[i].name).run().unwrap();
         }));
     }
-    let engine = open(cfg.nodes[0].layer_range(), sched.engine_slots(), cap);
+    let engine = open_kv(cfg.nodes[0].layer_range(), sched.engine_slots(), cap, kv_format);
     drop(coord_listener);
     let star = connect_workers(&cfg, Duration::from_secs(30)).unwrap();
     let (client, coordinator) = scheduler::spawn(engine, star, sched);
@@ -175,6 +189,9 @@ fn request_split_two_workers_match_the_reference() {
         metrics: None,
         log: Default::default(),
         service: Default::default(),
+        net: Default::default(),
+        // The same prompt four times: every one is for the workers.
+        cache: msh_node::config::CacheConfig { mode: msh_node::config::CacheMode::Off, ..Default::default() },
         nodes,
     };
     cfg.validate().unwrap();
@@ -286,4 +303,154 @@ fn http_chat_completion_answers_with_the_reference() {
     });
     assert_eq!(resp["choices"][0]["message"]["content"], "The capital of France is Paris.");
     assert_eq!(resp["usage"]["prompt_tokens"], PROMPT.len());
+}
+
+#[test]
+#[ignore = "needs the OLMoE model on disk"]
+fn three_node_cluster_matches_one_node_on_turbo4_kv() {
+    // TurboQuant changes the tokens against f32, but each node quantizes its own layers' KV as
+    // one process would, so a layer split still matches one process on the same format.
+    let sched = SchedulerConfig { prefill_chunk: 8, ..Default::default() };
+    let one = start_kv(&[[0, 16]], sched, KvFormat::Turbo4).generate(PROMPT.to_vec(), 32).unwrap().tokens;
+    let three = start_kv(&[[0, 8], [8, 12], [12, 16]], sched, KvFormat::Turbo4).generate(PROMPT.to_vec(), 32).unwrap().tokens;
+    assert_eq!(three, one);
+}
+
+/// Set in the child processes of [`kv_formats_compared`]: the one format that process runs.
+const KV_BENCH_FORMAT: &str = "MSH_KV_BENCH_FORMAT";
+const KV_FORMATS: [(&str, KvFormat); 4] =
+    [("f32", KvFormat::F32), ("f16", KvFormat::F16), ("turbo4", KvFormat::Turbo4), ("turbo3", KvFormat::Turbo3)];
+const KV_BENCH_PROMPTS: [&str; 4] = [
+    "Write a short story about a lighthouse keeper who finds a message in a bottle.",
+    "Explain how a refrigerator keeps food cold, step by step.",
+    "Write a Python function that checks whether a string is a palindrome, then explain it.",
+    "List ten facts about the planet Mars.",
+];
+const KV_BENCH_TOKENS: usize = 128;
+
+/// The lifetime peak of the process's physical footprint, in bytes.
+fn peak_footprint() -> u64 {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: `info` is a valid buffer for the V4 flavour, which the kernel fills.
+    let rc = unsafe {
+        libc::proc_pid_rusage(std::process::id() as i32, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast())
+    };
+    assert_eq!(rc, 0, "proc_pid_rusage");
+    // SAFETY: filled on success.
+    unsafe { info.assume_init() }.ri_lifetime_max_phys_footprint
+}
+
+/// KV formats on one whole-model worker, as in the request split: OLMoE, n_ctx 2048, the default
+/// request slots, a 4 GiB cap (the smallest whole GiB f32 KV fits in). Prints the budget, the peak footprint, prefill and decode speed
+/// and greedy-token agreement with f32 on short prompts (one pass each, from a cold hot tier).
+/// Each format runs in its own process: the cap and the peak count the whole process.
+#[test]
+#[ignore = "needs the OLMoE model on disk; a bench that prints a table"]
+fn kv_formats_compared() {
+    if let Ok(name) = std::env::var(KV_BENCH_FORMAT) {
+        let (_, kv_format) = *KV_FORMATS.iter().find(|(n, _)| *n == name).expect("format");
+        return kv_bench_one(kv_format);
+    }
+    let mut rows = Vec::new();
+    for (name, _) in KV_FORMATS {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["kv_formats_compared", "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env(KV_BENCH_FORMAT, name)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{name}:\n{stdout}\n{stderr}");
+        // The test harness may print its "test … " prefix on the same line.
+        let row = stdout.lines().find_map(|l| Some(l.split_once("kvbench ")?.1)).expect("kvbench line");
+        let mut row: serde_json::Value = serde_json::from_str(row).unwrap();
+        // streammoe's own line for the tier it opened, beside the plan's figure.
+        let hot = stderr.lines().chain(stdout.lines()).find(|l| l.contains("hot_tier")).unwrap_or("");
+        row["hot_line"] = hot.trim().into();
+        rows.push((name, row));
+    }
+    let gib = |v: &serde_json::Value| v.as_f64().unwrap() / (1u64 << 30) as f64;
+    let tokens = |r: &serde_json::Value| -> Vec<Vec<u64>> { serde_json::from_value(r["tokens"].clone()).unwrap() };
+    let reference = tokens(&rows[0].1);
+    println!(
+        "\nOLMoE-1B-7B, one whole-model worker, 4 GiB cap, n_ctx 2048, {} request slots, {} prompts, up to {KV_BENCH_TOKENS} tokens",
+        rows[0].1["slots"],
+        KV_BENCH_PROMPTS.len()
+    );
+    println!(
+        "| format | KV GiB | KV scratch GiB | fixed GiB | hot tier GiB (plan) | peak MiB | prefill ms (mean) | decode tok/s | tokens before first difference | share matching f32 |"
+    );
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+    for (name, r) in &rows {
+        let (mut same, mut total, mut firsts) = (0, 0, Vec::new());
+        for (a, b) in reference.iter().zip(&tokens(r)) {
+            let n = a.len().max(b.len());
+            same += (0..n).filter(|&i| a.get(i).is_some() && a.get(i) == b.get(i)).count();
+            total += n;
+            firsts.push((0..n).find(|&i| a.get(i) != b.get(i)).map_or("all".to_string(), |i| i.to_string()));
+        }
+        println!(
+            "| {name} | {:.3} | {:.3} | {:.2} | {:.2} | {:.0} | {:.0} | {:.1} | {} | {:.0}% |",
+            gib(&r["kv"]),
+            gib(&r["kv_scratch"]),
+            gib(&r["fixed"]),
+            gib(&r["hot_tier"]),
+            r["peak"].as_f64().unwrap() / (1u64 << 20) as f64,
+            r["prefill_ms"].as_f64().unwrap(),
+            r["decode_tps"].as_f64().unwrap(),
+            firsts.join(" / "),
+            100.0 * same as f64 / total as f64
+        );
+    }
+    for (name, r) in &rows {
+        println!("{name}: {} tokens; {}", tokens(r).iter().map(Vec::len).sum::<usize>(), r["hot_line"].as_str().unwrap());
+    }
+}
+
+/// One format of [`kv_formats_compared`], in this process; prints one `kvbench` JSON line.
+fn kv_bench_one(kv_format: KvFormat) {
+    use std::time::Instant;
+
+    use msh_node::chat::{ChatTemplate, Codec, Message};
+    use msh_node::engine::{Engine, Sample, StageIn};
+    use msh_node::streammoe_engine::Budgeter;
+
+    let dir = model_dir();
+    let (cap, slots) = (4u64 << 30, SchedulerConfig::default().engine_slots());
+    let spec = |mem_cap| OpenSpec { n_ctx: 2048, mem_cap, max_requests: slots, kv_format, ..OpenSpec::new(&dir, 0..16) };
+    let budget = Budgeter::new(&spec(None)).unwrap().budget(0..16, cap);
+    let codec = Codec::load(&dir.join("hf/tokenizer.json"), ChatTemplate::Olmoe).unwrap();
+    let mut engine = StreamMoeEngine::open(&spec(Some(cap))).expect("open OLMoE under the cap");
+    let eos = engine.eos();
+    let (mut hidden, mut out) = (Vec::new(), Vec::new());
+    let (mut prefill, mut decode, mut decoded, mut all) = (0.0, 0.0, 0, Vec::new());
+    for (k, text) in KV_BENCH_PROMPTS.iter().enumerate() {
+        let req = k as u64 + 1;
+        let prompt = codec.encode_chat(&[Message { role: "user".into(), content: text.to_string() }]).unwrap();
+        let t0 = Instant::now();
+        engine.step(req, 0, StageIn::Tokens(&prompt), Sample::Last, &mut hidden, &mut out).unwrap();
+        prefill += t0.elapsed().as_secs_f64();
+        let mut tokens = vec![out[0]];
+        let t0 = Instant::now();
+        while tokens.len() < KV_BENCH_TOKENS && tokens.last().copied() != eos {
+            let (pos, last) = ((prompt.len() + tokens.len() - 1) as u32, tokens[tokens.len() - 1]);
+            engine.step(req, pos, StageIn::Tokens(&[last]), Sample::Last, &mut hidden, &mut out).unwrap();
+            tokens.push(out[0]);
+        }
+        decode += t0.elapsed().as_secs_f64();
+        decoded += tokens.len() - 1;
+        engine.free(req);
+        all.push(tokens);
+    }
+    let row = serde_json::json!({
+        "slots": slots,
+        "kv": budget.kv,
+        "kv_scratch": budget.kv_scratch,
+        "fixed": budget.fixed,
+        "hot_tier": budget.hot_tier,
+        "peak": peak_footprint(),
+        "prefill_ms": 1e3 * prefill / KV_BENCH_PROMPTS.len() as f64,
+        "decode_tps": decoded as f64 / decode,
+        "tokens": all,
+    });
+    println!("kvbench {row}");
 }
