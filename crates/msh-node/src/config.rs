@@ -114,6 +114,23 @@
 //! `health_timeout_ms` (the controller pings every `health_interval_ms`) drops the link, frees
 //! what it held and waits for the next controller.
 //!
+//! An optional `[cache]` table sets the controller's answer cache on the request split
+//! ([`crate::cache`]): prompts it has answered, kept in its own RAM inside the service
+//! allowance. `mode = "exact"` (the default) answers a repeat of a prompt, token for token, from
+//! the cache; `"similar"` also answers a prompt whose vector is within `similar_threshold` of
+//! one cached (cosine), which changes answers, so it is opt-in; `"off"` keeps nothing. Least
+//! recently used entries go first past `max_entries` or `max_mib`. `bits` is the TurboQuant
+//! width of the prompt vectors (2, 3 or 4):
+//!
+//! ```toml
+//! [cache]
+//! mode = "similar"
+//! similar_threshold = 0.98
+//! max_entries = 10000
+//! max_mib = 32
+//! bits = 4
+//! ```
+//!
 //! An optional `[log]` table sets the log (NF-5). `RUST_LOG` overrides `level`.
 //!
 //! ```toml
@@ -154,7 +171,55 @@ pub struct Config {
     pub service: ServiceConfig,
     #[serde(default)]
     pub net: NetConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
     pub nodes: Vec<NodeConfig>,
+}
+
+/// What the controller's answer cache keeps and answers (request split only).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheMode {
+    Off,
+    /// A prompt seen before, token for token.
+    #[default]
+    Exact,
+    /// Also a prompt close enough to one seen before.
+    Similar,
+}
+
+impl CacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheMode::Off => "off",
+            CacheMode::Exact => "exact",
+            CacheMode::Similar => "similar",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    pub mode: CacheMode,
+    /// Least cosine between prompt vectors for a similar hit.
+    pub similar_threshold: f32,
+    pub max_entries: usize,
+    pub max_mib: f64,
+    /// TurboQuant bits per coordinate of a prompt vector.
+    pub bits: u32,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        CacheConfig { mode: CacheMode::Exact, similar_threshold: 0.98, max_entries: 10_000, max_mib: 32.0, bits: 4 }
+    }
+}
+
+impl CacheConfig {
+    pub fn max_bytes(&self) -> u64 {
+        (self.max_mib * (1u64 << 20) as f64) as u64
+    }
 }
 
 /// The links between the controller and the workers.
@@ -424,6 +489,16 @@ impl Config {
         if n.reconnect_min_ms == 0 || n.reconnect_min_ms > n.reconnect_max_ms {
             return bad("net.reconnect_min_ms must be positive and at most net.reconnect_max_ms".into());
         }
+        let c = &self.cache;
+        if !(2..=4).contains(&c.bits) {
+            return bad(format!("cache.bits = {} must be 2, 3 or 4", c.bits));
+        }
+        if !(c.similar_threshold > 0.0 && c.similar_threshold <= 1.0) {
+            return bad(format!("cache.similar_threshold = {} must be in (0, 1]", c.similar_threshold));
+        }
+        if c.max_entries == 0 || !(c.max_mib > 0.0 && c.max_mib.is_finite()) {
+            return bad("cache.max_entries and cache.max_mib must be positive".into());
+        }
         for (i, n) in self.nodes.iter().enumerate() {
             if self.nodes[..i].iter().any(|m| m.name == n.name) {
                 return bad(format!("duplicate node name {}", n.name));
@@ -691,6 +766,20 @@ mod tests {
         assert!(Config::parse(&alone).is_err(), "no worker");
         let streammoe = text.replace("[scheduler]", "[engine]\nkind = \"streammoe\"\nmodel_dir = \"/m\"\n[scheduler]");
         assert!(Config::parse(&streammoe).is_ok());
+    }
+
+    #[test]
+    fn cache_section() {
+        let c = Config::parse(THREE).unwrap();
+        assert_eq!((c.cache.mode, c.cache.similar_threshold, c.cache.bits), (CacheMode::Exact, 0.98, 4));
+        assert_eq!(c.cache.max_bytes(), 32 << 20);
+        let text = |t: &str| THREE.replace("num_layers = 40", &format!("num_layers = 40\n[cache]\n{t}"));
+        let c = Config::parse(&text("mode = \"similar\"\nsimilar_threshold = 0.9\nmax_entries = 5\nmax_mib = 0.5\nbits = 3")).unwrap();
+        assert_eq!((c.cache.mode, c.cache.similar_threshold, c.cache.max_entries, c.cache.bits), (CacheMode::Similar, 0.9, 5, 3));
+        assert_eq!(Config::parse(&text("mode = \"off\"")).unwrap().cache.mode, CacheMode::Off);
+        for bad in ["bits = 1", "bits = 5", "similar_threshold = 0", "similar_threshold = 1.5", "max_entries = 0", "max_mib = 0", "mode = \"fuzzy\"", "size = 1"] {
+            assert!(Config::parse(&text(bad)).is_err(), "{bad} accepted");
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! to each other. Its scheduler keeps several requests in flight.
 
 pub mod backoff;
+pub mod cache;
 pub mod chat;
 pub mod config;
 pub mod draft;
@@ -22,6 +23,7 @@ pub mod planner;
 pub mod requests;
 pub mod scheduler;
 pub mod stats;
+pub mod turboquant;
 
 use std::fmt;
 

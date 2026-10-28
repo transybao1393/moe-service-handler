@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::config::{Config, Split};
+use crate::config::{CacheMode, Config, Split};
 
 /// Largest HTTP request body accepted.
 pub const HTTP_BODY_LIMIT: usize = 1 << 20;
@@ -124,7 +124,9 @@ pub fn growth(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
 /// [`growth`] on the request split. The controller holds token ids, never hidden states: every
 /// request in flight on any worker or queued keeps its prompt (for a retry) up to n_ctx ids,
 /// and one `Start` payload is built at a time. A worker holds its requests' token ids, the
-/// `Start` read off the wire, and the engine's output for a prompt chunk.
+/// `Start` read off the wire, and the engine's output for a prompt chunk. The controller's
+/// answer cache holds up to `max_mib`, and each request kept for it its answer so far (up to
+/// n_ctx ids) and in similar mode its prompt vector; a similar lookup builds one query table.
 fn growth_requests(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
     let s = &cfg.scheduler;
     let workers = cfg.nodes.len() as u64 - 1;
@@ -143,6 +145,14 @@ fn growth_requests(cfg: &Config, idx: usize, serves_http: bool) -> Budget {
         b.items.push(("requests", held * ids));
         if serves_http {
             b.items.push(("http bodies", http_max_open(cfg) as u64 * HTTP_BODY_LIMIT as u64));
+        }
+        let c = &cfg.cache;
+        if c.mode != CacheMode::Off {
+            let similar = c.mode == CacheMode::Similar;
+            let vector = if similar { crate::cache::VECTOR_DIM as u64 * 4 } else { 0 };
+            // At most two 4-bit codes per byte, a float per byte value.
+            let table = if similar { crate::cache::VECTOR_DIM as u64 / 2 * 256 * 4 } else { 0 };
+            b.items.push(("cache", c.max_bytes() + held * (ids + vector) + table));
         }
     } else {
         b.items.push(("requests", s.max_in_flight.max(1) as u64 * ids));
@@ -295,15 +305,15 @@ mod tests {
 
     #[test]
     fn growth_on_the_request_split() {
-        let cfg = Config::parse(
+        let text = String::from(
             "hidden_dim = 2048\nnum_layers = 40\nsplit = \"requests\"\n\
              [scheduler]\nprefill_chunk = 64\nmax_in_flight = 2\nmax_queue = 5\n\
              [engine]\nn_ctx = 4096\n\
              [[nodes]]\nname = \"m4\"\naddr = \"127.0.0.1:1\"\n\
              [[nodes]]\nname = \"m1\"\naddr = \"127.0.0.1:2\"\n\
              [[nodes]]\nname = \"m4b\"\naddr = \"127.0.0.1:3\"\n",
-        )
-        .unwrap();
+        );
+        let cfg = Config::parse(&text).unwrap();
         let item = |b: &Budget, n: &str| b.items.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
         let ids = 4096 * 4;
         let coord = growth(&cfg, 0, true);
@@ -316,13 +326,20 @@ mod tests {
         assert_eq!(item(&coord, "frames"), Some(ids));
         assert_eq!(item(&coord, "hidden"), None);
         assert_eq!(item(&coord, "http bodies"), Some(9 << 20));
+        // The answer cache, and each request's answer on its way to it.
+        assert_eq!(item(&coord, "cache"), Some((32 << 20) + 9 * ids));
         let worker = growth(&cfg, 1, false);
         assert_eq!(item(&worker, "connections"), Some(conn));
         assert_eq!(item(&worker, "chunk buffers"), Some(2 * ids));
         assert_eq!(item(&worker, "requests"), Some(2 * ids));
         assert_eq!(item(&worker, "hidden"), Some(64 * 2048 * 4));
+        assert_eq!(item(&worker, "cache"), None);
         // Well inside 256 MiB on both.
-        assert!(coord.total() < 16 << 20 && worker.total() < 4 << 20);
+        assert!(coord.total() < 48 << 20 && worker.total() < 4 << 20);
+        let similar = Config::parse(&text.replace("n_ctx = 4096", "n_ctx = 4096\n[cache]\nmode = \"similar\"\nmax_mib = 8")).unwrap();
+        assert_eq!(item(&growth(&similar, 0, true), "cache"), Some((8 << 20) + 9 * (ids + 1024) + (128 << 10)));
+        let off = Config::parse(&text.replace("n_ctx = 4096", "n_ctx = 4096\n[cache]\nmode = \"off\"")).unwrap();
+        assert_eq!(item(&growth(&off, 0, true), "cache"), None);
     }
 
     #[test]

@@ -94,6 +94,7 @@ fn start_kv(splits: &[[u32; 2]], sched: SchedulerConfig, kv_format: KvFormat) ->
         log: Default::default(),
         service: Default::default(),
         net: Default::default(),
+        cache: Default::default(),
         nodes: splits
             .iter()
             .zip(&listeners)
@@ -189,6 +190,8 @@ fn request_split_two_workers_match_the_reference() {
         log: Default::default(),
         service: Default::default(),
         net: Default::default(),
+        // The same prompt four times: every one is for the workers.
+        cache: msh_node::config::CacheConfig { mode: msh_node::config::CacheMode::Off, ..Default::default() },
         nodes,
     };
     cfg.validate().unwrap();

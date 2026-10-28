@@ -153,7 +153,8 @@ pub struct Generation {
 }
 
 pub(crate) enum Msg {
-    Submit { id: u64, prompt: Vec<u32>, max_new: usize, events: Sender<Event> },
+    /// `probe`: the request split's cache key, from a lookup that missed.
+    Submit { id: u64, prompt: Vec<u32>, max_new: usize, events: Sender<Event>, probe: Option<crate::cache::Probe> },
     /// Request split: from a worker's link (see [`crate::requests`]).
     Requests(crate::requests::Note),
     // `epoch` numbers the links a message came over; news from links already cut is ignored.
@@ -209,7 +210,15 @@ impl Client {
     pub fn submit_with_id(&self, prompt: Vec<u32>, max_new: usize) -> (u64, Receiver<Event>) {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (events, rx) = mpsc::channel();
-        let msg = Msg::Submit { id, prompt, max_new, events: events.clone() };
+        // The request split answers from its cache here, on the caller's thread.
+        let probe = match &self.inner.board {
+            Some(b) => match b.from_cache(id, &prompt, max_new, &events) {
+                Ok(()) => return (id, rx),
+                Err(probe) => probe,
+            },
+            None => None,
+        };
+        let msg = Msg::Submit { id, prompt, max_new, events: events.clone(), probe };
         if self.inner.tx.send(msg).is_err() {
             let _ = events.send(Event::Rejected("scheduler stopped".into()));
         }
@@ -850,7 +859,7 @@ impl<E: Engine> Scheduler<E> {
 
     fn handle(&mut self, m: Msg) {
         match m {
-            Msg::Submit { id, prompt, max_new, events } => self.submit(id, prompt, max_new, events),
+            Msg::Submit { id, prompt, max_new, events, .. } => self.submit(id, prompt, max_new, events),
             Msg::Frame { epoch, h, payload } if epoch == self.epoch => self.on_frame(h, payload),
             Msg::Partial { epoch, from, h, layer, compute_us, values } if epoch == self.epoch => {
                 self.on_partial(from, h, layer, compute_us, values)

@@ -319,6 +319,12 @@ fn serve_requests<'a>(
     }
     let workers = cfg.nodes.len() - 1;
     info!(role = "controller", runs = role(cfg, 0), workers, "connecting to workers");
+    // The bench repeats one prompt; answers from the cache would not measure the workers.
+    let mut cfg = cfg.clone();
+    if codec.is_none() {
+        cfg.cache.mode = msh_node::config::CacheMode::Off;
+    }
+    let cfg = &cfg;
     let (client, sched) = msh_node::requests::spawn(cfg)?;
     let board = client.board().expect("request split").clone();
     let ready = board.wait_ready(workers, CONNECT_TIMEOUT);

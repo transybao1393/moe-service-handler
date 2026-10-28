@@ -86,7 +86,7 @@ async fn completion_and_stream_produce_the_same_text() {
 async fn worker_management_is_only_on_the_request_split() {
     // Request split endpoints: tests/requests.rs.
     let app = app(SchedulerConfig::default(), 256);
-    for (method, path) in [("GET", "/v1/workers"), ("GET", "/v1/requests"), ("POST", "/v1/workers/n1/drain"), ("POST", "/v1/requests/1/cancel")] {
+    for (method, path) in [("GET", "/v1/workers"), ("GET", "/v1/requests"), ("POST", "/v1/workers/n1/drain"), ("POST", "/v1/requests/1/cancel"), ("GET", "/v1/cache"), ("POST", "/v1/cache/clear")] {
         let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");

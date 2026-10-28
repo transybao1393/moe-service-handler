@@ -60,6 +60,7 @@ fn config_at(addrs: &[String], sched: SchedulerConfig, experts: ExpertsConfig, n
         log: Default::default(),
         service: Default::default(),
         net,
+        cache: Default::default(),
         nodes: addrs
             .iter()
             .enumerate()

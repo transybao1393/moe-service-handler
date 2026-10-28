@@ -5,7 +5,8 @@
 //! reports requests by outcome, tokens, time to first token, round trip per decode step,
 //! drafts, prefix reuse and the health ping's trip through the workers. The per-step CSV (CL-10) stays the
 //! source for detailed analysis; these are for watching a running cluster. On the request split
-//! the coordinator adds per-worker series labelled `worker="NAME"` ([`render_workers`]).
+//! the coordinator adds per-worker series labelled `worker="NAME"` ([`render_workers`]) and
+//! its answer cache's hits and misses by kind, entries and bytes.
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -83,6 +84,13 @@ pub struct Stats {
     pub cluster_up: AtomicU64,
     /// Times the cluster went down.
     pub cluster_downs: Counter,
+    /// Request split: the controller's answer cache ([`crate::cache`]).
+    pub cache_hits_exact: Counter,
+    pub cache_hits_similar: Counter,
+    pub cache_misses_exact: Counter,
+    pub cache_misses_similar: Counter,
+    pub cache_entries: AtomicU64,
+    pub cache_bytes: AtomicU64,
 }
 
 pub static STATS: Stats = Stats {
@@ -104,6 +112,12 @@ pub static STATS: Stats = Stats {
     footprint_limit: AtomicU64::new(0),
     cluster_up: AtomicU64::new(1),
     cluster_downs: Counter::new(),
+    cache_hits_exact: Counter::new(),
+    cache_hits_similar: Counter::new(),
+    cache_misses_exact: Counter::new(),
+    cache_misses_similar: Counter::new(),
+    cache_entries: AtomicU64::new(0),
+    cache_bytes: AtomicU64::new(0),
 };
 
 /// One worker's series on the request split, labelled `worker="NAME"`.
@@ -209,6 +223,12 @@ pub fn render(node: &str, coordinator: bool) -> String {
         metric("msh_cluster_down_total", "counter", "Times the cluster went down, a worker lost.", &[("", downs)]);
         let rtt = s.ping_rtt_us.load(Relaxed) as f64 / 1e6;
         metric("msh_ping_rtt_seconds", "gauge", "Last health ping's trip through every worker.", &[("", rtt)]);
+        let hits = [("kind=\"exact\"", s.cache_hits_exact.get() as f64), ("kind=\"similar\"", s.cache_hits_similar.get() as f64)];
+        metric("msh_cache_hits_total", "counter", "Requests answered from the answer cache, by match.", &hits);
+        let misses = [("kind=\"exact\"", s.cache_misses_exact.get() as f64), ("kind=\"similar\"", s.cache_misses_similar.get() as f64)];
+        metric("msh_cache_misses_total", "counter", "Answer cache lookups without a match, by match.", &misses);
+        metric("msh_cache_entries", "gauge", "Answers in the answer cache.", &[("", s.cache_entries.load(Relaxed) as f64)]);
+        metric("msh_cache_bytes", "gauge", "Bytes the answer cache holds.", &[("", s.cache_bytes.load(Relaxed) as f64)]);
         histogram(&mut out, &l, "msh_time_to_first_token_seconds", "From submission to the first token.", &s.time_to_first_token);
         histogram(&mut out, &l, "msh_decode_step_seconds", "Decode step round trip through the workers.", &s.decode_step);
         let workers = WORKERS.lock().unwrap_or_else(|e| e.into_inner()).clone();

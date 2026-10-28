@@ -85,6 +85,7 @@ fn config(addrs: &[String], sched: SchedulerConfig) -> Config {
         log: Default::default(),
         service: Default::default(),
         net: Default::default(),
+        cache: Default::default(),
         nodes,
     };
     cfg.validate().unwrap();
@@ -391,7 +392,8 @@ fn drain_and_resume() {
     let err = client.generate(prompt(0), 4).unwrap_err();
     assert!(matches!(&err, Error::Rejected(m) if m.contains("cluster down: no worker ready")), "{err}");
     assert_eq!(b.resume("n1").unwrap().state, WorkerState::Ready);
-    assert_eq!(client.generate(prompt(0), 6).unwrap().tokens, got[0]);
+    // A new prompt: a repeat would be answered from the controller's cache.
+    assert_eq!(client.generate(prompt(4), 6).unwrap().tokens, reference(&[prompt(4)], 6)[0]);
     assert_eq!(b.worker("n1").unwrap().done, 1);
     b.resume("n2").unwrap();
     client.shutdown();

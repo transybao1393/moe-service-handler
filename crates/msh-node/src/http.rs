@@ -6,9 +6,12 @@
 //! On the request split (docs/request-split.md), worker management, all JSON:
 //!
 //! - `GET /v1/workers`: every worker's row of the table; `GET /v1/workers/{name}`: one.
-//! - `GET /v1/requests`: requests in flight and queued.
+//! - `GET /v1/requests`: requests in flight and queued, then the last 16 answered from the
+//!   controller's cache (phase `cached`, worker `controller`).
 //! - `POST /v1/workers/{name}/drain` and `/resume`: stop or restart new requests to a worker.
 //! - `POST /v1/requests/{id}/cancel`: cancel one request (`7` or `chatcmpl-7`).
+//! - `GET /v1/cache`: the answer cache's entries, bytes, hits and misses by kind, and limits;
+//!   `POST /v1/cache/clear` empties it.
 //!
 //! An unknown worker or request gets 404, and so does all of it on the other splits.
 //!
@@ -66,6 +69,8 @@ pub fn router(state: Arc<HttpState>) -> Router {
         .route("/v1/workers/{name}/resume", post(resume))
         .route("/v1/requests", get(requests))
         .route("/v1/requests/{id}/cancel", post(cancel))
+        .route("/v1/cache", get(cache))
+        .route("/v1/cache/clear", post(clear_cache))
         .layer(middleware::from_fn_with_state(state.clone(), limit_open))
         .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT))
         .with_state(state)
@@ -142,6 +147,20 @@ async fn resume(State(s): State<Arc<HttpState>>, Path(name): Path<String>) -> Re
 async fn requests(State(s): State<Arc<HttpState>>) -> Response {
     match board(&s) {
         Ok(b) => Json(json!({ "requests": b.requests() })).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn cache(State(s): State<Arc<HttpState>>) -> Response {
+    match board(&s) {
+        Ok(b) => Json(b.cache()).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn clear_cache(State(s): State<Arc<HttpState>>) -> Response {
+    match board(&s) {
+        Ok(b) => Json(json!({ "cleared": b.clear_cache() })).into_response(),
         Err(r) => r,
     }
 }

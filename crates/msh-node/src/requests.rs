@@ -30,6 +30,16 @@
 //! The cluster takes requests while at least one worker is ready; with none, new and queued
 //! requests are refused as "cluster down". Every state change is one log line: worker, from,
 //! to, reason.
+//!
+//! The controller keeps its own answer cache ([`crate::cache`], `[cache]`), behind its own
+//! lock. A submitted request is looked up on the caller's thread (the HTTP handler), after its
+//! prompt is tokenized and before the queue: a prompt it has answered (or in similar mode, one
+//! close to it) gets that answer streamed back at once, as if from a worker, skipping the
+//! queue, the capacity checks and every worker, even while no worker is ready. Such a request
+//! is one log line with its kind and similarity, and shows in the table with phase `cached`
+//! and worker `controller`. The scheduler thread fills the cache when a worker's `Done` ends a
+//! request at the limit or the end-of-sequence token; failed, cancelled, stalled and dropped
+//! requests are not kept.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +56,7 @@ use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::backoff::Backoff;
+use crate::cache::{Cache, CacheStats, Hit, Probe};
 use crate::config::{Config, NetConfig, Split};
 use crate::scheduler::{Client, Event, Msg, SchedulerConfig};
 use crate::stats::{WorkerSeries, STATS};
@@ -154,6 +165,33 @@ pub struct RequestView {
     pub retries: u32,
     /// Set while its worker is stuck: what it was on.
     pub stuck: Option<String>,
+    /// Answered from the cache: how.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached: Option<CachedView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CachedView {
+    /// `exact` or `similar`.
+    pub kind: &'static str,
+    pub similarity: f32,
+    /// The worker that made the answer.
+    pub made_by: String,
+}
+
+/// Requests answered from the cache that the table keeps showing.
+const SERVED_KEPT: usize = 16;
+
+/// The answer cache and the requests it answered lately, behind their own lock so lookups
+/// and reads never wait on the scheduler. Lock order: `Board::inner`, then this.
+struct CacheState {
+    cache: Cache,
+    served: VecDeque<RequestView>,
+    shutting_down: bool,
+}
+
+fn lock_cache(c: &Mutex<CacheState>) -> MutexGuard<'_, CacheState> {
+    c.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Recent events, for rates and counts over a window.
@@ -248,6 +286,9 @@ struct Req {
     retries: u32,
     /// The client has its outcome; the worker's `Done` frees the slot.
     dropping: bool,
+    /// Its cache key, and the tokens sent so far, for the cache once it is done.
+    probe: Option<Probe>,
+    answer: Vec<u32>,
 }
 
 impl Req {
@@ -265,6 +306,7 @@ impl Req {
 /// HTTP API. Every method takes the lock for its own duration.
 pub struct Board {
     inner: Mutex<Inner>,
+    cache: Arc<Mutex<CacheState>>,
 }
 
 struct Inner {
@@ -284,6 +326,7 @@ struct Inner {
     tokens: Vec<u32>,
     stages: Vec<u32>,
     status: Status,
+    cache: Arc<Mutex<CacheState>>,
 }
 
 /// Starts the request split's scheduler for `cfg`: node 0 is this controller, every other
@@ -341,11 +384,17 @@ pub fn spawn(cfg: &Config) -> Result<(Client, JoinHandle<()>), Error> {
         tokens: Vec::new(),
         stages: Vec::new(),
         status: Status::default(),
+        cache: Arc::new(Mutex::new(CacheState {
+            cache: Cache::new(&cfg.cache, crate::cache::scope(cfg)),
+            served: VecDeque::new(),
+            shutting_down: false,
+        })),
     };
     for w in 0..inner.workers.len() {
         inner.reconnect(w);
     }
-    let board = Arc::new(Board { inner: Mutex::new(inner) });
+    let cache = inner.cache.clone();
+    let board = Arc::new(Board { inner: Mutex::new(inner), cache });
     let client = Client::new(tx, Some(board.clone()));
     let handle = thread::spawn(move || span.in_scope(|| run(board, rx)));
     Ok((client, handle))
@@ -414,7 +463,9 @@ impl Board {
         let mut ids: Vec<u64> = b.reqs.keys().copied().filter(|id| !b.queue.contains(id)).collect();
         ids.sort_unstable();
         ids.extend(b.queue.iter().copied());
-        ids.iter().map(|id| b.request_view(&b.reqs[id])).collect()
+        let mut views: Vec<RequestView> = ids.iter().map(|id| b.request_view(&b.reqs[id])).collect();
+        views.extend(lock_cache(&self.cache).served.iter().cloned());
+        views
     }
 
     pub fn request(&self, id: u64) -> Option<RequestView> {
@@ -499,9 +550,60 @@ impl Board {
         Ok(b.view(w))
     }
 
+    /// Answers request `id` from the cache if it can, at once on the caller's thread.
+    /// Otherwise returns the probe, if any, for the scheduler to keep with the request.
+    pub(crate) fn from_cache(&self, id: u64, prompt: &[u32], max_new: usize, events: &Sender<Event>) -> Result<(), Option<Probe>> {
+        if prompt.is_empty() || max_new == 0 {
+            return Err(None);
+        }
+        let mut c = lock_cache(&self.cache);
+        if c.shutting_down {
+            return Err(None);
+        }
+        let Some(probe) = c.cache.probe(prompt, max_new) else { return Err(None) };
+        let Some(hit) = c.cache.lookup(&probe) else { return Err(Some(probe)) };
+        let now = unix_ms(Instant::now());
+        let sent = hit.answer.len() as u32;
+        if c.served.len() == SERVED_KEPT {
+            c.served.pop_front();
+        }
+        c.served.push_back(RequestView {
+            id,
+            worker: Some("controller".into()),
+            phase: "cached",
+            position: prompt.len() as u32 + sent,
+            prompt_tokens: prompt.len(),
+            tokens_sent: sent,
+            max_tokens: max_new,
+            submitted: now,
+            started: Some(now),
+            last_progress: Some(now),
+            waiting_ms: 0,
+            idle_ms: None,
+            retries: 0,
+            stuck: None,
+            cached: Some(CachedView { kind: hit.kind, similarity: hit.similarity, made_by: hit.worker.clone() }),
+        });
+        drop(c);
+        answer_from_cache(id, hit, events);
+        Ok(())
+    }
+
     /// The per-worker Prometheus series.
     pub fn series(&self) -> Vec<WorkerSeries> {
         self.lock().series()
+    }
+
+    /// The answer cache's counts and limits.
+    pub fn cache(&self) -> CacheStats {
+        lock_cache(&self.cache).cache.stats()
+    }
+
+    /// Empties the answer cache; returns how many answers it held.
+    pub fn clear_cache(&self) -> usize {
+        let n = lock_cache(&self.cache).cache.clear();
+        info!(entries = n, "answer cache cleared");
+        n
     }
 }
 
@@ -572,6 +674,7 @@ impl Inner {
             idle_ms: r.started.map(|_| ms(r.last_progress.elapsed())),
             retries: r.retries,
             stuck,
+            cached: None,
         }
     }
 
@@ -622,7 +725,7 @@ impl Inner {
 
     fn handle(&mut self, m: Msg) {
         match m {
-            Msg::Submit { id, prompt, max_new, events } => self.submit(id, prompt, max_new, events),
+            Msg::Submit { id, prompt, max_new, events, probe } => self.submit(id, prompt, max_new, events, probe),
             Msg::Shutdown => self.begin_shutdown(),
             Msg::Requests(Note::Joined { worker, conn }) => self.joined(worker, conn),
             Msg::Requests(Note::Retry { worker, tries, wait }) => {
@@ -651,6 +754,7 @@ impl Inner {
             return;
         }
         self.shutting_down = true;
+        lock_cache(&self.cache).shutting_down = true;
         info!(active = self.reqs.len() - self.queue.len(), waiting = self.queue.len(), "shutting down");
         while let Some(id) = self.queue.pop_front() {
             let r = self.reqs.remove(&id).unwrap();
@@ -669,7 +773,9 @@ impl Inner {
         crate::stats::WORKERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
-    fn submit(&mut self, id: u64, prompt: Vec<u32>, max_new: usize, events: Sender<Event>) {
+    /// A request the cache did not answer; `probe` is its cache key, to fill the cache with
+    /// its answer.
+    fn submit(&mut self, id: u64, prompt: Vec<u32>, max_new: usize, events: Sender<Event>, probe: Option<Probe>) {
         let ready = self.ready();
         let reject = if self.shutting_down {
             Some("shutting down".to_string())
@@ -711,6 +817,8 @@ impl Inner {
             last_token: None,
             retries: 0,
             dropping: false,
+            probe,
+            answer: Vec::new(),
         };
         self.reqs.insert(id, r);
         self.queue.push_back(id);
@@ -942,6 +1050,10 @@ impl Inner {
                     STATS.requests_done.add(1);
                     self.workers[w].done += 1;
                     let _ = r.events.send(Event::Done);
+                    let complete = matches!(reason, "length" | "eos") && r.answer.len() == r.sent as usize;
+                    if let Some(p) = r.probe.filter(|_| complete) {
+                        lock_cache(&self.cache).cache.insert(p, r.answer, &self.workers[w].name);
+                    }
                 }
                 self.dispatch();
             }
@@ -1026,6 +1138,9 @@ impl Inner {
             r.decoding = true;
             r.last_progress = now;
             r.last_token = Some(now);
+            if r.probe.is_some() {
+                r.answer.push(token);
+            }
             s.tokens.add(now, 1, RATE_WINDOW);
             STATS.tokens_generated.add(1);
             if r.events.send(Event::Token { token, latency }).is_err() {
@@ -1086,6 +1201,32 @@ impl Inner {
         STATS.requests_waiting.store(self.queue.len() as u64, Ordering::Relaxed);
         *crate::stats::WORKERS.lock().unwrap_or_else(|e| e.into_inner()) = self.series();
     }
+}
+
+/// Streams a cached answer to the client, as a worker's tokens would come.
+fn answer_from_cache(id: u64, hit: Hit, events: &Sender<Event>) {
+    info!(
+        request = id,
+        phase = "cached",
+        worker = "controller",
+        kind = hit.kind,
+        similarity = format_args!("{:.4}", hit.similarity),
+        made_by = hit.worker,
+        age_s = hit.age.as_secs(),
+        hits = hit.hits,
+        generated = hit.answer.len(),
+        "cache hit"
+    );
+    for &token in &hit.answer {
+        if events.send(Event::Token { token, latency: Duration::ZERO }).is_err() {
+            info!(request = id, "cancelled by the client");
+            STATS.requests_cancelled.add(1);
+            return;
+        }
+    }
+    STATS.tokens_generated.add(hit.answer.len() as u64);
+    STATS.requests_done.add(1);
+    let _ = events.send(Event::Done);
 }
 
 /// Receives what one worker sends and hands it to the scheduler; reports when the link ends.

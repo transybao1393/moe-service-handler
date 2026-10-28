@@ -71,6 +71,7 @@ impl Cluster {
             log: Default::default(),
             service: Default::default(),
             net,
+            cache: Default::default(),
             nodes: splits
                 .iter()
                 .zip(&listeners)
@@ -244,6 +245,7 @@ fn with_fake_worker(sched: SchedulerConfig, fake: impl FnOnce(Connection) + Send
         log: Default::default(),
         service: Default::default(),
         net: Default::default(),
+        cache: Default::default(),
         nodes: vec![node("n0", &l0, [0, 20]), node("n1", &l1, [20, 40])],
     };
     let worker_cfg = cfg.clone();
@@ -523,6 +525,7 @@ fn config(addrs: &[String], splits: &[[u32; 2]], sched: SchedulerConfig, net: Ne
         log: Default::default(),
         service: Default::default(),
         net,
+        cache: Default::default(),
         nodes: addrs
             .iter()
             .zip(splits)
