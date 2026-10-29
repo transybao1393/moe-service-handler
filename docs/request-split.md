@@ -116,8 +116,9 @@ The controller keeps a table with one row per worker:
   keys on the original prompt and gets the whole answer. Greedy decoding gives the same next
   tokens, but the second worker reads the made tokens back as a prompt, which can differ from
   decoding them in the last bits, so the rest is very likely, not certainly, identical.
-  A request whose last token was the end of sequence (the controller's tokenizer knows it) is
-  finished instead. With `resume_on_loss = false` they fail. The controller reconnects in the
+  A request whose last token was already sent (only its `Done` lost) is finished instead.
+  The worker never sends the end-of-sequence token itself, so a link lost right after it
+  resumes, and the next worker stops at once. With `resume_on_loss = false` they fail. The controller reconnects in the
   background, and the worker is `ready` again once it says hello.
 - **Events:** a worker sends an `Event` on its own, with no ping. `PrefillDone`: the request
   moves to `decode` at once, as progress. `MemoryHigh` (footprint past 95 % of its cap): the

@@ -1,7 +1,7 @@
 # moe-service-handler
 
 <p align="center">
-  <img src="docs/assets/dataflow-requests-v2.svg" width="900" alt="Data flow, request split: two prompts come in to the m4 controller, which runs no model; it gives request A to the m1 worker and request B to the m4b worker at the same time; each worker runs streammoe on the whole model from its own SSD and sends every token back as it is made, and the controller streams it to the client. Every second a ping goes out and each worker's status comes back. The controller's worker table shows each worker's state and what it is doing. A third prompt that asks the first one again is answered from the controller's own cache, with no worker. A worker that hangs is marked stuck, with what it was on, and gets no new work. The workers never talk to each other.">
+  <img src="docs/assets/dataflow-requests-v3.svg" width="900" alt="Data flow, request split: two prompts come in to the m4 controller, which runs no model; it gives request A to the m1 worker and request B to the m4b worker at the same time; each worker runs streammoe on the whole model from its own SSD and sends every token back as it is made, and the controller streams it to the client. Every second a ping goes out and each worker's status comes back. The controller's worker table shows each worker's state and what it is doing. A third prompt that asks the first one again is answered from the controller's own cache, with no worker. Then m4b's link is lost in the middle of answer D: it is marked down, and D continues on m1 with the prompt and the tokens so far, so the client sees no gap. Events and commands go on the same links. The workers never talk to each other.">
 </p>
 
 Turns streammoe into a service that runs a large MoE model, Qwen3.6-35B-A3B, across three
@@ -23,7 +23,8 @@ The controller runs no model: it has the HTTP API, the tokenizer, the queue and 
 management. Each worker runs streammoe on the whole model from its own SSD, as streammoe is
 built to run. For each request:
 
-1. The prompt comes in to the controller, which tokenizes it.
+1. The prompt comes in to the controller (HTTP, or a WebSocket carrying several chats), which
+   tokenizes it.
 2. If the controller has answered it before, its own cache answers it, with no worker (below).
 3. Otherwise the controller gives it to the ready worker with the fewest requests running (`Start`);
    both workers work at the same time, each on its own requests.
@@ -48,7 +49,8 @@ experts (from `--plan`); the rest streams from its SSD.
 - **Lost worker:** requests that sent nothing yet go to the other worker. With
   `[scheduler] resume_on_loss` (default true) the rest go there too: the other worker gets the
   prompt plus the tokens made so far, and the client's stream goes on with no token repeated
-  or missed. One whose last token was the end of sequence is finished instead. A request
+  or missed. If the link breaks after the last token, so only the `Done` is lost, it is finished
+  instead; after the end of text the other worker stops at once. A request
   moves at most twice, then fails; `resumed` in `/v1/requests` counts the moves. Greedy
   decoding gives the same next tokens, but the second worker reads the made tokens back as a
   prompt, which can differ from decoding in the last bits, so the rest is very likely, not
@@ -79,7 +81,8 @@ experts (from `--plan`); the rest streams from its SSD.
   coordinate) and compared on the codes. Past `max_entries` (10 000) or `max_mib` (32), the
   least recently used go first. `GET /v1/cache` (entries, hits, misses), `POST /v1/cache/clear`,
   `msh_cache_*` series; a hit shows in `/v1/requests` as phase `cached` on worker `controller`.
-- **Next (designed, not built):** the controller decides and acts on its own: routing a chat's
+- **Next (designed, not built):** the commands above exist, but the policy that would use them
+  is not built: the controller deciding and acting on its own, routing a chat's
   next turn to the worker that holds it, per-worker load limits, reopening or restarting a
   stuck worker, and tuning streammoe's open settings one worker at a time.
 
@@ -102,7 +105,7 @@ decoding and prefix reuse apply to the layer split.
 
 - **Links:** one persistent TCP connection per worker, used both ways. A message bigger than
   `[net] max_chunk_kib` (64) goes in chunks, and one writer thread per link puts small frames
-  (pings, tokens, `Start`, `Drop`) between the chunks of big ones, so a big message never holds
+  (pings, tokens, `Start`, `Drop`, events, commands) between the chunks of big ones, so a big message never holds
   up the rest. On loopback, a ping behind a 512 KiB hidden state came back in 20 µs (p50)
   instead of 59 µs. TCP keep-alive is on.
 - **Frames:** 24-byte little-endian header (magic, version, type, request id, position,
@@ -173,8 +176,8 @@ decoding and prefix reuse apply to the layer split.
   change greedy output within a few tokens. `--plan` shows the KV size for each.
 - **API:** the coordinator serves OpenAI-compatible `GET /v1/models` and
   `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
-  429, a cluster that is down 503. In the request split the controller also serves the worker
-  management and cache endpoints above.
+  429, a cluster that is down 503. The same chats also run over a WebSocket (below). In the
+  request split the controller also serves the worker management and cache endpoints above.
 - **WebSocket** (`GET /v1/ws`, every split): several chats at once on one socket, as JSON text
   messages. The client sends `{"type":"chat","id":"<its id>","messages":[...],"max_tokens":N}`
   (checked as for chat completions) and `{"type":"cancel","id":"..."}`. The server sends
@@ -187,8 +190,8 @@ decoding and prefix reuse apply to the layer split.
 
 | Crate | Kind | Purpose | State |
 | --- | --- | --- | --- |
-| `msh-net` | library + `msh-probe` | Frames, chunked two-way connections, latency probe | M0 done; chunking and keep-alive |
-| `msh-node` | binary | Controller / worker, config, planner, star links, scheduler, HTTP API, metrics, engines | Request split with worker management (tested on OLMoE: 2 workers, whole model each), the controller's answer cache with TurboQuant prompt vectors, controller-to-worker links with reconnect, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11), Prometheus (CL-12), logs (NF-5), service memory allowance (NF-2); runs real streammoe (tested on OLMoE) |
+| `msh-net` | library + `msh-probe` | Frames, chunked two-way connections, latency probe | M0 done; chunking, keep-alive, event and command frames (protocol 8) |
+| `msh-node` | binary | Controller / worker, config, planner, star links, scheduler, HTTP API, metrics, engines | Request split with worker management (tested on OLMoE: 2 workers, whole model each), worker events and commands, resume on a lost worker, the controller's answer cache with TurboQuant prompt vectors, controller-to-worker links with reconnect, WebSocket chats, scheduler (CL-5), planner (CL-3), dead-node handling (CL-8), HTTP API (CL-2), chunked prefill (CL-6), speculative decoding and prefix reuse (mock engine), run metrics (CL-10, CL-11), Prometheus (CL-12), logs (NF-5), service memory allowance (NF-2); runs real streammoe (tested on OLMoE) |
 | `msh-policy` | library | Per-expert 4-bit / 2-bit / skip rules | Not started |
 
 The engine sits behind an `Engine` trait shaped like streammoe's `eval_request`: tokens or
@@ -214,12 +217,13 @@ Each node opens streammoe for its own role in the cluster:
 - `[engine]` passes on `kv_format` (`f32` default, `f16`, `turbo4`, `turbo3`), `attn_threads`,
   `runtime_overhead_gib` and the expert streaming settings (`experts_dir`, `prefetch_guess`,
   `prefetch_experts`, `fast_experts_dir`; see [`docs/speed.md`](docs/speed.md)). Only `f32`
-  keeps a split bit-identical to one node; `f16` gave the same tokens in our runs, TurboQuant
-  did not.
+  keeps a split bit-identical to one node; `f16` stays close (91 % of tokens match f32 on
+  OLMoE), TurboQuant does not (14–18 %; see below).
 
 streammoe's multi-request decode (`eval_requests`) and multi-token passes (`eval_tokens`, for
-speculative decoding) run on the whole model only, so the cluster cannot use them yet; each
-node runs one request's step at a time.
+speculative decoding) run on the whole model only, so the layer and expert splits cannot use
+them. The request split's workers run the whole model and could; they do not yet, and take
+their requests one step each, in turn.
 
 For development the real engine runs **OLMoE-1B-7B** (16 layers, 3.9 GB at 4-bit) from
 `~/models/olmoe-1b-7b`: a 3-process 8/4/4 split reproduces streammoe's MLX reference answer
@@ -242,6 +246,9 @@ $B --config configs/local-requests.toml --node m4 --max-tokens 500 --requests 4
 curl localhost:8080/v1/workers
 curl localhost:8080/v1/requests
 curl localhost:8080/v1/cache          # the controller's answer cache: entries, hits, misses
+curl localhost:8080/v1/workers/m1/command -H 'content-type: application/json' -d '{"command":"status"}'
+# several chats on one socket: GET /v1/ws, e.g. with websocat
+#   {"type":"chat","id":"a","messages":[{"role":"user","content":"Hi"}],"max_tokens":32}
 
 # layer split, three nodes on one machine (the controller waits up to 60 s for the workers)
 $B --config configs/local-3node.toml --node m4b &
@@ -267,6 +274,30 @@ target/release/msh-probe run <host>:7070 ethernet results/m0-<name>.csv
 ```
 
 ## Baseline numbers
+
+Time in the request split, a 400-token prompt and a 128-token answer (OLMoE on the M3 Pro;
+the link figures for Ethernet are typical, not measured between the Mac minis):
+
+| Step | Loopback | 1 Gb Ethernet |
+| --- | --- | --- |
+| Link round trip (ping) | 13.7 µs | ~0.1–0.3 ms |
+| `Start`, one `Token` or `Done`, one way | ~7 µs | ~0.1 ms |
+| Prefill on the worker | 1–1.5 s | same |
+| Each further token on the worker | 20–80 ms (12–51 tok/s) | same |
+| Whole answer | ~3.5–12 s | the same, plus under 1 ms of link |
+
+Each token goes back while the worker makes the next, so the link costs well under 1 % of
+an answer. `msh-probe` (quick start) measures the real links.
+
+KV format on one whole-model OLMoE worker (4 GiB cap, 4 prompts, 128 tokens each;
+`kv_formats_compared`, run beside another test, so speeds are rough):
+
+| Format | KV | Decode | Tokens matching f32 |
+| --- | --- | --- | --- |
+| f32 | 2.0 GiB | 12.2 tok/s | 100 % |
+| f16 | 1.0 GiB | 15.5 tok/s | 91 % |
+| turbo4 | 0.27 GiB | 26.5 tok/s | 14 % |
+| turbo3 | 0.20 GiB | 38.1 tok/s | 18 % |
 
 Loopback on a MacBook Pro M3 Pro ([`results/m0-m3pro-local.csv`](results/m0-m3pro-local.csv)),
 the software floor for the runs between the Mac minis:
