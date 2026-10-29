@@ -91,6 +91,8 @@ pub struct Stats {
     pub cache_misses_similar: Counter,
     pub cache_entries: AtomicU64,
     pub cache_bytes: AtomicU64,
+    /// Request split: requests moved to another worker after their worker's link broke.
+    pub requests_resumed: Counter,
 }
 
 pub static STATS: Stats = Stats {
@@ -118,6 +120,7 @@ pub static STATS: Stats = Stats {
     cache_misses_similar: Counter::new(),
     cache_entries: AtomicU64::new(0),
     cache_bytes: AtomicU64::new(0),
+    requests_resumed: Counter::new(),
 };
 
 /// One worker's series on the request split, labelled `worker="NAME"`.
@@ -134,6 +137,10 @@ pub struct WorkerSeries {
     pub cap: u64,
     pub done: u64,
     pub failed: u64,
+    /// Events the worker sent, by kind (`prefill_done`, `memory_high`, ...).
+    pub events: Vec<(&'static str, u64)>,
+    /// Commands sent to the worker, by command and whether it answered ok.
+    pub commands: Vec<(&'static str, bool, u64)>,
 }
 
 pub const WORKER_STATES: [&str; 5] = ["connecting", "ready", "draining", "stuck", "down"];
@@ -173,6 +180,12 @@ pub fn render_workers(node: &str, workers: &[WorkerSeries]) -> String {
     metric("msh_worker_cap_bytes", "gauge", "The worker's memory cap; 0 without one.", &|w| one(w.cap as f64));
     metric("msh_worker_requests_total", "counter", "Requests the worker finished, by outcome.", &|w| {
         vec![(",outcome=\"done\"".into(), w.done as f64), (",outcome=\"failed\"".into(), w.failed as f64)]
+    });
+    metric("msh_worker_events_total", "counter", "Events the worker sent, by kind.", &|w| {
+        w.events.iter().map(|(k, n)| (format!(",kind=\"{k}\""), *n as f64)).collect()
+    });
+    metric("msh_worker_commands_total", "counter", "Commands sent to the worker, by command and result.", &|w| {
+        w.commands.iter().map(|(c, ok, n)| (format!(",command=\"{c}\",ok=\"{ok}\""), *n as f64)).collect()
     });
     out
 }
@@ -214,6 +227,7 @@ pub fn render(node: &str, coordinator: bool) -> String {
             ("msh_cached_positions_total", "Prompt positions reused from a parked request.", &s.cached_positions),
             ("msh_draft_tokens_total", "Draft tokens sent for verification.", &s.drafted),
             ("msh_draft_tokens_accepted_total", "Draft tokens the head confirmed.", &s.accepted),
+            ("msh_requests_resumed_total", "Requests moved to another worker after a lost link.", &s.requests_resumed),
         ] {
             metric(name, "counter", help, &[("", c.get() as f64)]);
         }
@@ -321,6 +335,8 @@ mod tests {
             cap: 6 << 30,
             done: 9,
             failed: 1,
+            events: vec![("prefill_done", 4), ("memory_high", 0)],
+            commands: vec![("restart", false, 1)],
         };
         let out = render_workers("m4", &[w("m1", "ready", Some(0.002)), w("m4b", "stuck", None)]);
         for line in [
@@ -334,6 +350,8 @@ mod tests {
             "msh_worker_cap_bytes{node=\"m4\",worker=\"m1\"} 6442450944\n",
             "msh_worker_requests_total{node=\"m4\",worker=\"m1\",outcome=\"done\"} 9\n",
             "msh_worker_requests_total{node=\"m4\",worker=\"m4b\",outcome=\"failed\"} 1\n",
+            "msh_worker_events_total{node=\"m4\",worker=\"m1\",kind=\"prefill_done\"} 4\n",
+            "msh_worker_commands_total{node=\"m4\",worker=\"m1\",command=\"restart\",ok=\"false\"} 1\n",
         ] {
             assert!(out.contains(line), "{line} missing from\n{out}");
         }

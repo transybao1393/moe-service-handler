@@ -24,6 +24,7 @@
 //! its memory cap. A single node runs the whole model. An optional `[scheduler]` table sets
 //! `max_in_flight` (default 3), `max_queue` (64), `health_interval_ms` (1000),
 //! `health_timeout_ms` (5000), `stall_timeout_ms` (30000; request split only),
+//! `resume_on_loss` (true; request split only),
 //! `prefill_chunk` (64), `prefill_depth` (3), `max_draft` (0: no speculative decoding),
 //! `draft_min_ngram` (3) and `prefix_cache` (0: no prefix reuse).
 //!
@@ -51,6 +52,8 @@
 //! `max_in_flight` is then per worker, `max_queue` is the controller's queue, a worker that
 //! does not answer a health ping within `health_timeout_ms` is stuck and gets no new requests,
 //! and a request that makes no progress for `stall_timeout_ms` (default 30000) fails alone.
+//! When a worker's link breaks, `resume_on_loss` (default true) moves its requests to another
+//! worker, which carries on from the tokens already sent; `false` fails them instead.
 //! Speculative decoding (`max_draft`) and prefix reuse (`prefix_cache`) are not available here:
 //!
 //! ```toml
@@ -58,6 +61,7 @@
 //! [scheduler]
 //! max_in_flight = 2        # per worker
 //! stall_timeout_ms = 30000
+//! resume_on_loss = true
 //! ```
 //!
 //! An optional `[engine]` table picks the engine (default: the mock):
@@ -758,6 +762,9 @@ mod tests {
         assert!(!c.is_planned());
         let stall = text.replace("max_in_flight = 2", "stall_timeout_ms = 500");
         assert_eq!(Config::parse(&stall).unwrap().scheduler.stall_timeout_ms, 500);
+        assert!(c.scheduler.resume_on_loss);
+        let no_resume = text.replace("max_in_flight = 2", "resume_on_loss = false");
+        assert!(!Config::parse(&no_resume).unwrap().scheduler.resume_on_loss);
         assert!(Config::parse(&THREE.replace("num_layers = 40", "num_layers = 40\nsplit = \"requests\"")).is_err());
         assert!(Config::parse(&text.replace("max_in_flight = 2", "max_draft = 4")).is_err());
         assert!(Config::parse(&text.replace("max_in_flight = 2", "prefix_cache = 1")).is_err());

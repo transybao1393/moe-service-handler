@@ -195,7 +195,14 @@ impl Proxy {
 
 #[test]
 fn lost_worker_retries_unstarted_requests_and_comes_back() {
-    let sched = SchedulerConfig { max_in_flight: 2, prefill_chunk: 1, health_interval_ms: 20, ..Default::default() };
+    // Without resume_on_loss, a request that sent tokens fails with its worker.
+    let sched = SchedulerConfig {
+        max_in_flight: 2,
+        prefill_chunk: 1,
+        health_interval_ms: 20,
+        resume_on_loss: false,
+        ..Default::default()
+    };
     let (ls, real) = listeners(2);
     let proxy = Proxy::start(real[0].parse().unwrap());
     let cfg = config(&[proxy.addr.clone(), real[1].clone()], sched);
@@ -240,6 +247,37 @@ fn lost_worker_retries_unstarted_requests_and_comes_back() {
     assert_eq!(n2.join().unwrap().0.live_requests(), 0);
 }
 
+#[test]
+fn lost_worker_resumes_started_requests_on_another() {
+    let sched = SchedulerConfig { max_in_flight: 2, health_interval_ms: 20, ..Default::default() };
+    let (ls, real) = listeners(2);
+    let proxy = Proxy::start(real[0].parse().unwrap());
+    let cfg = config(&[proxy.addr.clone(), real[1].clone()], sched);
+    let mut ls = ls.into_iter();
+    let n1 = worker(&cfg, 1, ls.next().unwrap(), slow(2), 2);
+    let n2 = worker(&cfg, 2, ls.next().unwrap(), slow(2), 1);
+    let (client, sched) = requests::spawn(&cfg).unwrap();
+    let b = board(&client);
+    assert_eq!(b.wait_ready(2, Duration::from_secs(5)), 2);
+
+    b.drain("n2").unwrap();
+    let (a, a_rx) = client.submit_with_id(prompt(0), 200);
+    let first = next_token(&a_rx);
+    assert_eq!(b.request(a).unwrap().worker.as_deref(), Some("n1"));
+    b.resume("n2").unwrap();
+    proxy.cut();
+
+    // The request carries on from the tokens already sent and ends as if nothing happened.
+    let mut tokens = vec![first];
+    tokens.extend(collect(a_rx).unwrap().tokens);
+    assert_eq!(tokens, reference(&[prompt(0)], 200)[0]);
+    assert_eq!(b.worker("n2").unwrap().done, 1);
+    client.shutdown();
+    sched.join().unwrap();
+    assert_eq!(n2.join().unwrap().0.live_requests(), 0);
+    drop(n1);
+}
+
 /// A fake worker: answers `Hello`, then hands every frame to `f` until it returns false.
 fn fake(cfg: &Config, i: usize, l: TcpListener, mut f: impl FnMut(&mut Connection, msh_net::Header, &[u8]) -> bool + Send + 'static) {
     let cfg = cfg.clone();
@@ -262,7 +300,13 @@ fn pong(link: &mut Connection, seq: u64, requests: Vec<RunStatus>) {
 
 #[test]
 fn hung_worker_becomes_stuck_and_gets_no_new_work() {
-    let sched = SchedulerConfig { health_interval_ms: 20, health_timeout_ms: 300, stall_timeout_ms: 60_000, ..Default::default() };
+    let sched = SchedulerConfig {
+        health_interval_ms: 20,
+        health_timeout_ms: 300,
+        stall_timeout_ms: 60_000,
+        resume_on_loss: false,
+        ..Default::default()
+    };
     let (ls, addrs) = listeners(2);
     let cfg = config(&addrs, sched);
     let mut ls = ls.into_iter();

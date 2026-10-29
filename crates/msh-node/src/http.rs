@@ -2,6 +2,13 @@
 //!
 //! - `GET /v1/models`
 //! - `POST /v1/chat/completions`, with `stream: true` for server-sent events.
+//! - `GET /v1/ws`: a WebSocket of JSON text messages carrying several chats at once. The client
+//!   sends `{"type":"chat","id":"<its id>","messages":[...],"max_tokens":N}` (fields and checks
+//!   as for chat completions) and `{"type":"cancel","id":"..."}`. The server answers
+//!   `{"type":"token","id":"...","text":"..."}` per piece of text, then
+//!   `{"type":"done","id":"...","finish_reason":"length"|"stop"|"cancelled","usage":{"prompt_tokens":n,"completion_tokens":n}}`,
+//!   or `{"type":"error","id":"..."|null,"message":"..."}`. An error for a chat that was
+//!   running ends it. Closing the socket cancels every chat on it.
 //!
 //! On the request split (docs/request-split.md), worker management, all JSON:
 //!
@@ -9,6 +16,10 @@
 //! - `GET /v1/requests`: requests in flight and queued, then the last 16 answered from the
 //!   controller's cache (phase `cached`, worker `controller`).
 //! - `POST /v1/workers/{name}/drain` and `/resume`: stop or restart new requests to a worker.
+//! - `POST /v1/workers/{name}/command` with `{"command": "status" | "reset_stats" | "restart"}`:
+//!   sends it to the worker and answers `{"ok": bool, "message": str}` once the worker does.
+//!   400 for an unknown command, 404 for an unknown worker, 409 when the worker is not
+//!   connected, 504 after 10 s.
 //! - `POST /v1/requests/{id}/cancel`: cancel one request (`7` or `chatcmpl-7`).
 //! - `GET /v1/cache`: the answer cache's entries, bytes, hits and misses by kind, and limits;
 //!   `POST /v1/cache/clear` empties it.
@@ -23,10 +34,13 @@
 //! Memory stays bounded (NF-2): bodies over [`HTTP_BODY_LIMIT`] get 413, and at most
 //! `max_open` requests are read and set up at once; more get 429 before their body is read.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
@@ -67,6 +81,8 @@ pub fn router(state: Arc<HttpState>) -> Router {
         .route("/v1/workers/{name}", get(worker))
         .route("/v1/workers/{name}/drain", post(drain))
         .route("/v1/workers/{name}/resume", post(resume))
+        .route("/v1/workers/{name}/command", post(command))
+        .route("/v1/ws", get(ws))
         .route("/v1/requests", get(requests))
         .route("/v1/requests/{id}/cancel", post(cancel))
         .route("/v1/cache", get(cache))
@@ -177,24 +193,63 @@ async fn cancel(State(s): State<Arc<HttpState>>, Path(id): Path<String>) -> Resp
     }
 }
 
-async fn chat_completions(State(s): State<Arc<HttpState>>, Json(req): Json<ChatRequest>) -> Response {
-    let prompt = match s.codec.encode_chat(&req.messages) {
+#[derive(Deserialize)]
+struct CommandRequest {
+    command: String,
+}
+
+/// Sends a command to a worker and waits, off the runtime, for its answer.
+async fn command(
+    State(s): State<Arc<HttpState>>,
+    Path(name): Path<String>,
+    Json(req): Json<CommandRequest>,
+) -> Response {
+    let b = match board(&s) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let Some(kind) = msh_net::CommandKind::parse(&req.command) else {
+        return bad_request(&format!("unknown command {:?}", req.command));
+    };
+    let rx = match b.command(&name, kind, Duration::from_secs(10)) {
+        Ok(rx) => rx,
+        Err(m) if m.starts_with("no worker") => return error(StatusCode::NOT_FOUND, &m),
+        Err(m) => return error(StatusCode::CONFLICT, &m),
+    };
+    let outcome = tokio::task::spawn_blocking(move || rx.recv()).await;
+    let (ok, message) = match outcome {
+        Ok(Ok(o)) => (o.ok, o.message),
+        _ => (false, "worker down".to_string()),
+    };
+    tracing::info!(worker = name, command = kind.as_str(), ok, message, "worker command");
+    let status = if !ok && message == "timeout" { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::OK };
+    (status, Json(json!({ "ok": ok, "message": message }))).into_response()
+}
+
+/// Turns a chat into a prompt and a completion budget that fits the context.
+fn prepare(s: &HttpState, messages: &[Message], max_tokens: Option<usize>) -> Result<(Vec<u32>, usize), String> {
+    let prompt = match s.codec.encode_chat(messages) {
         Ok(p) if !p.is_empty() => p,
-        Ok(_) => return bad_request("empty prompt"),
-        Err(e) => return bad_request(&e.to_string()),
+        Ok(_) => return Err("empty prompt".to_string()),
+        Err(e) => return Err(e.to_string()),
     };
     let room = s.n_ctx.saturating_sub(prompt.len());
     if room == 0 {
-        let msg = format!("prompt of {} tokens fills the {}-token context", prompt.len(), s.n_ctx);
-        return bad_request(&msg);
+        return Err(format!("prompt of {} tokens fills the {}-token context", prompt.len(), s.n_ctx));
     }
-    let max_new = match req.max_completion_tokens.or(req.max_tokens) {
+    match max_tokens {
         Some(n) if n > room => {
-            let msg = format!("prompt ({}) plus max_tokens ({n}) exceeds the {}-token context", prompt.len(), s.n_ctx);
-            return bad_request(&msg);
+            Err(format!("prompt ({}) plus max_tokens ({n}) exceeds the {}-token context", prompt.len(), s.n_ctx))
         }
-        Some(n) => n,
-        None => room,
+        Some(n) => Ok((prompt, n)),
+        None => Ok((prompt, room)),
+    }
+}
+
+async fn chat_completions(State(s): State<Arc<HttpState>>, Json(req): Json<ChatRequest>) -> Response {
+    let (prompt, max_new) = match prepare(&s, &req.messages, req.max_completion_tokens.or(req.max_tokens)) {
+        Ok(p) => p,
+        Err(m) => return bad_request(&m),
     };
 
     let prompt_tokens = prompt.len();
@@ -296,16 +351,14 @@ fn stream(
         if tx.send(chunk(json!({ "role": "assistant", "content": "" }), None)).await.is_err() {
             return;
         }
-        let mut detok = Detokenizer::new(&s.codec);
-        let mut generated = 0;
+        let mut pieces = Pieces::new(&s.codec, max_new);
         let mut ev = Some(first);
         while let Some(e) = ev {
             match e {
                 Event::Token { token, .. } => {
-                    generated += 1;
-                    let piece = match detok.push(token) {
+                    let piece = match pieces.push(token) {
                         Ok(p) => p,
-                        Err(e) => return send_error(&tx, &e.to_string()).await,
+                        Err(m) => return send_error(&tx, &m).await,
                     };
                     if let Some(text) = piece {
                         if tx.send(chunk(json!({ "content": text }), None)).await.is_err() {
@@ -318,10 +371,200 @@ fn stream(
             }
             ev = events.recv().await;
         }
-        let _ = tx.send(chunk(json!({}), Some(finish_reason(generated, max_new)))).await;
+        let _ = tx.send(chunk(json!({}), Some(pieces.finish_reason()))).await;
         let _ = tx.send(Ok(SseEvent::default().data("[DONE]"))).await;
     });
     Sse::new(ReceiverStream::new(rx))
+}
+
+/// Turns a request's tokens into text as they come, and counts them.
+struct Pieces<'a> {
+    detok: Detokenizer<'a>,
+    generated: usize,
+    max_new: usize,
+}
+
+impl<'a> Pieces<'a> {
+    fn new(codec: &'a Codec, max_new: usize) -> Self {
+        Pieces { detok: Detokenizer::new(codec), generated: 0, max_new }
+    }
+
+    fn push(&mut self, token: u32) -> Result<Option<String>, String> {
+        self.generated += 1;
+        self.detok.push(token).map_err(|e| e.to_string())
+    }
+
+    fn finish_reason(&self) -> &'static str {
+        finish_reason(self.generated, self.max_new)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WsRequest {
+    Chat {
+        id: String,
+        messages: Vec<Message>,
+        max_tokens: Option<usize>,
+        max_completion_tokens: Option<usize>,
+    },
+    Cancel {
+        id: String,
+    },
+}
+
+/// A message from one chat's task to its socket. `last` ends the chat. `request` tells a
+/// cancelled chat's late messages from those of a new chat that reuses its id.
+struct WsOut {
+    id: String,
+    request: u64,
+    body: Value,
+    last: bool,
+}
+
+/// A chat running on a socket: its request, and the task relaying its events.
+struct WsChat {
+    request: u64,
+    task: tokio::task::AbortHandle,
+    prompt_tokens: usize,
+    generated: Arc<AtomicUsize>,
+}
+
+async fn ws(State(s): State<Arc<HttpState>>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.max_message_size(HTTP_BODY_LIMIT).on_upgrade(move |socket| ws_serve(s, socket))
+}
+
+async fn ws_serve(s: Arc<HttpState>, mut socket: WebSocket) {
+    let (tx, mut rx) = mpsc::channel::<WsOut>(64);
+    let mut chats: HashMap<String, WsChat> = HashMap::new();
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                let text = match msg {
+                    Some(Ok(WsMessage::Text(t))) => t,
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => continue,
+                };
+                let reply = match serde_json::from_str::<WsRequest>(text.as_str()) {
+                    Ok(req) => ws_request(&s, &tx, &mut chats, req),
+                    Err(e) => Some(ws_error(None, &format!("bad message: {e}"))),
+                };
+                if let Some(body) = reply {
+                    if socket.send(WsMessage::Text(body.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Some(out) = rx.recv() => {
+                // A chat cancelled from the socket may still have messages on the way; drop them.
+                if chats.get(&out.id).map(|c| c.request) != Some(out.request) {
+                    continue;
+                }
+                if out.last {
+                    chats.remove(&out.id);
+                }
+                if socket.send(WsMessage::Text(out.body.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    for (_, chat) in chats.drain() {
+        ws_cancel(&s, &chat);
+    }
+}
+
+/// Starts or cancels a chat; returns the message to send back at once, if any.
+fn ws_request(
+    s: &Arc<HttpState>,
+    tx: &mpsc::Sender<WsOut>,
+    chats: &mut HashMap<String, WsChat>,
+    req: WsRequest,
+) -> Option<Value> {
+    match req {
+        WsRequest::Cancel { id } => match chats.remove(&id) {
+            Some(chat) => {
+                ws_cancel(s, &chat);
+                let generated = chat.generated.load(Ordering::Relaxed);
+                Some(ws_done(&id, "cancelled", chat.prompt_tokens, generated))
+            }
+            None => Some(ws_error(Some(&id), &format!("no chat with id {id:?}"))),
+        },
+        WsRequest::Chat { id, messages, max_tokens, max_completion_tokens } => {
+            if chats.contains_key(&id) {
+                return Some(ws_error(Some(&id), &format!("duplicate id {id:?}")));
+            }
+            let (prompt, max_new) = match prepare(s, &messages, max_completion_tokens.or(max_tokens)) {
+                Ok(p) => p,
+                Err(m) => return Some(ws_error(Some(&id), &m)),
+            };
+            let prompt_tokens = prompt.len();
+            let (request, rx) = s.client.submit_with_id(prompt, max_new);
+            tracing::info!(request, prompt = prompt_tokens, max_new, client_id = id, "websocket chat");
+            let generated = Arc::new(AtomicUsize::new(0));
+            let relay =
+                ws_chat(s.clone(), id.clone(), request, forward(rx), tx.clone(), generated.clone(), prompt_tokens, max_new);
+            let task = tokio::spawn(relay).abort_handle();
+            chats.insert(id, WsChat { request, task, prompt_tokens, generated });
+            None
+        }
+    }
+}
+
+/// Relays one chat's events to its socket. `generated` counts its tokens for a cancel's usage.
+async fn ws_chat(
+    s: Arc<HttpState>,
+    id: String,
+    request: u64,
+    mut events: mpsc::Receiver<Event>,
+    tx: mpsc::Sender<WsOut>,
+    generated: Arc<AtomicUsize>,
+    prompt_tokens: usize,
+    max_new: usize,
+) {
+    let mut pieces = Pieces::new(&s.codec, max_new);
+    let last = loop {
+        let text = match events.recv().await {
+            Some(Event::Token { token, .. }) => {
+                generated.fetch_add(1, Ordering::Relaxed);
+                match pieces.push(token) {
+                    Ok(Some(text)) => text,
+                    Ok(None) => continue,
+                    Err(m) => break ws_error(Some(&id), &m),
+                }
+            }
+            Some(Event::Done) => break ws_done(&id, pieces.finish_reason(), prompt_tokens, pieces.generated),
+            Some(Event::Failed(m) | Event::Rejected(m)) => break ws_error(Some(&id), &m),
+            None => break ws_error(Some(&id), "scheduler stopped"),
+        };
+        let body = json!({ "type": "token", "id": id, "text": text });
+        // The socket is gone; returning drops `events`, which cancels the request.
+        if tx.send(WsOut { id: id.clone(), request, body, last: false }).await.is_err() {
+            return;
+        }
+    };
+    let _ = tx.send(WsOut { id, request, body: last, last: true }).await;
+}
+
+/// Stops a chat's relay, which cancels its request; on the request split, cancels it at once.
+fn ws_cancel(s: &HttpState, chat: &WsChat) {
+    chat.task.abort();
+    if let Some(b) = s.client.board() {
+        let _ = b.cancel(chat.request);
+    }
+}
+
+fn ws_done(id: &str, finish_reason: &str, prompt_tokens: usize, completion_tokens: usize) -> Value {
+    json!({
+        "type": "done",
+        "id": id,
+        "finish_reason": finish_reason,
+        "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens },
+    })
+}
+
+fn ws_error(id: Option<&str>, msg: &str) -> Value {
+    json!({ "type": "error", "id": id, "message": msg })
 }
 
 async fn send_error(tx: &mpsc::Sender<Result<SseEvent, Infallible>>, msg: &str) {
