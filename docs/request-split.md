@@ -2,7 +2,9 @@
 
 Status: phase 1 (worker management) built: `split = "requests"`, tested on the mock and on
 OLMoE (2 workers, each running the whole model, match the reference with 4 requests at once).
-Phase 2 (the controller deciding and commanding) is designed below, not built. Chosen 2026-10-28 (D30 in the decision log) because it uses
+Worker events, the command channel (`status`, `reset_stats`, `restart`), resume on loss and
+a WebSocket API are built too. The rest of phase 2 (the controller deciding and acting on its
+own) is designed below, not built. Chosen 2026-10-28 (D30 in the decision log) because it uses
 streammoe exactly as it is: each worker runs the whole model in mode A, and nothing in
 streammoe has to change.
 
@@ -91,6 +93,7 @@ The controller keeps a table with one row per worker:
 | `done`, `failed` | requests finished and failed on it |
 | `tokens_per_s` | recent decode speed |
 | `footprint`, `cap` | from the worker's status report |
+| `memory_high`, `last_event` | from its events: kind, text and time |
 | `last_error` | the last error it sent, with time and request |
 
 - **Status report:** every `Pong` carries the worker's status: its footprint and cap, and per
@@ -105,9 +108,22 @@ The controller keeps a table with one row per worker:
   answers pings. Progress is a new token or, during prefill, prompt positions advancing in the
   status report, so a long prompt is not failed as stalled. Only that request is failed and dropped on its worker.
 - **Lost worker:** its connection breaks. It is marked `down`; its requests that have not sent
-  a token yet go to another worker, the others fail (the client already has part of the
-  answer). The controller reconnects in the background, and the worker is `ready` again once
-  it says hello.
+  a token yet go to another worker. With `[scheduler] resume_on_loss` (default true) the
+  others resume on another worker too, from the prompt plus the tokens already sent, so the
+  client's stream just carries on (at most twice per request; `msh_requests_resumed_total`).
+  The next `Start` carries the prompt plus the tokens made, with `max_new` less those tokens;
+  `resumed` in `/v1/requests` counts the moves, and each move is a log line. The answer cache
+  keys on the original prompt and gets the whole answer. Greedy decoding gives the same next
+  tokens, but the second worker reads the made tokens back as a prompt, which can differ from
+  decoding them in the last bits, so the rest is very likely, not certainly, identical.
+  A request whose last token was the end of sequence (the controller's tokenizer knows it) is
+  finished instead. With `resume_on_loss = false` they fail. The controller reconnects in the
+  background, and the worker is `ready` again once it says hello.
+- **Events:** a worker sends an `Event` on its own, with no ping. `PrefillDone`: the request
+  moves to `decode` at once, as progress. `MemoryHigh` (footprint past 95 % of its cap): the
+  worker gets no new requests until `MemoryOk` (back under 90 %) or a status report under 90 %.
+  No cap, no memory events. `Note`: a log line. Each event is one log line, shows in the table
+  as `memory_high` and `last_event`, and counts as hearing from the worker.
 - **The cluster stays up while at least one worker is ready.** With none, new and queued
   requests fail (HTTP 503).
 - `connecting` is the state before a worker's first `Hello`; after a loss it stays `down` until
@@ -123,8 +139,10 @@ What the operator sees, all on the controller:
 | `GET /v1/workers/{name}` | one worker |
 | `GET /v1/requests` | requests in flight and queued: worker, phase, position, tokens, waiting time |
 | `POST /v1/workers/{name}/drain`, `/resume` | stop or restart new requests to a worker |
+| `POST /v1/workers/{name}/command` | `{"command": "status" \| "reset_stats" \| "restart"}` sent as a `Command`; answers `{"ok", "message"}` from the worker's `Result` (400 unknown command, 404 unknown worker, 409 not connected, 504 after 10 s). `restart` is refused while the worker holds requests; otherwise it exits 0 and launchd starts it again |
 | `POST /v1/requests/{id}/cancel` | cancel one request |
-| Prometheus | per-worker series with `worker="NAME"`: state, requests running, tokens per second, ping round trip, footprint, done and failed |
+| `GET /v1/ws` | WebSocket, every split: several chats on one socket (`chat`, `cancel`; `token`, `done`, `error`); closing it cancels them all. Formats in the README |
+| Prometheus | per-worker series with `worker="NAME"`: state, requests running, tokens per second, ping round trip, footprint, done and failed, events by kind (`msh_worker_events_total`), commands by command and result (`msh_worker_commands_total`) |
 | Logs | one line per state change: worker, old and new state, reason |
 
 ## Control: the controller decides and commands (phase 2)
@@ -134,15 +152,16 @@ commands. It works only through what streammoe already offers: its open settings
 measurements it reports (expert I/O and hot-tier hits, prefetch hits, footprint and peak
 against the cap, per-command timings).
 
-**Commands to a worker** (new `Command` frame, answered with the result):
+**Commands to a worker** (`Command` frame, answered with a `Result`; built except `reopen`):
 
-| Command | What the worker does | Allowed when |
-| --- | --- | --- |
-| drain / resume | takes no new requests / takes them again (controller side) | always |
-| cancel | drops one request | always |
-| `reopen` | closes streammoe and opens it again with new open settings: cap, 4-bit or 3-bit experts, KV format, prefetch guess and count, attention threads, request slots | drained (no requests) |
-| `restart` | exits; launchd starts it again | drained, or stuck |
-| `reset_stats` | clears streammoe's counters, to start a measurement | always |
+| Command | What the worker does | Allowed when | Built |
+| --- | --- | --- | --- |
+| drain / resume | takes no new requests / takes them again (controller side) | always | yes |
+| cancel | drops one request | always | yes |
+| `status` | answers one line: requests held, footprint, cap, uptime, requests and tokens since the last reset | always | yes |
+| `reopen` | closes streammoe and opens it again with new open settings: cap, 4-bit or 3-bit experts, KV format, prefetch guess and count, attention threads, request slots | drained (no requests) | no |
+| `restart` | exits; launchd starts it again | holding no request (else "busy: N requests") | yes |
+| `reset_stats` | clears the worker's counters, to start a measurement; streammoe has no counters to clear yet | always | yes |
 
 **Decisions** (a policy loop on the controller, every few seconds):
 
@@ -219,13 +238,17 @@ Beside `Hello`, `Ping`/`Pong`, `Token`, `Drop`, `Error`:
 | `Start` = 14 | controller → worker | request id in the header; `max_new u32, count u32`, then `token u32` × count |
 | `Token` | worker → controller | request id in the header, position = the token's position; the token id |
 | `Done` = 15 | worker → controller | request id, position = tokens made; one byte: `0` length, `1` end of sequence, `2` dropped |
+| `Event` = 16 | worker → controller | request id (0 if none) and a position in the header; `kind u8, value u64`, then UTF-8 text. Kinds: `1` prefill done (position = prompt length, value = µs), `2` memory high (value = footprint, text = cap), `3` memory ok, `4` note |
+| `Command` = 17 | controller → worker | command id in the header; `kind u8`: `1` status, `2` reset stats, `3` restart |
+| `Result` = 18 | worker → controller | the command's id; `ok u8`, then a UTF-8 message |
 | `Pong` | worker → controller | the status report: tagged sections (`tag u16, len u32, bytes`), unknown tags skipped. Tag 1 memory (footprint, cap); tag 2 requests (count, entry length, then per request id, decoding, position, tokens made). New fields go at the end of an entry or in a new tag |
 
 A message in chunks is several frames with the same type, request id and position: all but
 the last carry the `more` flag (`0x80`), and the first starts with the whole payload length
-(u32). Chunks of different requests may interleave; a request's own never do.
+(u32). Chunks of different requests may interleave; a request's own never do. An unknown
+event or command kind is skipped; the link stays up.
 
-Protocol version 7.
+Protocol version 8.
 
 ## What stays and what changes
 
@@ -236,7 +259,9 @@ Protocol version 7.
   them), the per-step metrics CSV, and routing a chat's next turn to the worker that holds it.
 - **New:** `split = "requests"`, the worker table and its endpoints, per-request progress,
   stuck and lost handling per worker, reconnect, drain, the controller's answer cache, chunked
-  links.
+  links, worker events, the command channel (`status`, `reset_stats`, `restart`), resume on
+  loss, and `GET /v1/ws`.
 - **Next, with streammoe as it is:** decode several requests on a worker in one batch
   (`eval_requests`) and speculative decoding on the worker (`eval_tokens`). Both work on the
-  whole model today.
+  whole model today. Not built yet: the `reopen` command and the policy loop that sends
+  commands on its own.

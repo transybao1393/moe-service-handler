@@ -76,6 +76,15 @@ impl Codec {
         Codec { tokenizer, template }
     }
 
+    /// The end-of-sequence token the template ends a turn with, if the tokenizer has it.
+    pub fn eos(&self) -> Option<u32> {
+        let text = match self.template {
+            ChatTemplate::Olmoe => OLMOE_BOS_EOS,
+            ChatTemplate::Chatml => "<|im_end|>",
+        };
+        self.tokenizer.token_to_id(text)
+    }
+
     /// Token ids for a chat, ending with the assistant prompt. The template supplies any BOS.
     pub fn encode_chat(&self, messages: &[Message]) -> Result<Vec<u32>, Error> {
         let text = self.template.render(messages)?;

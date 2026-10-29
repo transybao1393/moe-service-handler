@@ -45,12 +45,29 @@ experts (from `--plan`); the rest streams from its SSD.
 - **Stuck worker:** a ping not back within `health_timeout_ms` (5 s). It gets no new work and
   its requests show what they were on ("decode, token 212 of 500, no progress for 31 s").
 - **Stalled request:** no progress for `stall_timeout_ms` (30 s): only that request fails.
-- **Lost worker:** requests that sent nothing yet go to the other worker; the rest fail. The
-  controller reconnects, and the worker serves again after its `Hello`.
+- **Lost worker:** requests that sent nothing yet go to the other worker. With
+  `[scheduler] resume_on_loss` (default true) the rest go there too: the other worker gets the
+  prompt plus the tokens made so far, and the client's stream goes on with no token repeated
+  or missed. One whose last token was the end of sequence is finished instead. A request
+  moves at most twice, then fails; `resumed` in `/v1/requests` counts the moves. Greedy
+  decoding gives the same next tokens, but the second worker reads the made tokens back as a
+  prompt, which can differ from decoding in the last bits, so the rest is very likely, not
+  certainly, the same answer. With `false` they fail. The controller reconnects,
+  and the worker serves again after its `Hello`.
+- **Worker events:** a worker sends an `Event` on its own: `PrefillDone` (the request moves to
+  decode at once), `MemoryHigh` past 95 % of its cap (it gets no new requests) and `MemoryOk`
+  back under 90 %, and `Note`. Each is a log line and shows as the worker's `last_event`.
+- **Commands:** `POST /v1/workers/{name}/command` with `{"command": "status"}`,
+  `"reset_stats"` or `"restart"` sends a `Command` and answers `{"ok", "message"}` with the
+  worker's `Result`. `restart` is refused while the worker holds a request; otherwise it exits
+  and launchd starts it again. 400 unknown command, 404 unknown worker, 409 not connected,
+  504 after 10 s.
 - **The cluster stays up while one worker is ready**; with none, requests get 503.
 - **Endpoints:** `GET /v1/workers`, `GET /v1/workers/{name}`, `GET /v1/requests`,
-  `POST /v1/workers/{name}/drain` and `/resume`, `POST /v1/requests/{id}/cancel`; per-worker
-  Prometheus series (`worker="NAME"`) and a log line per state change.
+  `POST /v1/workers/{name}/drain` and `/resume`, `POST /v1/workers/{name}/command`,
+  `POST /v1/requests/{id}/cancel`; per-worker Prometheus series (`worker="NAME"`, with
+  `msh_worker_events_total{kind}` and `msh_worker_commands_total{command,ok}`),
+  `msh_requests_resumed_total`, and a log line per state change.
 - **Answer cache** (`[cache]`, on the controller only): prompts it has answered, kept in its own
   RAM and never shared; the workers keep their own KV caches inside streammoe. The key is the
   prompt's tokens, `max_new`, and the model, engine settings and chat template; sampling is
@@ -62,9 +79,9 @@ experts (from `--plan`); the rest streams from its SSD.
   coordinate) and compared on the codes. Past `max_entries` (10 000) or `max_mib` (32), the
   least recently used go first. `GET /v1/cache` (entries, hits, misses), `POST /v1/cache/clear`,
   `msh_cache_*` series; a hit shows in `/v1/requests` as phase `cached` on worker `controller`.
-- **Next (designed, not built):** the controller decides and commands: routing a chat's next
-  turn to the worker that holds it, per-worker load limits, reopening or restarting a stuck
-  worker, and tuning streammoe's open settings one worker at a time.
+- **Next (designed, not built):** the controller decides and acts on its own: routing a chat's
+  next turn to the worker that holds it, per-worker load limits, reopening or restarting a
+  stuck worker, and tuning streammoe's open settings one worker at a time.
 
 **Layer split** (`split = "layers"`, the default). Each node runs a contiguous layer range
 (streammoe's `layer_range`). The controller runs its layers and sends the hidden state to m1,
@@ -91,9 +108,10 @@ decoding and prefix reuse apply to the layer split.
 - **Frames:** 24-byte little-endian header (magic, version, type, request id, position,
   length) + payload. Types: `Hidden`, `Token`, `Drop`, `Rewind`, `Ping`/`Pong`, `Hello`, `Error`;
   for the request split also `Start`, `Done` and a status report in `Pong`; for the expert
-  split `Experts`, `Partial`, `Own`, `Move`, `Release`. A message in chunks is several frames
-  with the same type and request id: all but the last carry a `more` flag, and the first
-  starts with the whole length (protocol version 7).
+  split `Experts`, `Partial`, `Own`, `Move`, `Release`; for worker events and commands
+  `Event`, `Command`, `Result`. A message in chunks is several frames with the same type and
+  request id: all but the last carry a `more` flag, and the first starts with the whole length
+  (protocol version 8).
 - **f32 on the wire:** the engine works in f32, so a split pipeline stays bit-identical to
   one process. Hidden states go on the wire straight from the engine's output buffer and are
   read straight into the next engine's input, with no encode or decode copy (NET-6). The
@@ -157,6 +175,13 @@ decoding and prefix reuse apply to the layer split.
   `POST /v1/chat/completions` (plain or streamed), with greedy sampling. A full queue answers
   429, a cluster that is down 503. In the request split the controller also serves the worker
   management and cache endpoints above.
+- **WebSocket** (`GET /v1/ws`, every split): several chats at once on one socket, as JSON text
+  messages. The client sends `{"type":"chat","id":"<its id>","messages":[...],"max_tokens":N}`
+  (checked as for chat completions) and `{"type":"cancel","id":"..."}`. The server sends
+  `{"type":"token","id":"...","text":"..."}` per piece of text, then
+  `{"type":"done","id":"...","finish_reason":"length"|"stop"|"cancelled","usage":{...}}`, or
+  `{"type":"error","id":"..."|null,"message":"..."}` (bad JSON, unknown or duplicate id, queue
+  full, cluster down). Closing the socket cancels every chat on it.
 
 ## Crates
 

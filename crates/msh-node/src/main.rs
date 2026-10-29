@@ -327,6 +327,7 @@ fn serve_requests<'a>(
     let cfg = &cfg;
     let (client, sched) = msh_node::requests::spawn(cfg)?;
     let board = client.board().expect("request split").clone();
+    board.set_eos(codec.as_ref().and_then(Codec::eos));
     let ready = board.wait_ready(workers, CONNECT_TIMEOUT);
     if ready == 0 {
         return Err(format!("no worker ready after {} s", CONNECT_TIMEOUT.as_secs()).into());
@@ -350,6 +351,9 @@ fn serve_request_worker<E: Engine>(cfg: &Config, idx: usize, engine: E) -> Resul
     info!(role = "worker", runs = role(cfg, idx), listen = node.listen_addr(), "waiting for the controller");
     let mut worker = RequestWorker::new(engine, &node.name, cfg.scheduler.prefill_chunk, cap);
     worker.serve_forever(cfg, idx, &listener)?;
+    if worker.restart_requested() {
+        info!("restart requested by the controller; exiting for launchd to start us again");
+    }
     Ok(())
 }
 

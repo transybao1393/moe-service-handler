@@ -26,6 +26,12 @@
 //! it stops. A worker answers `Ping` with a `Pong` carrying its status report (see
 //! [`encode_status`]).
 //!
+//! Version 8 adds `Event`, `Command` and `Result`. A worker sends an `Event` on its own (a
+//! request's prefill ended, its memory passed or fell back under its cap); the controller sends
+//! a `Command` with its own command id as the request id, and the worker answers with a
+//! `Result` carrying the same id. Unknown event or command kinds decode to
+//! [`FrameError::UnknownKind`]; the receiver skips the frame and keeps the link.
+//!
 //! Chunking: a message whose payload is larger than the link's `max_chunk` goes as several
 //! frames with the same type, request id and position, so a small frame never waits behind a
 //! whole prompt chunk. Every frame but the last has [`FLAG_MORE`]; the first frame's payload
@@ -37,7 +43,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"MSHN";
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// On a `Hidden` frame: the head returns the token sampled after every position, not just the
 /// last. Workers pass it on.
@@ -94,6 +100,15 @@ pub enum MsgType {
     /// A worker stopped a request (request split): the request id in the header, the tokens it
     /// made as the position, and why in the payload (see [`encode_done`]).
     Done = 15,
+    /// Something a worker tells its controller on its own (request split): the request id (0
+    /// when not about one) and a kind-specific position in the header, then kind, value and text
+    /// (see [`encode_event`]).
+    Event = 16,
+    /// An order for a worker: the command id in the header, the kind in the payload (see
+    /// [`encode_command`]).
+    Command = 17,
+    /// A worker's answer to one `Command`, with the same id (see [`encode_result`]).
+    Result = 18,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -116,6 +131,9 @@ impl TryFrom<u8> for MsgType {
             13 => MsgType::Release,
             14 => MsgType::Start,
             15 => MsgType::Done,
+            16 => MsgType::Event,
+            17 => MsgType::Command,
+            18 => MsgType::Result,
             other => return Err(FrameError::UnknownType(other)),
         })
     }
@@ -195,6 +213,8 @@ pub enum FrameError {
     Remote(String),
     /// The connection ended in the middle of a chunked message.
     Incomplete { msg_type: MsgType, request_id: u64 },
+    /// An `Event` or `Command` of a kind this build does not know.
+    UnknownKind { msg_type: MsgType, kind: u8 },
 }
 
 impl fmt::Display for FrameError {
@@ -212,6 +232,7 @@ impl fmt::Display for FrameError {
                 write!(f, "expected {expected:?} frame, got {got:?}")
             }
             FrameError::Remote(msg) => write!(f, "remote error: {msg}"),
+            FrameError::UnknownKind { msg_type, kind } => write!(f, "unknown {msg_type:?} kind {kind}"),
             FrameError::Incomplete { msg_type, request_id } => {
                 write!(f, "connection ended inside a chunked {msg_type:?} of request {request_id}")
             }
@@ -457,6 +478,9 @@ pub fn decode_move(bytes: &[u8]) -> Result<(u16, u16, &[u8]), FrameError> {
 //     tag 1, memory:   footprint u64, cap u64 (0: no cap)
 //     tag 2, requests: count u32, entry_len u16, count entries of entry_len bytes, each
 //                      request u64, decoding u8, position u32, made u32, then any later fields
+//   Event:   kind u8, value u64, text (UTF-8, rest)
+//   Command: kind u8 (arguments may follow in a later version)
+//   Result:  ok u8 (1 or 0), message (UTF-8, rest)
 
 /// Encodes a `Start` payload: generate up to `max_new` tokens after `prompt`.
 pub fn encode_start(max_new: u32, prompt: &[u32], out: &mut Vec<u8>) {
@@ -506,6 +530,123 @@ pub fn decode_done(bytes: &[u8]) -> Result<DoneReason, FrameError> {
         [2] => Ok(DoneReason::Dropped),
         _ => Err(bad_payload(format!("done payload {bytes:?}"))),
     }
+}
+
+/// What an `Event` reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EventKind {
+    /// A request's prompt is prefilled; position = prompt length, value = prefill microseconds.
+    PrefillDone = 1,
+    /// Footprint passed 95 % of the cap; value = footprint bytes, position = 0, text = cap in
+    /// bytes as decimal.
+    MemoryHigh = 2,
+    /// Footprint back under 90 % of the cap; value = footprint bytes.
+    MemoryOk = 3,
+    /// Anything else worth a log line on the controller; text says what.
+    Note = 4,
+}
+
+impl EventKind {
+    pub const ALL: [EventKind; 4] = [EventKind::PrefillDone, EventKind::MemoryHigh, EventKind::MemoryOk, EventKind::Note];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::PrefillDone => "prefill_done",
+            EventKind::MemoryHigh => "memory_high",
+            EventKind::MemoryOk => "memory_ok",
+            EventKind::Note => "note",
+        }
+    }
+}
+
+/// Encodes an `Event` payload.
+pub fn encode_event(kind: EventKind, value: u64, text: &str, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(9 + text.len());
+    out.push(kind as u8);
+    out.extend_from_slice(&value.to_le_bytes());
+    out.extend_from_slice(text.as_bytes());
+}
+
+/// Decodes an `Event` payload: kind, value and text.
+pub fn decode_event(bytes: &[u8]) -> Result<(EventKind, u64, &str), FrameError> {
+    let (head, text) = bytes.split_at_checked(9).ok_or_else(|| bad_payload("event payload too short".into()))?;
+    let kind = match head[0] {
+        1 => EventKind::PrefillDone,
+        2 => EventKind::MemoryHigh,
+        3 => EventKind::MemoryOk,
+        4 => EventKind::Note,
+        kind => return Err(FrameError::UnknownKind { msg_type: MsgType::Event, kind }),
+    };
+    let text = std::str::from_utf8(text).map_err(|_| bad_payload("event text is not UTF-8".into()))?;
+    Ok((kind, u64::from_le_bytes(head[1..9].try_into().unwrap()), text))
+}
+
+/// What a `Command` asks a worker to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CommandKind {
+    /// Answer with a one-line status (requests held, footprint, cap, uptime).
+    Status = 1,
+    /// Clear the worker's own counters (and the engine's, if the Engine has a way; else say so).
+    ResetStats = 2,
+    /// Leave the serve loop so the process exits and launchd starts it again. Refused
+    /// (ok = 0, "busy: N requests") while the worker holds any request.
+    Restart = 3,
+}
+
+impl CommandKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommandKind::Status => "status",
+            CommandKind::ResetStats => "reset_stats",
+            CommandKind::Restart => "restart",
+        }
+    }
+
+    pub const ALL: [CommandKind; 3] = [CommandKind::Status, CommandKind::ResetStats, CommandKind::Restart];
+
+    /// The kind [`as_str`](Self::as_str) names, if any.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+}
+
+/// Encodes a `Command` payload.
+pub fn encode_command(kind: CommandKind, out: &mut Vec<u8>) {
+    out.clear();
+    out.push(kind as u8);
+}
+
+/// Decodes a `Command` payload. Bytes after the kind are left for later arguments.
+pub fn decode_command(bytes: &[u8]) -> Result<CommandKind, FrameError> {
+    match bytes.first() {
+        Some(1) => Ok(CommandKind::Status),
+        Some(2) => Ok(CommandKind::ResetStats),
+        Some(3) => Ok(CommandKind::Restart),
+        Some(&kind) => Err(FrameError::UnknownKind { msg_type: MsgType::Command, kind }),
+        None => Err(bad_payload("empty command payload".into())),
+    }
+}
+
+/// Encodes a `Result` payload.
+pub fn encode_result(ok: bool, message: &str, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(1 + message.len());
+    out.push(ok as u8);
+    out.extend_from_slice(message.as_bytes());
+}
+
+/// Decodes a `Result` payload: whether the command worked, and the worker's message.
+pub fn decode_result(bytes: &[u8]) -> Result<(bool, &str), FrameError> {
+    let (ok, message) = match bytes.split_first() {
+        Some((0, m)) => (false, m),
+        Some((1, m)) => (true, m),
+        _ => return Err(bad_payload(format!("result payload starts {:?}", bytes.first()))),
+    };
+    let message = std::str::from_utf8(message).map_err(|_| bad_payload("result message is not UTF-8".into()))?;
+    Ok((ok, message))
 }
 
 /// A worker's status report, the payload of its `Pong`. New fields go in new sections (or at
@@ -900,8 +1041,54 @@ mod tests {
     }
 
     #[test]
+    fn event_command_result_payloads_round_trip() {
+        let mut b = Vec::new();
+        let events = [
+            (EventKind::PrefillDone, 1234, ""),
+            (EventKind::MemoryHigh, u64::MAX, "17179869184"),
+            (EventKind::MemoryOk, 0, ""),
+            (EventKind::Note, 5, "héllo"),
+        ];
+        for (kind, value, text) in events {
+            encode_event(kind, value, text, &mut b);
+            assert_eq!(decode_event(&b).unwrap(), (kind, value, text));
+        }
+        for kind in [CommandKind::Status, CommandKind::ResetStats, CommandKind::Restart] {
+            encode_command(kind, &mut b);
+            assert_eq!(decode_command(&b).unwrap(), kind);
+            assert_eq!(CommandKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(CommandKind::parse("reboot"), None);
+        for (ok, message) in [(true, "ok"), (false, "busy: 2 requests"), (true, "")] {
+            encode_result(ok, message, &mut b);
+            assert_eq!(decode_result(&b).unwrap(), (ok, message));
+        }
+    }
+
+    #[test]
+    fn unknown_kinds_and_short_payloads_are_rejected() {
+        let mut b = Vec::new();
+        encode_event(EventKind::Note, 7, "x", &mut b);
+        b[0] = 9;
+        assert!(matches!(decode_event(&b), Err(FrameError::UnknownKind { msg_type: MsgType::Event, kind: 9 })));
+        b[0] = 0;
+        assert!(matches!(decode_event(&b), Err(FrameError::UnknownKind { kind: 0, .. })));
+        encode_event(EventKind::Note, 7, "", &mut b);
+        assert!(decode_event(&b[..8]).is_err());
+        assert!(decode_event(&[]).is_err());
+        encode_event(EventKind::Note, 7, "x", &mut b);
+        *b.last_mut().unwrap() = 0xFF;
+        assert!(decode_event(&b).is_err());
+        assert!(matches!(decode_command(&[4]), Err(FrameError::UnknownKind { msg_type: MsgType::Command, kind: 4 })));
+        assert!(decode_command(&[]).is_err());
+        assert!(decode_result(&[]).is_err());
+        assert!(decode_result(&[2, b'x']).is_err());
+        assert!(decode_result(&[1, 0xFF]).is_err());
+    }
+
+    #[test]
     fn request_split_types_decode() {
-        for t in [MsgType::Start, MsgType::Done] {
+        for t in [MsgType::Start, MsgType::Done, MsgType::Event, MsgType::Command, MsgType::Result] {
             let h = Header::new(t, 3, 4, 0);
             assert_eq!(Header::decode(&h.encode()).unwrap().msg_type, t);
         }

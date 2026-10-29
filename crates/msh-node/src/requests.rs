@@ -14,16 +14,30 @@
 //! the health ping, what it runs (per request its phase, position, tokens sent, start and last
 //! progress), done and failed counts, recent tokens and prompt positions per second and
 //! errors in the last minute, its footprint and cap from its status report, and its last
-//! error. Its actions ([`Board::drain`], [`Board::resume`], [`Board::cancel`],
-//! [`Board::mark_stuck`], [`Board::mark_down`]) are plain calls, for the HTTP API or a policy.
+//! error, whether its memory is high, and the last event it sent. Its actions
+//! ([`Board::drain`], [`Board::resume`], [`Board::cancel`], [`Board::mark_stuck`],
+//! [`Board::mark_down`], [`Board::command`]) are plain calls, for the HTTP API or a policy.
+//!
+//! Events: a worker sends an `Event` on its own. `PrefillDone` moves its request to decode at
+//! once (progress); `MemoryHigh` (footprint past 95 % of its cap) stops new requests to it
+//! until `MemoryOk` or a status report under 90 % of the cap; `Note` is a log line. Every
+//! event is one log line, shows as the worker's last event, and counts as hearing from it, as
+//! a pong does, so an overdue ping alone does not make it stuck. Commands: [`Board::command`]
+//! sends a `Command` (`status`, `reset_stats`, `restart`) with its own id and hands back a
+//! receiver for the worker's `Result`, or "timeout", or "worker down" when the link breaks.
+//! A worker that restarts goes down and reconnects as any other.
 //!
 //! Health: every `health_interval_ms` each connected worker gets a `Ping`, and its `Pong`
 //! carries its status report. A ping not back within `health_timeout_ms` makes the worker
 //! stuck: it gets no new requests until a ping is answered, and its requests show what they
 //! were on. A request without progress (a token, or prompt positions in a status report) for
 //! `stall_timeout_ms` fails alone and is dropped on its worker. A worker whose connection
-//! breaks is down: its requests that have sent no token yet go back to the front of the queue,
-//! the others fail, and a background thread reconnects, forever, waiting `[net]
+//! breaks is down: its requests that have sent no token yet go back to the front of the queue;
+//! with `[scheduler] resume_on_loss` the others go there too, at most twice each, as resumed
+//! requests: the next `Start` carries the prompt and the tokens sent so far, with the limit
+//! less those tokens, so the client's stream goes on with no token repeated or missed (and
+//! the answer cache still keys on the original prompt). Without it, or past two moves, they
+//! fail. A background thread reconnects, forever, waiting `[net]
 //! reconnect_min_ms` doubling to `reconnect_max_ms` between tries (the table shows the tries
 //! and when the next is due); after its `Hello` it is ready again. A failed write on a link
 //! counts as the link broken.
@@ -49,8 +63,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use msh_net::{
-    decode_done, decode_status, decode_token, encode_start, Connection, DoneReason, FrameError, Header, MsgType, Status,
-    Writer,
+    decode_done, decode_event, decode_result, decode_status, decode_token, encode_command, encode_start, CommandKind,
+    Connection, DoneReason, EventKind, FrameError, Header, MsgType, Status, Writer,
 };
 use serde::Serialize;
 use tracing::{debug, info, warn};
@@ -130,6 +144,26 @@ pub struct WorkerView {
     /// (Unix ms).
     pub reconnect_tries: u32,
     pub next_try: Option<u64>,
+    /// Set by a `MemoryHigh` event: it gets no new requests until its memory is back down.
+    pub memory_high: bool,
+    pub last_event: Option<LastEvent>,
+}
+
+/// The last event a worker sent.
+#[derive(Clone, Debug, Serialize)]
+pub struct LastEvent {
+    /// `prefill_done`, `memory_high`, `memory_ok` or `note`.
+    pub kind: &'static str,
+    pub text: String,
+    /// Unix ms.
+    pub at: u64,
+}
+
+/// A worker's answer to [`Board::command`].
+#[derive(Clone, Debug, Serialize)]
+pub struct CommandOutcome {
+    pub ok: bool,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -163,6 +197,8 @@ pub struct RequestView {
     pub idle_ms: Option<u64>,
     /// Times it went back to the queue after its worker was lost.
     pub retries: u32,
+    /// Times it moved to another worker after sending tokens (resume on loss).
+    pub resumed: u32,
     /// Set while its worker is stuck: what it was on.
     pub stuck: Option<String>,
     /// Answered from the cache: how.
@@ -256,11 +292,19 @@ struct Slot {
     footprint: u64,
     cap: u64,
     last_error: Option<(Instant, Option<u64>, String)>,
+    /// When it last sent anything a ping waits for: a pong or an event.
+    last_heard: Instant,
+    memory_high: bool,
+    last_event: Option<(Instant, EventKind, String)>,
+    /// Events received, indexed like [`EventKind::ALL`].
+    events: [u64; EventKind::ALL.len()],
+    /// Commands answered, indexed like [`CommandKind::ALL`], then [failed, ok].
+    commands: [[u64; 2]; CommandKind::ALL.len()],
 }
 
 impl Slot {
     fn takes_work(&self, max_in_flight: usize) -> bool {
-        self.state == WorkerState::Ready && self.send.is_some() && self.running.len() < max_in_flight
+        self.state == WorkerState::Ready && self.send.is_some() && !self.memory_high && self.running.len() < max_in_flight
     }
 
     fn tokens_per_s(&self, now: Instant) -> f64 {
@@ -284,19 +328,29 @@ struct Req {
     last_progress: Instant,
     last_token: Option<Instant>,
     retries: u32,
+    /// Times it moved to another worker after sending tokens, and the tokens sent before its
+    /// latest start (they go after the prompt in its `Start`).
+    resumed: u32,
+    base: u32,
     /// The client has its outcome; the worker's `Done` frees the slot.
     dropping: bool,
-    /// Its cache key, and the tokens sent so far, for the cache once it is done.
+    /// Its cache key, and the tokens sent so far, for the cache once it is done and to resume
+    /// it on another worker.
     probe: Option<Probe>,
     answer: Vec<u32>,
 }
 
 impl Req {
+    /// The prompt its latest `Start` carried: the prompt and the tokens sent before it.
+    fn start_len(&self) -> usize {
+        self.prompt.len() + self.base as usize
+    }
+
     /// What it is on, e.g. "decode, token 212 of 500".
     fn doing(&self) -> String {
         match (self.worker, self.decoding) {
             (None, _) => "queued".into(),
-            (Some(_), false) => format!("prefill, position {} of {}", self.position, self.prompt.len()),
+            (Some(_), false) => format!("prefill, position {} of {}", self.position, self.start_len()),
             (Some(_), true) => format!("decode, token {} of {}", self.sent, self.max_new),
         }
     }
@@ -327,6 +381,12 @@ struct Inner {
     stages: Vec<u32>,
     status: Status,
     cache: Arc<Mutex<CacheState>>,
+    /// Commands waiting for their `Result`, by command id: worker, deadline, receiver.
+    commands: HashMap<u64, (usize, Instant, CommandKind, Sender<CommandOutcome>)>,
+    /// The model's end-of-sequence token, from the controller's tokenizer: a request whose
+    /// last token is this one is finished even if its `Done` was lost.
+    eos: Option<u32>,
+    command_seq: u64,
 }
 
 /// Starts the request split's scheduler for `cfg`: node 0 is this controller, every other
@@ -366,6 +426,11 @@ pub fn spawn(cfg: &Config) -> Result<(Client, JoinHandle<()>), Error> {
             footprint: 0,
             cap: 0,
             last_error: None,
+            last_heard: now,
+            memory_high: false,
+            last_event: None,
+            events: [0; EventKind::ALL.len()],
+            commands: [[0; 2]; CommandKind::ALL.len()],
         })
         .collect();
     let inner = Inner {
@@ -389,6 +454,9 @@ pub fn spawn(cfg: &Config) -> Result<(Client, JoinHandle<()>), Error> {
             served: VecDeque::new(),
             shutting_down: false,
         })),
+        commands: HashMap::new(),
+        command_seq: 0,
+        eos: None,
     };
     for w in 0..inner.workers.len() {
         inner.reconnect(w);
@@ -478,6 +546,12 @@ impl Board {
         self.lock().ready()
     }
 
+    /// Sets the end-of-sequence token, so a request whose link breaks right after it is
+    /// finished instead of resumed past it.
+    pub fn set_eos(&self, eos: Option<u32>) {
+        self.lock().eos = eos;
+    }
+
     /// Waits until `n` workers are ready or `timeout` passes; returns how many are.
     pub fn wait_ready(&self, n: usize, timeout: Duration) -> usize {
         let deadline = Instant::now() + timeout;
@@ -539,8 +613,8 @@ impl Board {
         Ok(b.view(w))
     }
 
-    /// Closes a worker's link as if it were lost: its requests are retried or fail, and it
-    /// reconnects.
+    /// Closes a worker's link as if it were lost: its requests are retried, resumed or fail,
+    /// and it reconnects.
     pub fn mark_down(&self, name: &str, reason: &str) -> Result<WorkerView, String> {
         let mut b = self.lock();
         let w = b.find(name)?;
@@ -581,12 +655,36 @@ impl Board {
             waiting_ms: 0,
             idle_ms: None,
             retries: 0,
+            resumed: 0,
             stuck: None,
             cached: Some(CachedView { kind: hit.kind, similarity: hit.similarity, made_by: hit.worker.clone() }),
         });
         drop(c);
         answer_from_cache(id, hit, events);
         Ok(())
+    }
+
+    /// Sends `kind` to worker `name`; the receiver gets the worker's `Result`, or ok=false
+    /// "timeout" after `timeout`, or ok=false "worker down" if the link breaks.
+    pub fn command(&self, name: &str, kind: CommandKind, timeout: Duration) -> Result<Receiver<CommandOutcome>, String> {
+        let mut b = self.lock();
+        let w = b.find(name)?;
+        if b.workers[w].send.is_none() {
+            return Err(format!("worker {name} is not connected ({})", b.workers[w].state.as_str()));
+        }
+        b.command_seq += 1;
+        let id = b.command_seq;
+        let (tx, rx) = mpsc::channel();
+        b.commands.insert(id, (w, Instant::now() + timeout, kind, tx));
+        info!(worker = name, command = kind.as_str(), id, "command sent");
+        let mut buf = std::mem::take(&mut b.buf);
+        encode_command(kind, &mut buf);
+        let sent = b.workers[w].send.as_mut().unwrap().send(MsgType::Command, id, 0, &buf);
+        b.buf = buf;
+        if let Err(e) = sent {
+            b.lost(w, format!("send: {e}"));
+        }
+        Ok(rx)
     }
 
     /// The per-worker Prometheus series.
@@ -645,6 +743,12 @@ impl Inner {
             }),
             reconnect_tries: s.tries,
             next_try: s.next_try.map(unix_ms_ahead),
+            memory_high: s.memory_high,
+            last_event: s.last_event.as_ref().map(|(at, kind, text)| LastEvent {
+                kind: event_name(*kind),
+                text: text.clone(),
+                at: unix_ms(*at),
+            }),
         }
     }
 
@@ -673,9 +777,17 @@ impl Inner {
             waiting_ms: ms(if r.started.is_some() { r.waited } else { r.submitted.elapsed() }),
             idle_ms: r.started.map(|_| ms(r.last_progress.elapsed())),
             retries: r.retries,
+            resumed: r.resumed,
             stuck,
             cached: None,
         }
+    }
+
+    /// Hands a command's outcome to its caller and counts it on its worker.
+    fn answer_command(&mut self, id: u64, outcome: CommandOutcome) {
+        let Some((w, _, kind, tx)) = self.commands.remove(&id) else { return };
+        self.workers[w].commands[kind as usize - 1][outcome.ok as usize] += 1;
+        let _ = tx.send(outcome);
     }
 
     fn series(&self) -> Vec<WorkerSeries> {
@@ -692,6 +804,12 @@ impl Inner {
                 cap: s.cap,
                 done: s.done,
                 failed: s.failed,
+                events: EventKind::ALL.iter().zip(s.events).map(|(k, n)| (k.as_str(), n)).collect(),
+                commands: CommandKind::ALL
+                    .iter()
+                    .zip(s.commands)
+                    .flat_map(|(c, [bad, good])| [(c.as_str(), false, bad), (c.as_str(), true, good)])
+                    .collect(),
             })
             .collect()
     }
@@ -816,6 +934,8 @@ impl Inner {
             last_progress: now,
             last_token: None,
             retries: 0,
+            resumed: 0,
+            base: 0,
             dropping: false,
             probe,
             answer: Vec::new(),
@@ -851,7 +971,14 @@ impl Inner {
 
     fn start_on(&mut self, id: u64, w: usize) {
         let r = self.reqs.get_mut(&id).unwrap();
-        encode_start(r.max_new.min(u32::MAX as usize) as u32, &r.prompt, &mut self.buf);
+        // A resumed request goes on from its tokens so far: they join the prompt.
+        let left = r.max_new - r.sent as usize;
+        if r.sent == 0 {
+            encode_start(left.min(u32::MAX as usize) as u32, &r.prompt, &mut self.buf);
+        } else {
+            let prompt = [r.prompt.as_slice(), &r.answer].concat();
+            encode_start(left.min(u32::MAX as usize) as u32, &prompt, &mut self.buf);
+        }
         let s = &mut self.workers[w];
         let sent = s.send.as_mut().map(|c| c.send(MsgType::Start, id, 0, &self.buf));
         if let Some(Err(e)) = sent {
@@ -865,14 +992,16 @@ impl Inner {
         r.last_progress = now;
         r.position = 0;
         r.decoding = false;
+        r.base = r.sent;
         s.running.push(id);
         info!(
             request = id,
             worker = s.name,
-            prompt = r.prompt.len(),
-            max_new = r.max_new,
+            prompt = r.start_len(),
+            max_new = left,
             queued_ms = ms(r.waited),
             retries = r.retries,
+            resumed = r.resumed,
             "started"
         );
     }
@@ -941,6 +1070,8 @@ impl Inner {
         s.next_ping_at = now;
         s.tries = 0;
         s.next_try = None;
+        s.last_heard = now;
+        s.memory_high = false;
         thread::spawn(move || span.in_scope(|| read_worker(w, link, recv, tx)));
         let to = self.up_state(w);
         self.set_state(w, to, format!("connected to {peer}"));
@@ -948,7 +1079,8 @@ impl Inner {
     }
 
     /// The link to worker `w` is gone: requests that sent no token go back to the queue, the
-    /// rest fail, and the worker reconnects in the background.
+    /// rest resume on another worker (`resume_on_loss`, at most twice) or fail, its commands
+    /// get "worker down", and the worker reconnects in the background.
     fn lost(&mut self, w: usize, reason: String) {
         let s = &mut self.workers[w];
         // Nothing queued is worth waiting for: cut the link at once.
@@ -960,7 +1092,7 @@ impl Inner {
         s.errors.add(Instant::now(), 1, ERROR_WINDOW);
         let running = std::mem::take(&mut s.running);
         let name = s.name.clone();
-        let (mut retried, mut failed) = (0, 0);
+        let (mut retried, mut resumed, mut failed) = (0, 0, 0);
         for &id in running.iter().rev() {
             let Some(r) = self.reqs.get_mut(&id) else { continue };
             if r.dropping {
@@ -972,6 +1104,29 @@ impl Inner {
                 r.position = 0;
                 self.queue.push_front(id);
                 retried += 1;
+            } else if r.sent as usize >= r.max_new || (self.eos.is_some() && r.answer.last() == self.eos.as_ref()) {
+                // Every token (or the end of sequence) is out; only the `Done` was lost.
+                // `RequestWorker` never sends the end-of-sequence token itself, so after it a
+                // lost `Done` resumes instead, and the next worker stops at once.
+                let r = self.release(w, id).unwrap();
+                info!(request = id, worker = name, generated = r.sent, "done; its worker was lost before its Done");
+                STATS.requests_done.add(1);
+                self.workers[w].done += 1;
+                // Cache first, so a client that asks again at once finds it.
+                if let Some(p) = r.probe.filter(|_| r.answer.len() == r.sent as usize) {
+                    lock_cache(&self.cache).cache.insert(p, r.answer, &name);
+                }
+                let _ = r.events.send(Event::Done);
+            } else if self.cfg.resume_on_loss && r.resumed < 2 {
+                r.worker = None;
+                r.started = None;
+                r.resumed += 1;
+                r.position = 0;
+                r.decoding = false;
+                info!(request = id, from = name, tokens_kept = r.sent, resumed = r.resumed, "resumed: back to the queue");
+                STATS.requests_resumed.add(1);
+                self.queue.push_front(id);
+                resumed += 1;
             } else {
                 let msg = format!("worker {name} lost after {} tokens: {reason}", r.sent);
                 self.fail(w, id, msg.clone());
@@ -980,7 +1135,12 @@ impl Inner {
                 failed += 1;
             }
         }
-        self.set_state(w, WorkerState::Down, format!("{reason}; {retried} requests retried, {failed} failed"));
+        let gone: Vec<u64> = self.commands.iter().filter(|(_, c)| c.0 == w).map(|(&id, _)| id).collect();
+        for id in gone {
+            self.answer_command(id, CommandOutcome { ok: false, message: "worker down".into() });
+        }
+        let reason = format!("{reason}; {retried} requests retried, {resumed} resumed, {failed} failed");
+        self.set_state(w, WorkerState::Down, reason);
         if !self.shutting_down {
             self.reconnect(w);
         }
@@ -1049,11 +1209,12 @@ impl Inner {
                     );
                     STATS.requests_done.add(1);
                     self.workers[w].done += 1;
-                    let _ = r.events.send(Event::Done);
+                    // Cache first, so a client that asks again at once finds it.
                     let complete = matches!(reason, "length" | "eos") && r.answer.len() == r.sent as usize;
                     if let Some(p) = r.probe.filter(|_| complete) {
                         lock_cache(&self.cache).cache.insert(p, r.answer, &self.workers[w].name);
                     }
+                    let _ = r.events.send(Event::Done);
                 }
                 self.dispatch();
             }
@@ -1074,6 +1235,18 @@ impl Inner {
                 }
                 self.dispatch();
             }
+            MsgType::Event => self.on_event(w, h, &payload),
+            MsgType::Result => {
+                if self.commands.get(&id).is_none_or(|c| c.0 != w) {
+                    return;
+                }
+                let outcome = match decode_result(&payload) {
+                    Ok((ok, message)) => CommandOutcome { ok, message: message.to_string() },
+                    Err(e) => CommandOutcome { ok: false, message: format!("bad result frame: {e}") },
+                };
+                info!(worker = self.workers[w].name, id, ok = outcome.ok, message = outcome.message, "command result");
+                self.answer_command(id, outcome);
+            }
             other => warn!(worker = self.workers[w].name, "unexpected {other:?} frame"),
         }
     }
@@ -1086,6 +1259,7 @@ impl Inner {
         s.ping = None;
         s.ping_ms = Some(rtt.as_secs_f64() * 1e3);
         s.last_pong = Some(now);
+        s.last_heard = now;
         s.next_ping_at = sent + Duration::from_millis(self.cfg.health_interval_ms);
         STATS.ping_rtt_us.store(rtt.as_micros() as u64, Ordering::Relaxed);
         if let Err(e) = decode_status(payload, &mut self.status) {
@@ -1093,11 +1267,16 @@ impl Inner {
         }
         s.footprint = self.status.footprint;
         s.cap = self.status.cap;
+        let memory_back = s.memory_high && s.cap > 0 && (s.footprint as f64) < s.cap as f64 * 0.9;
+        if memory_back {
+            s.memory_high = false;
+            info!(worker = s.name, footprint = s.footprint, cap = s.cap, "memory back under 90 % (status report)");
+        }
         for run in &self.status.requests {
             let Some(r) = self.reqs.get_mut(&run.request).filter(|r| r.worker == Some(w) && !r.dropping) else { continue };
             if run.position > r.position {
                 if !r.decoding {
-                    let prompt = (run.position as usize).min(r.prompt.len()) as u32;
+                    let prompt = (run.position as usize).min(r.start_len()) as u32;
                     s.prefill.add(now, prompt.saturating_sub(r.position) as u64, RATE_WINDOW);
                 }
                 r.position = run.position;
@@ -1109,6 +1288,43 @@ impl Inner {
             let to = self.up_state(w);
             self.set_state(w, to, format!("ping answered after {} ms", ms(rtt)));
             self.dispatch();
+        } else if memory_back {
+            self.dispatch();
+        }
+    }
+
+    /// A worker's event: progress, memory pressure, or a note.
+    fn on_event(&mut self, w: usize, h: Header, payload: &[u8]) {
+        let now = Instant::now();
+        let s = &mut self.workers[w];
+        s.last_heard = now;
+        let (kind, value, text) = match decode_event(payload) {
+            Ok(e) => e,
+            Err(e) => return warn!(worker = s.name, error = %e, "bad event frame; skipped"),
+        };
+        s.events[kind as usize - 1] += 1;
+        s.last_event = Some((now, kind, text.to_string()));
+        match kind {
+            EventKind::PrefillDone => {
+                let id = h.request_id;
+                let Some(r) = self.reqs.get_mut(&id).filter(|r| r.worker == Some(w) && !r.dropping) else { return };
+                let prompt = (h.position as usize).min(r.start_len()) as u32;
+                s.prefill.add(now, prompt.saturating_sub(r.position) as u64, RATE_WINDOW);
+                r.position = r.position.max(prompt);
+                r.decoding = true;
+                r.last_progress = now;
+                info!(request = id, worker = s.name, prompt, prefill_ms = value / 1000, "prefill done");
+            }
+            EventKind::MemoryHigh => {
+                s.memory_high = true;
+                warn!(worker = s.name, footprint = value, cap = text, "memory high: no new requests");
+            }
+            EventKind::MemoryOk => {
+                s.memory_high = false;
+                info!(worker = s.name, footprint = value, "memory ok: takes requests again");
+                self.dispatch();
+            }
+            EventKind::Note => info!(worker = s.name, request = h.request_id, value, note = text, "worker note"),
         }
     }
 
@@ -1124,12 +1340,16 @@ impl Inner {
         let mut gone = false;
         for &token in &self.tokens {
             let latency = now.duration_since(r.last_token.or(r.started).unwrap_or(now));
-            if r.sent == 0 {
-                STATS.time_to_first_token.observe(r.submitted.elapsed());
-                STATS.prompt_positions.add(r.prompt.len() as u64);
-                let rest = (r.prompt.len() as u32).saturating_sub(r.position);
+            if r.sent == r.base {
+                STATS.prompt_positions.add(r.start_len() as u64);
+                let rest = (r.start_len() as u32).saturating_sub(r.position);
                 s.prefill.add(now, rest as u64, RATE_WINDOW);
-                info!(request = id, worker = s.name, ttft_ms = ms(r.submitted.elapsed()), "first token");
+                if r.sent == 0 {
+                    STATS.time_to_first_token.observe(r.submitted.elapsed());
+                    info!(request = id, worker = s.name, ttft_ms = ms(r.submitted.elapsed()), "first token");
+                } else {
+                    info!(request = id, worker = s.name, at = r.sent, "first token after resume");
+                }
             } else {
                 STATS.decode_step.observe(latency);
             }
@@ -1138,9 +1358,7 @@ impl Inner {
             r.decoding = true;
             r.last_progress = now;
             r.last_token = Some(now);
-            if r.probe.is_some() {
-                r.answer.push(token);
-            }
+            r.answer.push(token);
             s.tokens.add(now, 1, RATE_WINDOW);
             STATS.tokens_generated.add(1);
             if r.events.send(Event::Token { token, latency }).is_err() {
@@ -1165,7 +1383,11 @@ impl Inner {
                 continue;
             }
             match s.ping {
-                Some((seq, sent)) if now.duration_since(sent) > timeout && s.state != WorkerState::Stuck => {
+                Some((seq, sent))
+                    if now.duration_since(sent) > timeout
+                        && now.duration_since(s.last_heard) > timeout
+                        && s.state != WorkerState::Stuck =>
+                {
                     let on: Vec<String> = s.running.iter().filter_map(|id| self.reqs.get(id)).map(|r| format!("{} {}", r.id, r.doing())).collect();
                     let reason = format!("health ping {seq} not back after {} ms; running: [{}]", ms(timeout), on.join("; "));
                     self.set_state(w, WorkerState::Stuck, reason);
@@ -1181,6 +1403,11 @@ impl Inner {
                 }
                 None => {}
             }
+        }
+        let late: Vec<u64> = self.commands.iter().filter(|(_, c)| now >= c.1).map(|(&id, _)| id).collect();
+        for id in late {
+            warn!(worker = self.workers[self.commands[&id].0].name, id, "command timed out");
+            self.answer_command(id, CommandOutcome { ok: false, message: "timeout".into() });
         }
         let stall = Duration::from_millis(self.cfg.stall_timeout_ms);
         let stalled: Vec<u64> = self
@@ -1200,6 +1427,15 @@ impl Inner {
         STATS.requests_active.store((self.reqs.len() - self.queue.len()) as u64, Ordering::Relaxed);
         STATS.requests_waiting.store(self.queue.len() as u64, Ordering::Relaxed);
         *crate::stats::WORKERS.lock().unwrap_or_else(|e| e.into_inner()) = self.series();
+    }
+}
+
+fn event_name(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::PrefillDone => "prefill_done",
+        EventKind::MemoryHigh => "memory_high",
+        EventKind::MemoryOk => "memory_ok",
+        EventKind::Note => "note",
     }
 }
 

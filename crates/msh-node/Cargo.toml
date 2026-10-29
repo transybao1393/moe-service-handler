@@ -18,7 +18,7 @@ msh-net = { version = "0.1.0", path = "../msh-net" }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.0.7"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "sync"] }
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 tokio-stream = "0.1.19"
 serde_json = "1.0.154"
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
@@ -27,6 +27,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 libc = "0.2"
 
 [dev-dependencies]
+futures-util = "0.3.34"
 http-body-util = "0.1.5"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time"] }
+tokio-tungstenite = "0.29.0"
 tower = { version = "0.5.3", features = ["util"] }

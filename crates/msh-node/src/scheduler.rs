@@ -96,6 +96,9 @@ pub struct SchedulerConfig {
     /// Request split: how long a request may go without progress (a token, or prompt
     /// positions in the worker's status report) before it fails.
     pub stall_timeout_ms: u64,
+    /// Request split: when a worker's link breaks, move its requests to another worker and
+    /// carry on from the tokens already sent instead of failing them.
+    pub resume_on_loss: bool,
     /// Prompt positions per prefill step. Bigger chunks make better use of the engine's
     /// batched path; smaller ones let other requests' decode steps in sooner.
     pub prefill_chunk: usize,
@@ -124,6 +127,7 @@ impl Default for SchedulerConfig {
             health_interval_ms: 1000,
             health_timeout_ms: 5000,
             stall_timeout_ms: 30_000,
+            resume_on_loss: true,
             prefill_chunk: 64,
             prefill_depth: 3,
             max_draft: 0,

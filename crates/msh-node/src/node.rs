@@ -30,8 +30,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use msh_net::{
-    decode_move, decode_own, decode_start, encode_done, encode_move, encode_status, encode_token, Connection,
-    DoneReason, FrameError, Header, MsgType, RunStatus, Status, Writer, FLAG_EVERY_TOKEN,
+    decode_command, decode_move, decode_own, decode_start, encode_done, encode_event, encode_move, encode_result,
+    encode_status, encode_token, CommandKind, Connection, DoneReason, EventKind, FrameError, Header, MsgType,
+    RunStatus, Status, Writer, FLAG_EVERY_TOKEN,
 };
 
 use crate::backoff::Backoff;
@@ -191,13 +192,15 @@ fn timed_out(e: &FrameError) -> bool {
 
 /// Accepts the controller on `listener` again and again, calling `serve` on each connection
 /// until it ends: a controller that lost the link reconnects here.
-fn accept_forever(cfg: &Config, idx: usize, listener: &TcpListener, mut serve: impl FnMut(Connection) -> Result<(), Error>) -> Result<(), Error> {
+/// Returns when `serve` answers `Ok(true)`: stop serving.
+fn accept_forever(cfg: &Config, idx: usize, listener: &TcpListener, mut serve: impl FnMut(Connection) -> Result<bool, Error>) -> Result<(), Error> {
     loop {
         match accept_controller(cfg, idx, listener.try_clone()?) {
             Ok(link) => {
                 info!(controller = link.peer_name(), "connected");
                 match serve(link) {
-                    Ok(()) => info!("controller link ended; waiting for the next controller"),
+                    Ok(true) => return Ok(()),
+                    Ok(false) => info!("controller link ended; waiting for the next controller"),
                     Err(e) => warn!(error = %e, "controller link failed; waiting for the next controller"),
                 }
             }
@@ -245,7 +248,7 @@ impl<E: Engine> Worker<E> {
     /// quiet for `health_timeout_ms`.
     pub fn serve_forever(&mut self, cfg: &Config, idx: usize, listener: &TcpListener) -> Result<(), Error> {
         self.keepalive = Some(Duration::from_millis(cfg.scheduler.health_timeout_ms.max(1)));
-        accept_forever(cfg, idx, listener, |link| self.serve(link))
+        accept_forever(cfg, idx, listener, |link| self.serve(link).map(|()| false))
     }
 
     pub fn into_engine(self) -> E {
@@ -417,6 +420,7 @@ impl<E: Engine> Worker<E> {
 enum FromController {
     Start(Header, Vec<u8>),
     Drop(u64),
+    Command(Header, Vec<u8>),
     Other(Header),
     /// The connection ended, and why.
     Closed(String),
@@ -431,6 +435,8 @@ struct Run {
     /// Positions the engine holds.
     next_pos: usize,
     made: usize,
+    /// When its first prompt chunk began.
+    began: Option<Instant>,
 }
 
 /// Request split (`split = "requests"`): a worker running every layer and the head, serving
@@ -441,6 +447,9 @@ struct Run {
 /// error fails only its request (an `Error` frame, no `Done`). A reader thread answers every
 /// `Ping` at once with a `Pong` carrying the status report, even while a long step runs: a slow
 /// step shows as a request without progress, a frozen process as a ping not answered.
+///
+/// It also sends events on its own (`PrefillDone`, and `MemoryHigh`/`MemoryOk` around its cap)
+/// and answers `Command` frames with a `Result`.
 pub struct RequestWorker<E: Engine> {
     engine: E,
     name: String,
@@ -451,6 +460,13 @@ pub struct RequestWorker<E: Engine> {
     hidden: Vec<f32>,
     out: Vec<u32>,
     frame: Vec<u8>,
+    /// A `Restart` command ended the link.
+    restart: bool,
+    /// Requests ended and tokens made since start or `ResetStats`.
+    served: u64,
+    made: u64,
+    since: Instant,
+    up: Instant,
 }
 
 impl<E: Engine> RequestWorker<E> {
@@ -466,6 +482,11 @@ impl<E: Engine> RequestWorker<E> {
             hidden: Vec::new(),
             out: Vec::new(),
             frame: Vec::new(),
+            restart: false,
+            served: 0,
+            made: 0,
+            since: Instant::now(),
+            up: Instant::now(),
         }
     }
 
@@ -481,10 +502,16 @@ impl<E: Engine> RequestWorker<E> {
 
     /// Accepts the controller on `listener` again and again, serving each connection until it
     /// ends: a controller that lost the link reconnects here. Drops a link quiet for
-    /// `health_timeout_ms`.
+    /// `health_timeout_ms`. Returns after a `Restart` command.
     pub fn serve_forever(&mut self, cfg: &Config, idx: usize, listener: &TcpListener) -> Result<(), Error> {
         self.keepalive = Some(Duration::from_millis(cfg.scheduler.health_timeout_ms.max(1)));
-        accept_forever(cfg, idx, listener, |link| self.serve(link))
+        accept_forever(cfg, idx, listener, |link| self.serve(link).map(|()| self.restart))
+    }
+
+    /// Whether a `Restart` command ended the last link; the process should exit so launchd
+    /// starts it again.
+    pub fn restart_requested(&self) -> bool {
+        self.restart
     }
 
     /// Serves one connection until it ends, then frees every request it held.
@@ -500,12 +527,23 @@ impl<E: Engine> RequestWorker<E> {
         };
         let mut running: HashMap<u64, Run> = HashMap::new();
         let mut order: VecDeque<u64> = VecDeque::new();
+        // Memory events go out on each link afresh.
+        let mut memory_high = false;
+        let mut checked: Option<Instant> = None;
         let why = 'serve: loop {
-            // Wait while idle; between steps take whatever has come in.
+            if checked.map_or(true, |t| t.elapsed() >= MEMORY_CHECK) {
+                checked = Some(Instant::now());
+                if let Err(e) = self.check_memory(&mut memory_high, &send) {
+                    break 'serve format!("send: {e}");
+                }
+            }
+            // Wait while idle, waking for the memory check; between steps take whatever has
+            // come in.
             let first = if order.is_empty() {
-                match rx.recv() {
+                match rx.recv_timeout(MEMORY_CHECK) {
                     Ok(m) => Some(m),
-                    Err(_) => break 'serve "reader stopped".to_string(),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break 'serve "reader stopped".to_string(),
                 }
             } else {
                 None
@@ -524,6 +562,13 @@ impl<E: Engine> RequestWorker<E> {
                         // Already over: its `Done` or `Error` is on the way.
                         None => Ok(()),
                     },
+                    FromController::Command(h, payload) => {
+                        let sent = self.command(h.request_id, &payload, running.len(), &send);
+                        if sent.is_ok() && self.restart {
+                            break 'serve "restart requested".to_string();
+                        }
+                        sent
+                    }
                     FromController::Other(h) => {
                         let msg = format!("{}: unexpected {:?} frame on the request split", self.name, h.msg_type);
                         warn!("{msg}");
@@ -541,6 +586,7 @@ impl<E: Engine> RequestWorker<E> {
                     Ok(false) => {
                         running.remove(&id);
                         self.engine.free(id);
+                        self.served += 1;
                     }
                     Err(e) => break 'serve format!("send: {e}"),
                 }
@@ -592,7 +638,7 @@ impl<E: Engine> RequestWorker<E> {
             return self.send_done(send, id, 0, DoneReason::Length);
         }
         let prompt_len = prompt.len();
-        running.insert(id, Run { tokens: prompt, prompt_len, max_new, next_pos: 0, made: 0 });
+        running.insert(id, Run { tokens: prompt, prompt_len, max_new, next_pos: 0, made: 0, began: None });
         order.push_back(id);
         Ok(())
     }
@@ -602,6 +648,7 @@ impl<E: Engine> RequestWorker<E> {
         let start = r.next_pos;
         let end = if start < r.prompt_len { r.prompt_len.min(start + self.prefill_chunk) } else { start + 1 };
         let t0 = Instant::now();
+        let began = *r.began.get_or_insert(t0);
         let input = StageIn::Tokens(&r.tokens[start..end]);
         let result = self.engine.step(id, start as u32, input, Sample::Last, &mut self.hidden, &mut self.out);
         crate::stats::STATS.compute.observe(t0.elapsed());
@@ -626,12 +673,18 @@ impl<E: Engine> RequestWorker<E> {
             }
         };
         r.next_pos = end;
+        if start < r.prompt_len {
+            let us = began.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            encode_event(EventKind::PrefillDone, us, "", &mut self.frame);
+            send.send(MsgType::Event, id, r.prompt_len as u32, &self.frame)?;
+        }
         if Some(token) == self.engine.eos() {
             self.send_done(send, id, r.made, DoneReason::Eos)?;
             return Ok(false);
         }
         r.tokens.push(token);
         r.made += 1;
+        self.made += 1;
         // The token's own position in the sequence.
         encode_token(&[token], &[us], &mut self.frame);
         send.send(MsgType::Token, id, (r.tokens.len() - 1) as u32, &self.frame)?;
@@ -646,6 +699,65 @@ impl<E: Engine> RequestWorker<E> {
         encode_done(why, &mut self.frame);
         send.send(MsgType::Done, id, made as u32, &self.frame)
     }
+
+    /// Sends `MemoryHigh` once past 95 % of the cap and `MemoryOk` once back under 90 %.
+    fn check_memory(&mut self, high: &mut bool, send: &Writer) -> std::io::Result<()> {
+        let Some(cap) = self.cap.filter(|&c| c > 0) else { return Ok(()) };
+        let now = footprint();
+        let kind = if !*high && now as u128 * 100 > cap as u128 * 95 {
+            EventKind::MemoryHigh
+        } else if *high && (now as u128 * 100) < cap as u128 * 90 {
+            EventKind::MemoryOk
+        } else {
+            return Ok(());
+        };
+        *high = kind == EventKind::MemoryHigh;
+        info!(footprint = now, cap, ?kind, "memory event");
+        encode_event(kind, now, &cap.to_string(), &mut self.frame);
+        send.send(MsgType::Event, 0, 0, &self.frame)
+    }
+
+    /// Answers command `id` with a `Result`; `held` is the number of requests held.
+    fn command(&mut self, id: u64, payload: &[u8], held: usize, send: &Writer) -> std::io::Result<()> {
+        let (ok, msg) = match decode_command(payload) {
+            Err(e) => {
+                warn!(command = id, error = %e, "bad command");
+                (false, format!("bad command: {e}"))
+            }
+            Ok(CommandKind::Status) => {
+                let cap = self.cap.map_or("none".to_string(), |c| c.to_string());
+                let msg = format!(
+                    "requests {held}, footprint {}, cap {cap}, uptime {} s, served {}, made {} in {} s",
+                    footprint(),
+                    self.up.elapsed().as_secs(),
+                    self.served,
+                    self.made,
+                    self.since.elapsed().as_secs()
+                );
+                (true, msg)
+            }
+            Ok(CommandKind::ResetStats) => {
+                (self.served, self.made, self.since) = (0, 0, Instant::now());
+                (true, "worker counters cleared; the engine keeps no counters to clear".to_string())
+            }
+            Ok(CommandKind::Restart) if held > 0 => (false, format!("busy: {held} requests")),
+            Ok(CommandKind::Restart) => {
+                self.restart = true;
+                (true, "restarting".to_string())
+            }
+        };
+        info!(command = id, ok, msg, "command");
+        encode_result(ok, &msg, &mut self.frame);
+        send.send(MsgType::Result, id, 0, &self.frame)
+    }
+}
+
+/// How often the request-split worker checks its footprint against the cap.
+const MEMORY_CHECK: Duration = Duration::from_secs(1);
+
+/// The footprint the status report carries.
+fn footprint() -> u64 {
+    crate::memory::footprint().unwrap_or_else(|| crate::memory::LAST_FOOTPRINT.load(Ordering::Relaxed))
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -683,8 +795,7 @@ fn read_controller(
         let msg = match h.msg_type {
             MsgType::Ping => {
                 let mut s = lock(&status).clone();
-                s.footprint = crate::memory::footprint()
-                    .unwrap_or_else(|| crate::memory::LAST_FOOTPRINT.load(std::sync::atomic::Ordering::Relaxed));
+                s.footprint = footprint();
                 encode_status(&s, &mut out);
                 // A broken link also fails the worker loop's next send.
                 let _ = send.send(MsgType::Pong, h.request_id, 0, &out);
@@ -692,6 +803,7 @@ fn read_controller(
             }
             MsgType::Start => FromController::Start(h, std::mem::take(&mut buf)),
             MsgType::Drop => FromController::Drop(h.request_id),
+            MsgType::Command => FromController::Command(h, std::mem::take(&mut buf)),
             _ => FromController::Other(h),
         };
         if tx.send(msg).is_err() {
